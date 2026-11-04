@@ -1,0 +1,19 @@
+/target/
+**/*.rs.bk
+
+# Secrets and local data: never commit
+session*.json
+*.session.json
+/data/
+*.db
+*.db-*
+*.sqlite
+*.log
+.env
+
+# Personal files kept next to the project
+/file/
+
+# QR images
+qr*.png
+login_qr*.png

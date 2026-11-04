@@ -1,0 +1,30 @@
+[package]
+name = "zeta-zalo"
+description = "Unofficial Zalo Web/PC protocol client, the protocol core of the Zeta Chat gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+cbc.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+md-5.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+qrcode.workspace = true
+tracing-subscriber.workspace = true
