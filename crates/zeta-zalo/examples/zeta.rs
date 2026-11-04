@@ -28,6 +28,7 @@ Cách dùng:
   zeta friends <session.json> [--names]          đếm (hoặc liệt kê) bạn bè
   zeta groups  <session.json> [--names]          đếm (hoặc liệt kê) nhóm
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
+  zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
   zeta send    <session.json> user|group <id> <nội dung>
   zeta listen  <session.json> [giây]             nghe sự kiện thời gian thực
   zeta import-ctdozlite <ctdozlite.json> <out.json>";
@@ -47,6 +48,7 @@ async fn main() -> Result<()> {
         Some("friends") => friends(rest).await,
         Some("groups") => groups(rest).await,
         Some("recent") => recent(rest).await,
+        Some("probe") => probe(rest).await,
         Some("send") => send(rest).await,
         Some("listen") => listen(rest).await,
         Some("import-ctdozlite") => import_ctdozlite(rest),
@@ -167,6 +169,58 @@ async fn recent(args: &[String]) -> Result<()> {
                 .unwrap_or_default();
             println!("{bucket}: {} tin, trường: {fields:?}", items.len());
         }
+    }
+    Ok(())
+}
+
+/// Keys, types and array sizes of a JSON value, never the values themselves.
+fn shape(v: &serde_json::Value, depth: usize) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) if depth < 3 => {
+            let inner: Vec<String> = m
+                .iter()
+                .map(|(k, x)| format!("{k}: {}", shape(x, depth + 1)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Value::Object(m) => format!("{{{} khóa}}", m.len()),
+        Value::Array(a) => match a.first() {
+            Some(first) => format!("[{} × {}]", a.len(), shape(first, depth + 1)),
+            None => "[]".into(),
+        },
+        Value::String(_) => "chuỗi".into(),
+        Value::Number(_) => "số".into(),
+        Value::Bool(_) => "bool".into(),
+        Value::Null => "null".into(),
+    }
+}
+
+async fn probe(args: &[String]) -> Result<()> {
+    use zeta_zalo::Service;
+    let client = load_client(&session_path(args)?)?;
+    let (Some(service), Some(path), Some(params)) = (args.get(1), args.get(2), args.get(3)) else {
+        bail!("cần: probe <session.json> <dịch vụ> <đường dẫn> <JSON params>");
+    };
+    let service = match service.as_str() {
+        "chat" => Service::Chat,
+        "group" => Service::Group,
+        "conversation" => Service::Conversation,
+        "profile" => Service::Profile,
+        "friend" => Service::Friend,
+        "file" => Service::File,
+        "sticker" => Service::Sticker,
+        "group_cloud_message" => Service::GroupCloudMessage,
+        other => bail!("dịch vụ không hỗ trợ: {other}"),
+    };
+    let mut params: serde_json::Value =
+        serde_json::from_str(params).context("params không phải JSON")?;
+    if params.get("imei").is_some_and(|v| v == "auto") {
+        params["imei"] = serde_json::json!(client.device().imei);
+    }
+    match client.get_encrypted(service, path, &params).await {
+        Ok(data) => println!("OK {}", shape(&data, 0)),
+        Err(e) => println!("LỖI {e}"),
     }
     Ok(())
 }

@@ -163,6 +163,23 @@ impl ZaloClient {
         self.execute(request, url, key).await
     }
 
+    /// `GET {service}{path}?zpw_ver…&params=<encrypted params>`: any read call,
+    /// for exploring the protocol (see the `zeta probe` example command).
+    pub async fn get_encrypted(
+        &self,
+        service: Service,
+        path: &str,
+        params: &Value,
+    ) -> Result<Value> {
+        let key = self.session_key()?;
+        let path_and_query = format!(
+            "{path}?{}&params={}",
+            Self::common_params(),
+            self.encrypt_params(params)?
+        );
+        self.get_service(service, &path_and_query, Some(key)).await
+    }
+
     /// POST one file part as `multipart/form-data` (uploads to the file service).
     pub(crate) async fn post_multipart(
         &self,

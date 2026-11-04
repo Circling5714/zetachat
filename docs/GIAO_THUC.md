@@ -92,6 +92,10 @@ Zalo gửi lại tin vừa gửi qua WebSocket với cùng `clientId` (`cliMsgId
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.
 
-## 10. Cloud của tôi
+## 10. Lịch sử cũ (chưa tìm ra)
+
+Hội thoại 1-1 không có lịch sử trên máy chủ: Zalo PC lấy lịch sử bằng cách đồng bộ từ điện thoại. Với nhóm và Cloud, ctdozlite gọi `GET {group_cloud_message}/api/cm/getoldv2` và `cm/getrecentv2` với `groupId`, `globalMsgId`, `count`, `msgIds: []`, `imei`, `src`. Thử trên tài khoản thử (tháng 11/2026), các lời gọi này trả lỗi `604` (hoặc `-69` "Stop retry" khi `src: 3`), còn `{group}/api/group/history` trả `404`. Hiện gateway chỉ có những tin đến sau khi nó chạy, cộng với tin gần đây của `get-last-msgs`. Lệnh `zeta probe` (ví dụ `zeta`) giúp thử tiếp mà không in nội dung tin.
+
+## 11. Cloud của tôi
 
 "Cloud của tôi" là một hội thoại riêng có mã `send2me_id` (trả về ở `getLoginInfo`), không phải `uid` của chính tài khoản. Gửi ảnh với `toid` là `uid` của mình bị từ chối với lỗi `114` (tham số không hợp lệ).
