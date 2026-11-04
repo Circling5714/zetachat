@@ -231,6 +231,27 @@ impl ZaloClient {
         Ok(out)
     }
 
+    /// Latest messages of the recent conversations
+    /// (`preloadconvers/get-last-msgs`), the call Zalo PC makes at start-up to
+    /// paint its conversation list. An empty `threadIdLocalMsgId` map asks for all
+    /// recent conversations. The payload is shaped like real-time frames
+    /// (`msgs`, `groupMsgs`).
+    pub async fn recent_messages(&self) -> Result<Value> {
+        let key = self.session_key()?;
+        let params = self.encrypt_params(&json!({
+            "threadIdLocalMsgId": "{}",
+            "imei": self.device().imei,
+        }))?;
+        let path = format!(
+            "/api/preloadconvers/get-last-msgs?{}&params={params}",
+            Self::common_params()
+        );
+        Ok(unwrap_json_string(
+            self.get_service(Service::Conversation, &path, Some(key))
+                .await?,
+        ))
+    }
+
     /// Send a text message.
     ///
     /// Sent to the primary host only: a send that timed out may still have been

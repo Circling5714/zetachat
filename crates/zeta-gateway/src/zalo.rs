@@ -406,6 +406,7 @@ impl Connector {
         self.self_uid = client.session().map(|s| s.uid.clone()).unwrap_or_default();
         if matches!(health, SessionHealth::Valid(_)) {
             self.sync_contacts(&client).await;
+            self.load_recent(&client).await;
         }
         let realtime = socket::RealtimeConfig::from_client(&client)
             .ok()
@@ -548,7 +549,36 @@ impl Connector {
         }
     }
 
+    /// Recent messages (`get-last-msgs`), so the conversation list is not empty
+    /// after a fresh start. Stored quietly: no unread counter, no notification;
+    /// clients just reload their lists.
+    async fn load_recent(&self, client: &ZaloClient) {
+        match client.recent_messages().await {
+            Ok(data) => {
+                let stored = parse_frame_messages(&data, &self.self_uid)
+                    .into_iter()
+                    .filter(|m| self.store_parsed(m.clone(), false).is_some())
+                    .count();
+                tracing::info!(stored, "recent messages loaded");
+                if stored > 0 {
+                    if let Err(e) = self.bus.publish("threads_changed", json!({})) {
+                        tracing::error!(error = %e, "cannot publish threads_changed");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot load recent messages"),
+        }
+    }
+
     fn store_incoming(&self, m: ParsedMessage) {
+        if let Some(message) = self.store_parsed(m, true) {
+            publish_message(&self.store, &self.bus, &message);
+        }
+    }
+
+    /// Store a parsed message; returns it when it was new. `live` messages count as
+    /// unread when incoming.
+    fn store_parsed(&self, m: ParsedMessage, live: bool) -> Option<Message> {
         // A 1-1 sender's display name fills in an unnamed thread; contacts win.
         let name = if m.kind == ThreadKind::User && !m.outgoing {
             m.sender_name.clone()
@@ -576,11 +606,13 @@ impl Connector {
         match self
             .store
             .upsert_thread(&thread, false)
-            .and_then(|_| self.store.insert_message(&new))
+            .and_then(|_| self.store.insert_message_with(&new, live))
         {
-            Ok(Some(message)) => publish_message(&self.store, &self.bus, &message),
-            Ok(None) => {}
-            Err(e) => tracing::error!(error = %e, "cannot store message"),
+            Ok(message) => message,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot store message");
+                None
+            }
         }
     }
 

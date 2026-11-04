@@ -30,6 +30,7 @@ Mã hội thoại có dạng `zalo:u:<id người dùng>` hoặc `zalo:g:<id nh�
 |---|---|
 | `message` | `{ "message": {…}, "thread": {…} }`: tin nhắn mới, đến hay đi |
 | `thread_read` | `{ "thread_id": "…" }` |
+| `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |
 
 Mỗi sự kiện có `id` là số thứ tự tăng dần. Client lưu `id` cuối cùng đã nhận; khi mất mạng và nối lại, gửi nó qua `Last-Event-ID` (hoặc `?since=`) để nhận phần còn thiếu.

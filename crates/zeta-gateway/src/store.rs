@@ -189,6 +189,17 @@ impl Store {
     /// server id or by the client id of a message this gateway sent itself (Zalo
     /// echoes sent messages back over the socket).
     pub fn insert_message(&self, m: &NewMessage) -> Result<Option<Message>> {
+        self.insert_message_with(m, true)
+    }
+
+    /// [`Store::insert_message`], choosing whether an incoming message raises the
+    /// unread counter. History loaded at start-up does not: it may have been read
+    /// on the phone already.
+    pub fn insert_message_with(
+        &self,
+        m: &NewMessage,
+        count_unread: bool,
+    ) -> Result<Option<Message>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let known: bool = tx.query_row(
@@ -236,7 +247,11 @@ impl Store {
         tx.execute(
             "UPDATE threads SET last_message_at = MAX(last_message_at, ?2), unread = unread + ?3
              WHERE id = ?1",
-            params![m.thread_id, m.sent_at, if m.outgoing { 0 } else { 1 }],
+            params![
+                m.thread_id,
+                m.sent_at,
+                i64::from(count_unread && !m.outgoing)
+            ],
         )?;
         tx.commit()?;
         Ok(Some(Message {
@@ -502,6 +517,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["m1", "m2"]
         );
+    }
+
+    #[test]
+    fn history_does_not_raise_unread() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        s.insert_message_with(&msg(&t, "old", "", false, 5), false)
+            .unwrap();
+        let th = s.thread(&t).unwrap().unwrap();
+        assert_eq!((th.unread, th.last_message_at), (0, 5));
     }
 
     #[test]

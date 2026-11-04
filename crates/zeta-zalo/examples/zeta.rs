@@ -27,6 +27,7 @@ Cách dùng:
   zeta check   <session.json>                    hỏi Zalo phiên còn dùng được không
   zeta friends <session.json> [--names]          đếm (hoặc liệt kê) bạn bè
   zeta groups  <session.json> [--names]          đếm (hoặc liệt kê) nhóm
+  zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta send    <session.json> user|group <id> <nội dung>
   zeta listen  <session.json> [giây]             nghe sự kiện thời gian thực
   zeta import-ctdozlite <ctdozlite.json> <out.json>";
@@ -45,6 +46,7 @@ async fn main() -> Result<()> {
         Some("check") => check(rest).await,
         Some("friends") => friends(rest).await,
         Some("groups") => groups(rest).await,
+        Some("recent") => recent(rest).await,
         Some("send") => send(rest).await,
         Some("listen") => listen(rest).await,
         Some("import-ctdozlite") => import_ctdozlite(rest),
@@ -141,6 +143,29 @@ async fn groups(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--names") {
         for g in &list {
             println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
+        }
+    }
+    Ok(())
+}
+
+/// Shape of `get-last-msgs`: key names and counts only, never message content.
+async fn recent(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let data = client.recent_messages().await?;
+    let root = data.get("data").filter(|d| d.is_object()).unwrap_or(&data);
+    let keys: Vec<&String> = root
+        .as_object()
+        .map(|m| m.keys().collect())
+        .unwrap_or_default();
+    println!("khóa: {keys:?}");
+    for bucket in ["msgs", "groupMsgs", "pageMsgs"] {
+        if let Some(items) = root.get(bucket).and_then(|v| v.as_array()) {
+            let fields: Vec<&String> = items
+                .first()
+                .and_then(|m| m.as_object())
+                .map(|m| m.keys().collect())
+                .unwrap_or_default();
+            println!("{bucket}: {} tin, trường: {fields:?}", items.len());
         }
     }
     Ok(())

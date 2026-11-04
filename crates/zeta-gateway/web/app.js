@@ -483,6 +483,8 @@ function openStream() {
   state.stream = es;
   es.addEventListener('message', (e) => { track(e); onMessage(JSON.parse(e.data)); });
   es.addEventListener('status', (e) => { track(e); onStatus(JSON.parse(e.data)); });
+  // History was loaded on the gateway: reload lists instead of replaying messages.
+  es.addEventListener('threads_changed', (e) => { track(e); resync(); });
   es.addEventListener('thread_read', (e) => {
     track(e);
     const t = state.threads.get(JSON.parse(e.data).thread_id);
