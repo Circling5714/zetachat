@@ -64,7 +64,9 @@ CREATE TABLE devices (
 );
 ";
 
-const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread";
+const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread, \
+    COALESCE((SELECT m.text FROM messages m WHERE m.thread_id = threads.id \
+              ORDER BY m.seq DESC LIMIT 1), '')";
 const MESSAGE_COLUMNS: &str =
     "seq, thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text, sent_at";
 
@@ -78,6 +80,7 @@ fn thread_from_row(row: &Row<'_>) -> Result<Thread> {
         avatar: row.get(4)?,
         last_message_at: row.get(5)?,
         unread: row.get(6)?,
+        preview: row.get(7)?,
     })
 }
 
@@ -294,6 +297,21 @@ impl Store {
             params![kind, payload.to_string(), created_at],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Sequence number of the newest event, 0 when the log is empty.
+    pub fn last_event_seq(&self) -> Result<i64> {
+        self.conn()
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))
+    }
+
+    /// Drop events created before `before_ms`. Clients that were away longer
+    /// reload their lists instead of replaying.
+    pub fn prune_events(&self, before_ms: i64) -> Result<usize> {
+        self.conn().execute(
+            "DELETE FROM events WHERE created_at < ?1",
+            params![before_ms],
+        )
     }
 
     /// Events after `since`, oldest first.

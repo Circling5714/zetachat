@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#2563eb">
+  <title>zetachat</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="pair" class="screen" hidden>
+    <form id="pair-form" class="card pair-card">
+      <img src="/icon.svg" alt="" class="pair-logo" width="56" height="56">
+      <h1>zetachat</h1>
+      <p class="muted">Nhập token của thiết bị này. Token được tạo trên máy chủ bằng lệnh <code>zetachat-gateway device add &lt;tên&gt;</code>.</p>
+      <input id="pair-token" class="field" placeholder="zc_…" autocomplete="off" spellcheck="false" required>
+      <button type="submit" class="btn">Kết nối</button>
+      <p id="pair-error" class="error" hidden></p>
+    </form>
+  </div>
+
+  <div id="app" class="layout" hidden>
+    <aside class="sidebar">
+      <header class="side-head">
+        <span class="brand">zetachat</span>
+        <button id="zalo-status" class="status-pill" type="button"></button>
+      </header>
+      <div class="search-wrap">
+        <input id="search" class="field" type="search" placeholder="Tìm hội thoại" autocomplete="off">
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-filter="all" type="button">Tất cả</button>
+        <button class="tab" data-filter="unread" type="button">Chưa đọc</button>
+        <button class="tab" data-filter="contacts" type="button">Danh bạ</button>
+      </div>
+      <ul id="threads" class="threads"></ul>
+    </aside>
+
+    <main class="chat">
+      <div id="empty" class="empty">
+        <img src="/icon.svg" alt="" width="64" height="64">
+        <p>Chọn một hội thoại để bắt đầu</p>
+      </div>
+      <section id="conversation" class="conversation" hidden>
+        <header class="chat-head">
+          <button id="back" class="icon-btn" type="button" aria-label="Quay lại">‹</button>
+          <div id="chat-avatar" class="avatar"></div>
+          <div class="chat-title">
+            <div id="chat-name" class="name"></div>
+            <div id="chat-sub" class="muted small"></div>
+          </div>
+        </header>
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <form id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="Nhập tin nhắn…" aria-label="Tin nhắn"></textarea>
+          <button id="send" class="btn" type="submit">Gửi</button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div id="login" class="modal" hidden>
+    <div class="card login-card" role="dialog" aria-modal="true" aria-labelledby="login-title">
+      <h2 id="login-title">Đăng nhập Zalo</h2>
+      <p id="login-text" class="muted"></p>
+      <img id="login-qr" class="qr" alt="Mã QR đăng nhập Zalo" hidden>
+      <div class="row">
+        <button id="login-start" class="btn" type="button">Tạo mã QR</button>
+        <button id="login-close" class="btn secondary" type="button">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

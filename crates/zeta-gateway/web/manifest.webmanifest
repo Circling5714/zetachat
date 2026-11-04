@@ -1,0 +1,14 @@
+{
+  "name": "zetachat",
+  "short_name": "zetachat",
+  "description": "Zalo trên mọi thiết bị của bạn, qua gateway tự host",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4f6fb",
+  "theme_color": "#2563eb",
+  "lang": "vi",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

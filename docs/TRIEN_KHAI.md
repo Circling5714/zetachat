@@ -71,7 +71,18 @@ sudo ufw allow from <IP của Nginx Proxy Manager> to any port 8370 proto tcp
 
 Nếu reverse proxy chạy trên cùng máy, đặt `ZETACHAT_LISTEN=127.0.0.1:8370` trong file dịch vụ thay vì mở ra LAN. **Không bao giờ mở cổng gateway ra Internet**; khi ở ngoài, hãy truy cập qua VPN.
 
-## 6. Kiểm tra
+## 6. Giao diện web
+
+Mở `https://<tên miền nội bộ>/` trên PC.
+
+- **Ghép thiết bị**: lệnh `device add` in ra một link dạng `https://<địa chỉ gateway>/#token=zc_…`. Thay `<địa chỉ gateway>` bằng tên miền của bạn rồi mở link trên đúng thiết bị đó; token nằm sau dấu `#` nên không đi qua máy chủ hay log của proxy. Hoặc dán token vào màn hình "Kết nối".
+- **Đăng nhập Zalo**: nếu gateway chưa có phiên, giao diện tự mở hộp "Đăng nhập Zalo"; bấm "Tạo mã QR" rồi quét bằng app Zalo.
+- **Cài như ứng dụng**: trong Edge chọn *… → Ứng dụng → Cài đặt trang web này dưới dạng ứng dụng* để có cửa sổ riêng và biểu tượng trên thanh tác vụ.
+- **Thông báo**: lần đầu mở một hội thoại, trình duyệt hỏi quyền thông báo; cho phép để nhận tin khi cửa sổ không ở phía trước.
+
+Thông báo, cài ứng dụng và chế độ offline cần HTTPS (hoặc `localhost`), nên hãy truy cập qua Nginx Proxy Manager chứ không phải `http://<IP>:8370`.
+
+## 7. Kiểm tra
 
 ```bash
 curl https://<tên miền nội bộ>/api/v1/health

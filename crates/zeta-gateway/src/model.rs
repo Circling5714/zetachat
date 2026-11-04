@@ -63,6 +63,8 @@ pub struct Thread {
     /// Milliseconds since the epoch, 0 when the thread has no message yet.
     pub last_message_at: i64,
     pub unread: i64,
+    /// Text of the newest message, empty without messages.
+    pub preview: String,
 }
 
 /// Create-or-update input for a thread.

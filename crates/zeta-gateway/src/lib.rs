@@ -3,9 +3,11 @@
 
 pub mod api;
 pub mod auth;
+pub mod demo;
 pub mod events;
 pub mod model;
 pub mod store;
+pub mod web;
 pub mod zalo;
 
 use std::path::{Path, PathBuf};

@@ -436,6 +436,24 @@ impl Connector {
             }
             Err(e) => tracing::warn!(error = %e, "cannot load friends"),
         }
+        match client.groups().await {
+            Ok(groups) => {
+                let count = groups.len();
+                for g in groups {
+                    let thread = ThreadUpsert {
+                        kind: ThreadKind::Group,
+                        remote_id: g.id,
+                        name: g.name,
+                        avatar: g.avatar,
+                    };
+                    if let Err(e) = self.store.upsert_thread(&thread, true) {
+                        tracing::error!(error = %e, "cannot store group");
+                    }
+                }
+                tracing::info!(count, "groups synced");
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot load groups"),
+        }
     }
 
     fn handle_command(&mut self, cmd: ZaloCommand, login_tx: &mpsc::Sender<LoginOutcome>) {

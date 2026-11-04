@@ -26,6 +26,7 @@ Cách dùng:
   zeta login   <session.json> [tên máy]          đăng nhập bằng mã QR, lưu phiên
   zeta check   <session.json>                    hỏi Zalo phiên còn dùng được không
   zeta friends <session.json> [--names]          đếm (hoặc liệt kê) bạn bè
+  zeta groups  <session.json> [--names]          đếm (hoặc liệt kê) nhóm
   zeta send    <session.json> user|group <id> <nội dung>
   zeta listen  <session.json> [giây]             nghe sự kiện thời gian thực
   zeta import-ctdozlite <ctdozlite.json> <out.json>";
@@ -43,6 +44,7 @@ async fn main() -> Result<()> {
         Some("login") => login(rest).await,
         Some("check") => check(rest).await,
         Some("friends") => friends(rest).await,
+        Some("groups") => groups(rest).await,
         Some("send") => send(rest).await,
         Some("listen") => listen(rest).await,
         Some("import-ctdozlite") => import_ctdozlite(rest),
@@ -126,6 +128,19 @@ async fn friends(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--names") {
         for f in &list {
             println!("  {} {}", f.uid, f.display_name);
+        }
+    }
+    Ok(())
+}
+
+async fn groups(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let list = client.groups().await?;
+    let named = list.iter().filter(|g| !g.name.is_empty()).count();
+    println!("{} nhóm ({named} có tên)", list.len());
+    if args.iter().any(|a| a == "--names") {
+        for g in &list {
+            println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
         }
     }
     Ok(())

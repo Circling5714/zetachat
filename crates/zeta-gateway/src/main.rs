@@ -7,7 +7,9 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use zeta_gateway::api::{self, AppState};
+use zeta_gateway::demo;
 use zeta_gateway::events::EventBus;
+use zeta_gateway::model::now_ms;
 use zeta_gateway::store::Store;
 use zeta_gateway::zalo::{self, ZaloConfig};
 use zeta_gateway::{db_path, session_path};
@@ -39,6 +41,9 @@ enum Command {
         /// Địa chỉ lắng nghe. Để 127.0.0.1 nếu reverse proxy chạy cùng máy.
         #[arg(long, env = "ZETACHAT_LISTEN", default_value = "127.0.0.1:8370")]
         listen: SocketAddr,
+        /// Dùng dữ liệu mẫu, không kết nối Zalo (để thử giao diện). Cần thư mục dữ liệu riêng.
+        #[arg(long)]
+        demo: bool,
     },
     /// Quản lý thiết bị được phép dùng API.
     Device {
@@ -75,8 +80,9 @@ async fn main() -> Result<()> {
     prepare_data_dir(&cli.data_dir)?;
     match cli.command.unwrap_or(Command::Serve {
         listen: "127.0.0.1:8370".parse()?,
+        demo: false,
     }) {
-        Command::Serve { listen } => serve(&cli.data_dir, listen).await,
+        Command::Serve { listen, demo } => serve(&cli.data_dir, listen, demo).await,
         Command::Device { action } => device(&cli.data_dir, action),
         Command::Login => login(&cli.data_dir).await,
         Command::ImportCtdozlite { path } => import_ctdozlite(&cli.data_dir, &path),
@@ -94,17 +100,36 @@ fn prepare_data_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn serve(data_dir: &Path, listen: SocketAddr) -> Result<()> {
+/// Events older than this are dropped at start-up; clients away longer reload.
+const EVENT_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
+
+async fn serve(data_dir: &Path, listen: SocketAddr, demo: bool) -> Result<()> {
     let store = Arc::new(Store::open(&db_path(data_dir))?);
+    match store.prune_events(now_ms() - EVENT_RETENTION_MS) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "old events pruned"),
+        Err(e) => tracing::warn!(error = %e, "cannot prune events"),
+    }
     let bus = EventBus::new(store.clone());
-    let zalo = zalo::spawn(
-        ZaloConfig {
-            session_path: session_path(data_dir),
-            computer_name: COMPUTER_NAME.into(),
-        },
-        store.clone(),
-        bus.clone(),
-    );
+    let zalo = if demo {
+        if session_path(data_dir).exists() {
+            bail!(
+                "chế độ demo cần một thư mục dữ liệu riêng, {} đang có phiên Zalo",
+                data_dir.display()
+            );
+        }
+        tracing::warn!("demo mode: sample data, Zalo is not contacted");
+        demo::spawn(store.clone(), bus.clone())
+    } else {
+        zalo::spawn(
+            ZaloConfig {
+                session_path: session_path(data_dir),
+                computer_name: COMPUTER_NAME.into(),
+            },
+            store.clone(),
+            bus.clone(),
+        )
+    };
     let app = api::router(AppState { store, bus, zalo });
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -143,6 +168,7 @@ fn device(data_dir: &Path, action: DeviceAction) -> Result<()> {
             let (device, token) = store.add_device(&name)?;
             println!("Đã thêm thiết bị {} ({})", device.name, device.id);
             println!("Token (chỉ hiện một lần, hãy lưu lại): {token}");
+            println!("Hoặc mở trên thiết bị đó: https://<địa chỉ gateway>/#token={token}");
         }
         DeviceAction::List => {
             for d in store.devices()? {

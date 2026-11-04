@@ -78,6 +78,45 @@ impl Profile {
     }
 }
 
+/// One group the account belongs to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub avatar: String,
+    pub member_count: u64,
+}
+
+impl Group {
+    pub(crate) fn from_info(id: &str, info: &Value) -> Self {
+        let avatar = first_str(info, &["fullAvt", "avt", "avatar"]);
+        Self {
+            id: id.to_string(),
+            name: first_str(info, &["name", "groupName", "displayName"]),
+            // Zalo returns a placeholder URL ending in /default for groups without a photo.
+            avatar: if avatar.ends_with("/default") {
+                String::new()
+            } else {
+                avatar
+            },
+            member_count: info.get("totalMember").and_then(Value::as_u64).unwrap_or(0),
+        }
+    }
+}
+
+/// Group endpoints sometimes double-encode `data` as a JSON string.
+fn unwrap_json_string(v: Value) -> Value {
+    match &v {
+        Value::String(s) => serde_json::from_str(s.trim()).unwrap_or(v),
+        _ => v,
+    }
+}
+
+/// `data.data` when present, else the value itself.
+fn inner_data(v: &Value) -> &Value {
+    v.get("data").filter(|d| d.is_object()).unwrap_or(v)
+}
+
 impl Friend {
     pub(crate) fn from_value(v: &Value) -> Option<Self> {
         let uid = first_str(v, &["userId", "uid"]);
@@ -147,6 +186,51 @@ impl ZaloClient {
         Ok(items.iter().filter_map(Friend::from_value).collect())
     }
 
+    /// Ids of the groups the account belongs to (`getlg/v4`).
+    pub async fn group_ids(&self) -> Result<Vec<String>> {
+        let key = self.session_key()?;
+        let path = format!("/api/group/getlg/v4?{}", Self::common_params());
+        let data = unwrap_json_string(self.get_service(Service::Group, &path, Some(key)).await?);
+        Ok(inner_data(&data)
+            .get("gridVerMap")
+            .and_then(Value::as_object)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// Groups with name, avatar and size (`getlg/v4`, then `getmg-v2` in batches).
+    pub async fn groups(&self) -> Result<Vec<Group>> {
+        let key = self.session_key()?;
+        let ids = self.group_ids().await?;
+        let url = format!(
+            "{}/api/group/getmg-v2?{}",
+            self.domains().primary(Service::Group),
+            Self::common_params()
+        );
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(50) {
+            let versions: serde_json::Map<String, Value> =
+                chunk.iter().map(|id| (id.clone(), json!(0))).collect();
+            // The bundle sends the map as a JSON string inside the payload.
+            let params = self.encrypt_params(&json!({
+                "gridVerMap": Value::Object(versions).to_string(),
+                "imei": self.device().imei,
+            }))?;
+            let data = unwrap_json_string(
+                self.post_form(&url, format!("params={params}"), Some(key))
+                    .await?,
+            );
+            let infos = inner_data(&data)
+                .get("gridInfoMap")
+                .and_then(Value::as_object);
+            for id in chunk {
+                let info = infos.and_then(|m| m.get(id)).unwrap_or(&Value::Null);
+                out.push(Group::from_info(id, info));
+            }
+        }
+        Ok(out)
+    }
+
     /// Send a text message.
     ///
     /// Sent to the primary host only: a send that timed out may still have been
@@ -181,6 +265,32 @@ impl ZaloClient {
             msg_id: first_str(&data, &["msgId"]),
             client_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    #[test]
+    fn group_info_and_placeholders() {
+        let g = Group::from_info(
+            "7",
+            &json!({ "name": "Nhà", "fullAvt": "https://x/default", "totalMember": 4 }),
+        );
+        assert_eq!(
+            (g.name.as_str(), g.avatar.as_str(), g.member_count),
+            ("Nhà", "", 4)
+        );
+        let unknown = Group::from_info("8", &Value::Null);
+        assert_eq!((unknown.id.as_str(), unknown.name.as_str()), ("8", ""));
+    }
+
+    #[test]
+    fn double_encoded_data_is_unwrapped() {
+        let v = unwrap_json_string(json!(r#"{"data":{"gridVerMap":{"1":0}}}"#));
+        assert!(inner_data(&v).get("gridVerMap").is_some());
+        assert_eq!(unwrap_json_string(json!("plain")), json!("plain"));
     }
 }
 

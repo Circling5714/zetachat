@@ -9,6 +9,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -97,6 +98,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
         .route("/api/v1/zalo/login", get(login_state).post(start_login))
+        .route("/api/v1/zalo/login/qr.svg", get(login_qr_svg))
+        .route(
+            "/api/v1/session",
+            post(create_session).delete(delete_session),
+        )
+        .merge(crate::web::routes())
         .with_state(state)
 }
 
@@ -108,8 +115,76 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
 }
 
-async fn status(State(st): State<AppState>, _: AuthDevice) -> Json<Value> {
-    Json(json!({ "version": env!("CARGO_PKG_VERSION"), "zalo": st.zalo.status() }))
+async fn status(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Value> {
+    let last_event_seq = st.store.last_event_seq().map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "zalo": st.zalo.status(),
+        "last_event_seq": last_event_seq,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SessionBody {
+    token: String,
+}
+
+fn session_cookie(value: &str, max_age: i64, secure: bool) -> String {
+    format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        crate::auth::COOKIE_NAME,
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+/// Exchange a device token for an HttpOnly cookie, so the browser client never has
+/// to keep the token in JavaScript-readable storage. `SameSite=Strict` keeps other
+/// sites from riding on the cookie.
+async fn create_session(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SessionBody>,
+) -> Result<Response, ApiError> {
+    let token = body.token.trim();
+    let device = st
+        .store
+        .device_for_token(token)
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::unauthorized)?;
+    // Behind the reverse proxy the original scheme is in X-Forwarded-Proto.
+    let secure = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    let cookie = session_cookie(token, 365 * 24 * 3600, secure);
+    let body = Json(json!({ "device": { "id": device.id, "name": device.name } }));
+    Ok(([(SET_COOKIE, cookie)], body).into_response())
+}
+
+async fn delete_session() -> Response {
+    (
+        [(SET_COOKIE, session_cookie("", 0, false))],
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+/// The pending login QR code as SVG, for clients that cannot draw QR codes.
+async fn login_qr_svg(State(st): State<AppState>, _: AuthDevice) -> Result<Response, ApiError> {
+    let LoginState::WaitingScan { qr, .. } = st.zalo.status().login else {
+        return Err(ApiError::not_found("login QR code"));
+    };
+    let code = qrcode::QrCode::new(qr.as_bytes()).map_err(ApiError::internal)?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(256, 256)
+        .quiet_zone(true)
+        .build();
+    Ok((
+        [(CONTENT_TYPE, "image/svg+xml"), (CACHE_CONTROL, "no-store")],
+        svg,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -128,7 +203,12 @@ async fn list_threads(
 ) -> ApiResult<Vec<Thread>> {
     let threads = st
         .store
-        .threads(q.all, clamp(q.limit, 50), q.offset.unwrap_or(0).max(0))
+        // Up to 1000 so a client can list a whole friend list in one call.
+        .threads(
+            q.all,
+            q.limit.unwrap_or(50).clamp(1, 1000),
+            q.offset.unwrap_or(0).max(0),
+        )
         .map_err(ApiError::internal)?;
     Ok(Json(threads))
 }
