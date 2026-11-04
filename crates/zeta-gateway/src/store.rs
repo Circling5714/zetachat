@@ -314,6 +314,24 @@ impl Store {
             > 0)
     }
 
+    /// Original Zalo JSON of the newest incoming messages of a thread, newest
+    /// first (for read receipts).
+    pub fn incoming_raw(&self, thread_id: &str, limit: i64) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT raw FROM messages WHERE thread_id = ?1 AND outgoing = 0 AND raw <> '{}'
+             ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![thread_id, limit], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for raw in rows {
+            if let Ok(value) = serde_json::from_str(&raw?) {
+                out.push(value);
+            }
+        }
+        Ok(out)
+    }
+
     /// Store a message once. Returns `None` when it is already known, either by its
     /// server id or by the client id of a message this gateway sent itself (Zalo
     /// echoes sent messages back over the socket).
@@ -582,6 +600,23 @@ mod tests {
             sent_at: at,
             raw: "{}".into(),
         }
+    }
+
+    #[test]
+    fn incoming_raw_messages_newest_first() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        for (i, outgoing) in [false, true, false, false].into_iter().enumerate() {
+            let mut m = msg(&t, &format!("m{i}"), "", outgoing, i as i64);
+            m.raw = serde_json::json!({ "msgId": format!("m{i}") }).to_string();
+            s.insert_message(&m).unwrap();
+        }
+        // Sent from here: no original JSON, never part of a receipt.
+        s.insert_message(&msg(&t, "m9", "", false, 9)).unwrap();
+        let raws = s.incoming_raw(&t, 2).unwrap();
+        let ids: Vec<&str> = raws.iter().map(|v| v["msgId"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["m3", "m2"]);
     }
 
     #[test]

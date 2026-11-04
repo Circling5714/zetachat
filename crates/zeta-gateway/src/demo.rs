@@ -432,6 +432,8 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     };
                     let _ = reply.send(result);
                 }
+                // Nobody to tell in the demo.
+                ZaloCommand::MarkSeen { .. } => {}
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {
                         qr: "https://zetachat.invalid/demo-login".into(),

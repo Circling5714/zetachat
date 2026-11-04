@@ -253,6 +253,60 @@ impl ZaloClient {
         ))
     }
 
+    /// Tell Zalo the account has seen these incoming messages (`seenv2`, as in
+    /// zca-js): their senders see "Đã xem" and the account's other devices clear
+    /// their unread marks. `messages` are message objects as Zalo sent them; at
+    /// most 50 are used.
+    pub async fn send_seen(&self, to: Recipient<'_>, messages: &[Value]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let key = self.session_key()?;
+        let own_uid = self.session().map(|s| s.uid.clone()).unwrap_or_default();
+        let field = |m: &Value, k: &str| m.get(k).cloned().unwrap_or(Value::Null);
+        let data: Vec<Value> = messages
+            .iter()
+            .take(50)
+            .map(|m| {
+                let id_to = first_str(m, &["idTo"]);
+                json!({
+                    "cmi": first_str(m, &["cliMsgId"]),
+                    "gmi": first_str(m, &["msgId"]),
+                    "si": first_str(m, &["uidFrom"]),
+                    "di": if id_to == own_uid { "0".to_string() } else { id_to },
+                    "mt": field(m, "msgType"),
+                    "st": field(m, "st"),
+                    "at": field(m, "at"),
+                    "cmd": field(m, "cmd"),
+                    "ts": field(m, "ts"),
+                })
+            })
+            .collect();
+        let (service, path, params) = match to {
+            Recipient::User(uid) => (
+                Service::Chat,
+                "/api/message/seenv2",
+                json!({ "msgInfos": json!({ "data": data }).to_string(), "senderId": uid }),
+            ),
+            Recipient::Group(grid) => (
+                Service::Group,
+                "/api/group/seenv2",
+                json!({
+                    "msgInfos": json!({ "data": data, "grid": grid }).to_string(),
+                    "imei": self.device().imei,
+                }),
+            ),
+        };
+        let url = format!(
+            "{}{path}?{}&nretry=0",
+            self.domains().primary(service),
+            Self::common_params()
+        );
+        let form = format!("params={}", self.encrypt_params(&params)?);
+        self.post_form(&url, form, Some(key)).await?;
+        Ok(())
+    }
+
     /// Send a text message.
     ///
     /// Sent to the primary host only: a send that timed out may still have been

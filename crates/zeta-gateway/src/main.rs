@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Args, FromArgMatches, Parser, Subcommand};
 use zeta_gateway::api::{self, AppState};
 use zeta_gateway::demo;
 use zeta_gateway::events::EventBus;
@@ -36,20 +36,37 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[derive(Args)]
+struct ServeArgs {
+    /// Địa chỉ lắng nghe. Để 127.0.0.1 nếu reverse proxy chạy cùng máy.
+    #[arg(long, env = "ZETACHAT_LISTEN", default_value = "127.0.0.1:8370")]
+    listen: SocketAddr,
+    /// Dùng dữ liệu mẫu, không kết nối Zalo (để thử giao diện). Cần thư mục dữ liệu riêng.
+    #[arg(long)]
+    demo: bool,
+    /// Dung lượng tối đa của bộ nhớ đệm media (ảnh, video, tệp), tính bằng MB.
+    #[arg(long, env = "ZETACHAT_MEDIA_CACHE_MB", default_value_t = 2048)]
+    media_cache_mb: u64,
+    /// Báo "đã xem" cho Zalo khi đọc tin trên zetachat: người gửi thấy "Đã xem",
+    /// điện thoại hết báo chưa đọc. Đặt false để đọc mà không báo.
+    #[arg(long, env = "ZETACHAT_READ_RECEIPTS", default_value_t = true, action = ArgAction::Set)]
+    read_receipts: bool,
+}
+
+impl ServeArgs {
+    /// Options of a plain `zetachat-gateway` without a subcommand: defaults and
+    /// environment variables.
+    fn from_env() -> Result<Self> {
+        let matches =
+            Self::augment_args(clap::Command::new("serve")).try_get_matches_from(["serve"])?;
+        Ok(Self::from_arg_matches(&matches)?)
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Chạy gateway (mặc định).
-    Serve {
-        /// Địa chỉ lắng nghe. Để 127.0.0.1 nếu reverse proxy chạy cùng máy.
-        #[arg(long, env = "ZETACHAT_LISTEN", default_value = "127.0.0.1:8370")]
-        listen: SocketAddr,
-        /// Dùng dữ liệu mẫu, không kết nối Zalo (để thử giao diện). Cần thư mục dữ liệu riêng.
-        #[arg(long)]
-        demo: bool,
-        /// Dung lượng tối đa của bộ nhớ đệm media (ảnh, video, tệp), tính bằng MB.
-        #[arg(long, env = "ZETACHAT_MEDIA_CACHE_MB", default_value_t = 2048)]
-        media_cache_mb: u64,
-    },
+    Serve(ServeArgs),
     /// Quản lý thiết bị được phép dùng API.
     Device {
         #[command(subcommand)]
@@ -83,16 +100,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     prepare_data_dir(&cli.data_dir)?;
-    match cli.command.unwrap_or(Command::Serve {
-        listen: "127.0.0.1:8370".parse()?,
-        demo: false,
-        media_cache_mb: 2048,
-    }) {
-        Command::Serve {
-            listen,
-            demo,
-            media_cache_mb,
-        } => serve(&cli.data_dir, listen, demo, media_cache_mb).await,
+    let command = match cli.command {
+        Some(command) => command,
+        None => Command::Serve(ServeArgs::from_env()?),
+    };
+    match command {
+        Command::Serve(args) => serve(&cli.data_dir, args).await,
         Command::Device { action } => device(&cli.data_dir, action),
         Command::Login => login(&cli.data_dir).await,
         Command::ImportCtdozlite { path } => import_ctdozlite(&cli.data_dir, &path),
@@ -131,7 +144,13 @@ fn spawn_media_trimming(media: Arc<MediaCache>, budget_mb: u64) {
     });
 }
 
-async fn serve(data_dir: &Path, listen: SocketAddr, demo: bool, media_cache_mb: u64) -> Result<()> {
+async fn serve(data_dir: &Path, args: ServeArgs) -> Result<()> {
+    let ServeArgs {
+        listen,
+        demo,
+        media_cache_mb,
+        read_receipts,
+    } = args;
     let store = Arc::new(Store::open(&db_path(data_dir))?);
     let media = Arc::new(MediaCache::new(media_dir(data_dir))?);
     spawn_media_trimming(media.clone(), media_cache_mb);
@@ -156,6 +175,7 @@ async fn serve(data_dir: &Path, listen: SocketAddr, demo: bool, media_cache_mb: 
                 session_path: session_path(data_dir),
                 computer_name: COMPUTER_NAME.into(),
                 media: Some(media.clone()),
+                read_receipts,
             },
             store.clone(),
             bus.clone(),
@@ -281,4 +301,26 @@ fn import_ctdozlite(data_dir: &Path, path: &Path) -> Result<()> {
     session.save(&target)?;
     println!("Đã nhập phiên vào {}", target.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_options() {
+        let serve = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Serve(serve)) => serve,
+            _ => panic!("not serve"),
+        };
+        let defaults = serve(&["zetachat-gateway", "serve"]);
+        assert!(defaults.read_receipts && !defaults.demo);
+        assert_eq!(defaults.media_cache_mb, 2048);
+        let quiet = serve(&["zetachat-gateway", "serve", "--read-receipts", "false"]);
+        assert!(!quiet.read_receipts);
+        assert_eq!(
+            ServeArgs::from_env().unwrap().listen,
+            "127.0.0.1:8370".parse().unwrap()
+        );
+    }
 }

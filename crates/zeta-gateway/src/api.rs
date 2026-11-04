@@ -381,10 +381,28 @@ async fn mark_read(
     _: AuthDevice,
     Path(id): Path<String>,
 ) -> ApiResult<Value> {
-    if !st.store.mark_read(&id).map_err(ApiError::internal)? {
-        return Err(ApiError::not_found("thread"));
-    }
+    let unread = st
+        .store
+        .thread(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("thread"))?
+        .unread;
+    st.store.mark_read(&id).map_err(ApiError::internal)?;
     let _ = st.bus.publish("thread_read", json!({ "thread_id": id }));
+    // Tell Zalo too, for the messages that were unread here.
+    if let (true, Some((kind, remote_id))) = (unread > 0, split_thread_id(&id)) {
+        let messages = st
+            .store
+            .incoming_raw(&id, unread.min(50))
+            .map_err(ApiError::internal)?;
+        if !messages.is_empty() {
+            let _ = st.zalo.commands.try_send(ZaloCommand::MarkSeen {
+                kind,
+                remote_id: remote_id.to_string(),
+                messages,
+            });
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 

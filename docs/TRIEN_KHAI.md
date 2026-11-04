@@ -28,6 +28,8 @@ journalctl -u zetachat-gateway -f
 
 Dữ liệu (cơ sở dữ liệu, phiên Zalo và bộ nhớ đệm media) nằm trong `/var/lib/zetachat`, quyền `0700`. Thư mục này chứa thông tin đăng nhập Zalo, cần được sao lưu và bảo vệ như mật khẩu.
 
+Khi bạn đọc tin trên zetachat, gateway báo "đã xem" cho Zalo như Zalo PC: người gửi thấy "Đã xem" và điện thoại hết báo chưa đọc. Muốn đọc mà không báo, thêm `Environment=ZETACHAT_READ_RECEIPTS=false` vào file dịch vụ.
+
 Ảnh, video và tệp được giữ trong `/var/lib/zetachat/media`, tối đa 2 GB theo mặc định; khi vượt, tệp lâu không dùng nhất bị xóa trước (kiểm tra mỗi giờ). Đổi giới hạn bằng `Environment=ZETACHAT_MEDIA_CACHE_MB=<số MB>` trong file dịch vụ. Thư mục `media` có thể bỏ qua khi sao lưu: tệp nào thiếu sẽ được tải lại từ Zalo khi còn link.
 
 ## 3. Thiết bị

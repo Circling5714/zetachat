@@ -16,7 +16,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu |
 | POST | `/threads/{id}/attachments?name=&caption=&width=&height=` | Gửi ảnh hoặc tệp. Thân request là chính tệp (tối đa 100 MB), `Content-Type` là loại tệp. Ảnh JPEG, PNG, WebP, GIF được gửi dạng ảnh (`width`, `height` là kích thước ảnh nếu client biết); loại khác được gửi dạng tệp. Trả về tin nhắn đã lưu |
-| POST | `/threads/{id}/read` | Đánh dấu đã đọc |
+| POST | `/threads/{id}/read` | Đánh dấu đã đọc. Nếu bật báo đã xem (mặc định), gateway báo cho Zalo về các tin đến chưa đọc: người gửi thấy "Đã xem", điện thoại hết báo chưa đọc |
 | GET | `/events?since=&limit=` | Nhật ký sự kiện sau `seq = since` |
 | GET | `/events/stream` | Luồng sự kiện (server-sent events). Gửi lại header `Last-Event-ID` khi nối lại để không sót sự kiện |
 | GET | `/media?u=<url>` | Tệp trên CDN của Zalo (ảnh, video, sticker, tin nhắn thoại, tệp đính kèm, ảnh đại diện) qua bộ nhớ đệm của gateway. Chỉ nhận URL thuộc tên miền media của Zalo (`400` với URL khác). Hỗ trợ `Range` để tua video |

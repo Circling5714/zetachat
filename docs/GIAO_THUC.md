@@ -88,4 +88,10 @@ Cả hai đều tải lên host `file` (`tt-files-wpa.zaloapp.com`) theo từng 
 
 Zalo gửi lại tin vừa gửi qua WebSocket với cùng `clientId` (`cliMsgId`), nên gateway không lưu trùng.
 
+## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
+
+`POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.
+
+## 10. Cloud của tôi
+
 "Cloud của tôi" là một hội thoại riêng có mã `send2me_id` (trả về ở `getLoginInfo`), không phải `uid` của chính tài khoản. Gửi ảnh với `toid` là `uid` của mình bị từ chối với lỗi `114` (tham số không hợp lệ).

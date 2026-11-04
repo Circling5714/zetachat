@@ -1,6 +1,7 @@
 //! HTTP API tests with an in-memory store and a fake Zalo connector.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -15,14 +16,19 @@ use zeta_gateway::model::{thread_id, Media, NewMessage, ThreadKind, ThreadUpsert
 use zeta_gateway::store::Store;
 use zeta_gateway::zalo::{LoginState, ZaloCommand, ZaloHandle, ZaloStatus};
 
+/// Read receipts the connector was asked for: (remote id, message ids).
+type SeenLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
 struct Fixture {
     app: Router,
     store: Arc<Store>,
     token: String,
+    /// Read receipts the connector was asked for: (remote id, message ids).
+    seen: SeenLog,
 }
 
 /// A connector that "sends" by storing the message, like the real one does.
-fn fake_connector(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
+fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle {
     let (commands, mut rx) = mpsc::channel(8);
     let status = Arc::new(RwLock::new(ZaloStatus::default()));
     tokio::spawn(async move {
@@ -112,6 +118,17 @@ fn fake_connector(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
                         .unwrap();
                     let _ = reply.send(Ok(message));
                 }
+                ZaloCommand::MarkSeen {
+                    remote_id,
+                    messages,
+                    ..
+                } => {
+                    let ids = messages
+                        .iter()
+                        .map(|m| m["msgId"].as_str().unwrap_or_default().to_string())
+                        .collect();
+                    seen.lock().unwrap().push((remote_id, ids));
+                }
                 ZaloCommand::StartLogin { reply } => {
                     let _ = reply.send(LoginState::WaitingScan {
                         qr: "https://example/qr".into(),
@@ -127,7 +144,8 @@ fn fake_connector(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
 fn fixture() -> Fixture {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let bus = EventBus::new(store.clone());
-    let zalo = fake_connector(store.clone(), bus.clone());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let zalo = fake_connector(store.clone(), bus.clone(), seen.clone());
     let (_, token) = store.add_device("test").unwrap();
     let media = std::env::temp_dir().join(format!("zetachat-api-{:016x}", rand::random::<u64>()));
     let app = api::router(AppState {
@@ -136,7 +154,12 @@ fn fixture() -> Fixture {
         zalo,
         media: Arc::new(MediaCache::new(media).unwrap()),
     });
-    Fixture { app, store, token }
+    Fixture {
+        app,
+        store,
+        token,
+        seen,
+    }
 }
 
 async fn call(
@@ -307,6 +330,58 @@ async fn photos_and_files_are_handed_to_the_connector() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "name is required");
     let (status, _) = upload(&f, "/api/v1/threads/bogus/attachments?name=a", None, b"x").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reading_a_thread_sends_a_read_receipt_for_its_unread_messages() {
+    let f = fixture();
+    let id = thread_id(ThreadKind::User, "8");
+    f.store
+        .upsert_thread(
+            &ThreadUpsert {
+                kind: ThreadKind::User,
+                remote_id: "8".into(),
+                name: "C".into(),
+                avatar: String::new(),
+            },
+            true,
+        )
+        .unwrap();
+    for (i, live) in [(1, false), (2, true), (3, true)] {
+        let remote = format!("m{i}");
+        f.store
+            .insert_message_with(
+                &NewMessage {
+                    thread_id: id.clone(),
+                    remote_id: remote.clone(),
+                    client_id: String::new(),
+                    sender_id: "8".into(),
+                    sender_name: "C".into(),
+                    outgoing: false,
+                    kind: "webchat".into(),
+                    text: "x".into(),
+                    media: None,
+                    quote: None,
+                    sent_at: i,
+                    raw: json!({ "msgId": remote, "uidFrom": "8" }).to_string(),
+                },
+                live,
+            )
+            .unwrap();
+    }
+    let read = format!("/api/v1/threads/{id}/read");
+    let (status, _) = call(&f, "POST", &read, None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    // Only the two messages that were unread here; history was read elsewhere.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        f.seen.lock().unwrap().clone(),
+        [("8".to_string(), vec!["m3".to_string(), "m2".to_string()])]
+    );
+    // Nothing unread any more: no second receipt.
+    call(&f, "POST", &read, None, true).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(f.seen.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

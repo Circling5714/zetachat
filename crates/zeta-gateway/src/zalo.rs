@@ -106,6 +106,13 @@ pub enum ZaloCommand {
         attachment: Attachment,
         reply: oneshot::Sender<Result<Message, String>>,
     },
+    /// The account read these incoming messages (original Zalo JSON): send a
+    /// read receipt, if enabled.
+    MarkSeen {
+        kind: ThreadKind,
+        remote_id: String,
+        messages: Vec<Value>,
+    },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
     },
@@ -177,6 +184,9 @@ pub struct ZaloConfig {
     pub computer_name: String,
     /// Where media of new messages is downloaded ahead of time, if anywhere.
     pub media: Option<Arc<MediaCache>>,
+    /// Tell Zalo when messages are read here (senders see "Đã xem", the phone
+    /// clears its unread marks).
+    pub read_receipts: bool,
 }
 
 /// Start the connector task.
@@ -542,6 +552,25 @@ impl Connector {
                         tracing::warn!(error = %e, "attachment not sent");
                     }
                     let _ = reply.send(result);
+                });
+            }
+            ZaloCommand::MarkSeen {
+                kind,
+                remote_id,
+                messages,
+            } => {
+                let Some(client) = self.client.clone().filter(|_| self.cfg.read_receipts) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let count = messages.len();
+                    match client
+                        .send_seen(recipient(kind, &remote_id), &messages)
+                        .await
+                    {
+                        Ok(()) => tracing::debug!(count, "read receipt sent"),
+                        Err(e) => tracing::warn!(error = %e, "read receipt not sent"),
+                    }
                 });
             }
             ZaloCommand::StartLogin { reply } => {
