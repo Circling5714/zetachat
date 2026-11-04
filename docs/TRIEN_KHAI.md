@@ -1,0 +1,79 @@
+# Triển khai gateway
+
+Hướng dẫn cho một máy chủ Linux trong LAN, ví dụ container LXC Ubuntu 24.04, đặt sau reverse proxy (Nginx Proxy Manager) và truy cập từ xa qua VPN (WireGuard). Các giá trị trong `<…>` là của riêng bạn.
+
+> [!IMPORTANT]
+> Một tài khoản Zalo chỉ có **một suất đăng nhập máy tính**. Khi gateway đang giữ phiên, đừng đăng nhập Zalo PC hay Zalo Web chính thức bằng cùng tài khoản, nếu không hai bên sẽ đá phiên của nhau.
+
+## 1. Build
+
+```bash
+sudo apt install -y build-essential pkg-config curl git
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+. ~/.cargo/env
+git clone https://github.com/Circling5714/zetachat.git && cd zetachat
+cargo build --release -p zeta-gateway
+sudo install -m 755 target/release/zetachat-gateway /usr/local/bin/
+```
+
+## 2. Tài khoản hệ thống và dịch vụ
+
+```bash
+sudo useradd --system --home /var/lib/zetachat --shell /usr/sbin/nologin zetachat
+sudo install -m 644 deploy/zetachat-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now zetachat-gateway
+journalctl -u zetachat-gateway -f
+```
+
+Dữ liệu (cơ sở dữ liệu và phiên Zalo) nằm trong `/var/lib/zetachat`, quyền `0700`. Thư mục này chứa thông tin đăng nhập Zalo, cần được sao lưu và bảo vệ như mật khẩu.
+
+## 3. Thiết bị
+
+Mỗi thiết bị (PC, laptop…) cần một token riêng:
+
+```bash
+sudo -u zetachat ZETACHAT_DATA_DIR=/var/lib/zetachat zetachat-gateway device add "Laptop"
+sudo -u zetachat ZETACHAT_DATA_DIR=/var/lib/zetachat zetachat-gateway device list
+sudo -u zetachat ZETACHAT_DATA_DIR=/var/lib/zetachat zetachat-gateway device revoke <id>
+```
+
+Token chỉ hiện một lần. Mất thiết bị thì thu hồi token của nó; phiên Zalo không bị ảnh hưởng.
+
+## 4. Đăng nhập Zalo
+
+Chọn một trong các cách:
+
+- **Qua API** (gateway đang chạy): `POST /api/v1/zalo/login` trả về chuỗi `qr`; vẽ nó thành mã QR rồi quét bằng app Zalo. Xem [API.md](API.md).
+- **Trong terminal**: dừng dịch vụ, chạy `sudo -u zetachat ZETACHAT_DATA_DIR=/var/lib/zetachat zetachat-gateway login`, quét mã QR hiện trên màn hình, rồi bật lại dịch vụ.
+- **Từ phiên ctdozlite có sẵn**: `zetachat-gateway import-ctdozlite <session.json>`. Phiên do bản đăng nhập trong terminal của ctdozlite tạo ra có thể đã hỏng (xem [GIAO_THUC.md](GIAO_THUC.md), mục 4.1); gateway sẽ báo `rejected` nếu vậy.
+
+Thiết bị hiện trên điện thoại với tên "Ứng dụng: zetachat".
+
+## 5. Reverse proxy và tường lửa
+
+Trong Nginx Proxy Manager, tạo một Proxy Host:
+
+- Domain: `<tên miền nội bộ>`, Scheme `http`, Forward `<IP của máy chủ>`, port `8370`.
+- Bật SSL bằng chứng chỉ của bạn.
+- Mục *Advanced*, để luồng sự kiện không bị giữ lại:
+
+```nginx
+proxy_buffering off;
+proxy_read_timeout 1h;
+```
+
+Chỉ cho Nginx Proxy Manager truy cập cổng của gateway:
+
+```bash
+sudo ufw allow from <IP của Nginx Proxy Manager> to any port 8370 proto tcp
+```
+
+Nếu reverse proxy chạy trên cùng máy, đặt `ZETACHAT_LISTEN=127.0.0.1:8370` trong file dịch vụ thay vì mở ra LAN. **Không bao giờ mở cổng gateway ra Internet**; khi ở ngoài, hãy truy cập qua VPN.
+
+## 6. Kiểm tra
+
+```bash
+curl https://<tên miền nội bộ>/api/v1/health
+curl -H "Authorization: Bearer <token>" https://<tên miền nội bộ>/api/v1/status
+```

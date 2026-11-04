@@ -1,0 +1,524 @@
+//! SQLite store: threads, messages, the event log and client devices.
+//!
+//! One connection behind a mutex is plenty for a single-user gateway: every
+//! operation is a short statement, and none is held across an `.await`.
+
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde_json::Value;
+
+use crate::auth;
+use crate::model::{
+    now_ms, Device, Message, NewMessage, StoredEvent, Thread, ThreadKind, ThreadUpsert,
+};
+
+pub type Result<T> = rusqlite::Result<T>;
+
+const SCHEMA_V1: &str = "
+CREATE TABLE threads (
+    id              TEXT PRIMARY KEY,
+    network         TEXT NOT NULL DEFAULT 'zalo',
+    kind            TEXT NOT NULL,
+    remote_id       TEXT NOT NULL,
+    name            TEXT NOT NULL DEFAULT '',
+    avatar          TEXT NOT NULL DEFAULT '',
+    last_message_at INTEGER NOT NULL DEFAULT 0,
+    unread          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX threads_recent ON threads (last_message_at DESC);
+
+CREATE TABLE messages (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id   TEXT NOT NULL REFERENCES threads (id),
+    remote_id   TEXT NOT NULL,
+    client_id   TEXT NOT NULL DEFAULT '',
+    sender_id   TEXT NOT NULL DEFAULT '',
+    sender_name TEXT NOT NULL DEFAULT '',
+    outgoing    INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    text        TEXT NOT NULL DEFAULT '',
+    sent_at     INTEGER NOT NULL,
+    raw         TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (thread_id, remote_id)
+);
+CREATE INDEX messages_thread ON messages (thread_id, seq);
+CREATE INDEX messages_client ON messages (thread_id, client_id);
+
+CREATE TABLE events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE devices (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_at   INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL DEFAULT 0,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
+";
+
+const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread";
+const MESSAGE_COLUMNS: &str =
+    "seq, thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text, sent_at";
+
+fn thread_from_row(row: &Row<'_>) -> Result<Thread> {
+    let kind: String = row.get(1)?;
+    Ok(Thread {
+        id: row.get(0)?,
+        kind: ThreadKind::parse(&kind).unwrap_or(ThreadKind::User),
+        remote_id: row.get(2)?,
+        name: row.get(3)?,
+        avatar: row.get(4)?,
+        last_message_at: row.get(5)?,
+        unread: row.get(6)?,
+    })
+}
+
+fn message_from_row(row: &Row<'_>) -> Result<Message> {
+    Ok(Message {
+        seq: row.get(0)?,
+        thread_id: row.get(1)?,
+        remote_id: row.get(2)?,
+        client_id: row.get(3)?,
+        sender_id: row.get(4)?,
+        sender_name: row.get(5)?,
+        outgoing: row.get(6)?,
+        kind: row.get(7)?,
+        text: row.get(8)?,
+        sent_at: row.get(9)?,
+    })
+}
+
+fn device_from_row(row: &Row<'_>) -> Result<Device> {
+    Ok(Device {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        last_seen_at: row.get(3)?,
+        revoked: row.get(4)?,
+    })
+}
+
+pub struct Store {
+    conn: Mutex<Connection>,
+}
+
+impl Store {
+    pub fn open(path: &Path) -> Result<Self> {
+        Self::init(Connection::open(path)?)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
+        conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < 1 {
+            conn.execute_batch(SCHEMA_V1)?;
+            conn.pragma_update(None, "user_version", 1)?;
+        }
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Create a thread or refresh it. Empty values never overwrite stored ones; a
+    /// stored name is replaced only when `overwrite_name` is set (contact sync).
+    pub fn upsert_thread(&self, t: &ThreadUpsert, overwrite_name: bool) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO threads (id, kind, remote_id, name, avatar) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (id) DO UPDATE SET
+                name = CASE WHEN excluded.name <> '' AND (?6 OR threads.name = '')
+                            THEN excluded.name ELSE threads.name END,
+                avatar = CASE WHEN excluded.avatar <> '' THEN excluded.avatar ELSE threads.avatar END",
+            params![t.id(), t.kind.as_str(), t.remote_id, t.name, t.avatar, overwrite_name],
+        )?;
+        Ok(())
+    }
+
+    /// Threads by most recent activity. Without `include_idle`, threads that never
+    /// had a message (plain contacts) are left out.
+    pub fn threads(&self, include_idle: bool, limit: i64, offset: i64) -> Result<Vec<Thread>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {THREAD_COLUMNS} FROM threads
+             WHERE ?1 OR last_message_at > 0
+             ORDER BY last_message_at DESC, name ASC LIMIT ?2 OFFSET ?3"
+        ))?;
+        let rows = stmt.query_map(params![include_idle, limit, offset], thread_from_row)?;
+        rows.collect()
+    }
+
+    pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {THREAD_COLUMNS} FROM threads WHERE id = ?1"),
+                params![id],
+                thread_from_row,
+            )
+            .optional()
+    }
+
+    /// Reset the unread counter. Returns false for an unknown thread.
+    pub fn mark_read(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .execute("UPDATE threads SET unread = 0 WHERE id = ?1", params![id])?
+            > 0)
+    }
+
+    /// Store a message once. Returns `None` when it is already known, either by its
+    /// server id or by the client id of a message this gateway sent itself (Zalo
+    /// echoes sent messages back over the socket).
+    pub fn insert_message(&self, m: &NewMessage) -> Result<Option<Message>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let known: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE thread_id = ?1 AND remote_id = ?2)",
+            params![m.thread_id, m.remote_id],
+            |r| r.get(0),
+        )?;
+        if known {
+            return Ok(None);
+        }
+        if !m.client_id.is_empty() {
+            let sent_here = tx.execute(
+                "UPDATE messages SET remote_id = ?3
+                 WHERE thread_id = ?1 AND client_id = ?2 AND remote_id LIKE 'local:%'",
+                params![m.thread_id, m.client_id, m.remote_id],
+            )?;
+            let same_client: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM messages WHERE thread_id = ?1 AND client_id = ?2)",
+                params![m.thread_id, m.client_id],
+                |r| r.get(0),
+            )?;
+            if sent_here > 0 || same_client {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
+        tx.execute(
+            "INSERT INTO messages
+                (thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text, sent_at, raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                m.thread_id,
+                m.remote_id,
+                m.client_id,
+                m.sender_id,
+                m.sender_name,
+                m.outgoing,
+                m.kind,
+                m.text,
+                m.sent_at,
+                m.raw
+            ],
+        )?;
+        let seq = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE threads SET last_message_at = MAX(last_message_at, ?2), unread = unread + ?3
+             WHERE id = ?1",
+            params![m.thread_id, m.sent_at, if m.outgoing { 0 } else { 1 }],
+        )?;
+        tx.commit()?;
+        Ok(Some(Message {
+            seq,
+            thread_id: m.thread_id.clone(),
+            remote_id: m.remote_id.clone(),
+            client_id: m.client_id.clone(),
+            sender_id: m.sender_id.clone(),
+            sender_name: m.sender_name.clone(),
+            outgoing: m.outgoing,
+            kind: m.kind.clone(),
+            text: m.text.clone(),
+            sent_at: m.sent_at,
+        }))
+    }
+
+    /// The message this gateway sent with `client_id`, if stored.
+    pub fn message_by_client_id(
+        &self,
+        thread_id: &str,
+        client_id: &str,
+    ) -> Result<Option<Message>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE thread_id = ?1 AND client_id = ?2"),
+                params![thread_id, client_id],
+                message_from_row,
+            )
+            .optional()
+    }
+
+    /// Up to `limit` messages of a thread older than `before` (a `seq`), oldest first.
+    pub fn messages(
+        &self,
+        thread_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE thread_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![thread_id, before.unwrap_or(i64::MAX), limit],
+            message_from_row,
+        )?;
+        let mut out: Vec<Message> = rows.collect::<Result<_>>()?;
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Append to the event log; returns the event's sequence number.
+    pub fn append_event(&self, kind: &str, payload: &Value, created_at: i64) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO events (kind, payload, created_at) VALUES (?1, ?2, ?3)",
+            params![kind, payload.to_string(), created_at],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Events after `since`, oldest first.
+    pub fn events_since(&self, since: i64, limit: i64) -> Result<Vec<StoredEvent>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, kind, payload, created_at FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since, limit], |r| {
+            let payload: String = r.get(2)?;
+            Ok(StoredEvent {
+                seq: r.get(0)?,
+                kind: r.get(1)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                created_at: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Register a device; returns it with its token, which is shown only once.
+    pub fn add_device(&self, name: &str) -> Result<(Device, String)> {
+        let token = auth::new_token();
+        let device = Device {
+            id: auth::new_device_id(),
+            name: name.to_string(),
+            created_at: now_ms(),
+            last_seen_at: 0,
+            revoked: false,
+        };
+        self.conn().execute(
+            "INSERT INTO devices (id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                device.id,
+                device.name,
+                auth::hash_token(&token),
+                device.created_at
+            ],
+        )?;
+        Ok((device, token))
+    }
+
+    /// The active device owning `token`, refreshing its last-seen time.
+    pub fn device_for_token(&self, token: &str) -> Result<Option<Device>> {
+        let conn = self.conn();
+        let device = conn
+            .query_row(
+                "SELECT id, name, created_at, last_seen_at, revoked FROM devices
+                 WHERE token_hash = ?1 AND revoked = 0",
+                params![auth::hash_token(token)],
+                device_from_row,
+            )
+            .optional()?;
+        if let Some(d) = &device {
+            conn.execute(
+                "UPDATE devices SET last_seen_at = ?2 WHERE id = ?1",
+                params![d.id, now_ms()],
+            )?;
+        }
+        Ok(device)
+    }
+
+    pub fn devices(&self) -> Result<Vec<Device>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, created_at, last_seen_at, revoked FROM devices ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], device_from_row)?;
+        rows.collect()
+    }
+
+    /// Revoke a device. Returns false for an unknown id.
+    pub fn revoke_device(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .execute("UPDATE devices SET revoked = 1 WHERE id = ?1", params![id])?
+            > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::thread_id;
+
+    fn user(remote: &str, name: &str) -> ThreadUpsert {
+        ThreadUpsert {
+            kind: ThreadKind::User,
+            remote_id: remote.into(),
+            name: name.into(),
+            avatar: String::new(),
+        }
+    }
+
+    fn msg(thread: &str, remote: &str, client: &str, outgoing: bool, at: i64) -> NewMessage {
+        NewMessage {
+            thread_id: thread.into(),
+            remote_id: remote.into(),
+            client_id: client.into(),
+            sender_id: "s".into(),
+            sender_name: String::new(),
+            outgoing,
+            kind: "webchat".into(),
+            text: format!("text {remote}"),
+            sent_at: at,
+            raw: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn thread_names_fill_in_but_only_contacts_overwrite() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", ""), false).unwrap();
+        s.upsert_thread(&user("1", "From message"), false).unwrap();
+        assert_eq!(s.thread("zalo:u:1").unwrap().unwrap().name, "From message");
+        s.upsert_thread(&user("1", "Other"), false).unwrap();
+        assert_eq!(s.thread("zalo:u:1").unwrap().unwrap().name, "From message");
+        s.upsert_thread(&user("1", "Contact"), true).unwrap();
+        s.upsert_thread(&user("1", ""), true).unwrap();
+        assert_eq!(s.thread("zalo:u:1").unwrap().unwrap().name, "Contact");
+    }
+
+    #[test]
+    fn messages_are_stored_once_and_update_the_thread() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        assert!(s
+            .insert_message(&msg(&t, "m1", "", false, 100))
+            .unwrap()
+            .is_some());
+        assert!(s
+            .insert_message(&msg(&t, "m1", "", false, 100))
+            .unwrap()
+            .is_none());
+        assert!(s
+            .insert_message(&msg(&t, "m2", "", true, 200))
+            .unwrap()
+            .is_some());
+        let th = s.thread(&t).unwrap().unwrap();
+        assert_eq!((th.last_message_at, th.unread), (200, 1));
+        assert!(s.mark_read(&t).unwrap());
+        assert_eq!(s.thread(&t).unwrap().unwrap().unread, 0);
+        assert!(!s.mark_read("zalo:u:404").unwrap());
+    }
+
+    #[test]
+    fn server_echo_of_a_sent_message_is_not_duplicated() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        let sent = s
+            .insert_message(&msg(&t, "local:777", "777", true, 1))
+            .unwrap()
+            .unwrap();
+        // The echo carries the server id and the same client id.
+        assert!(s
+            .insert_message(&msg(&t, "srv-1", "777", true, 1))
+            .unwrap()
+            .is_none());
+        let stored = s.message_by_client_id(&t, "777").unwrap().unwrap();
+        assert_eq!((stored.seq, stored.remote_id.as_str()), (sent.seq, "srv-1"));
+        assert_eq!(s.messages(&t, None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn messages_page_backwards_oldest_first() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        for i in 0..5 {
+            s.insert_message(&msg(&t, &format!("m{i}"), "", false, i))
+                .unwrap();
+        }
+        let last_two = s.messages(&t, None, 2).unwrap();
+        assert_eq!(
+            last_two
+                .iter()
+                .map(|m| m.remote_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m3", "m4"]
+        );
+        let before = s.messages(&t, Some(last_two[0].seq), 2).unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .map(|m| m.remote_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m2"]
+        );
+    }
+
+    #[test]
+    fn idle_threads_are_hidden_by_default() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "Contact"), true).unwrap();
+        s.upsert_thread(&user("2", "Chat"), true).unwrap();
+        s.insert_message(&msg("zalo:u:2", "m", "", false, 5))
+            .unwrap();
+        assert_eq!(s.threads(false, 50, 0).unwrap().len(), 1);
+        assert_eq!(s.threads(true, 50, 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn event_log_replays_after_a_sequence() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .append_event("x", &serde_json::json!({ "n": 1 }), 1)
+            .unwrap();
+        let b = s
+            .append_event("y", &serde_json::json!({ "n": 2 }), 2)
+            .unwrap();
+        let after_a = s.events_since(a, 10).unwrap();
+        assert_eq!(after_a.len(), 1);
+        assert_eq!((after_a[0].seq, after_a[0].kind.as_str()), (b, "y"));
+    }
+
+    #[test]
+    fn devices_authenticate_until_revoked() {
+        let s = Store::open_in_memory().unwrap();
+        let (device, token) = s.add_device("Laptop").unwrap();
+        assert_eq!(s.device_for_token(&token).unwrap().unwrap().id, device.id);
+        assert!(s.device_for_token("zc_wrong").unwrap().is_none());
+        assert!(s.revoke_device(&device.id).unwrap());
+        assert!(s.device_for_token(&token).unwrap().is_none());
+        assert!(s.devices().unwrap()[0].revoked);
+    }
+}

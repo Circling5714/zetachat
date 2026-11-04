@@ -35,8 +35,8 @@ Chi tiết trong [docs/KIEN_TRUC.md](docs/KIEN_TRUC.md). Những gì đã kiểm
 | Giai đoạn | Nội dung | Trạng thái |
 |---|---|---|
 | 0 | Chạy thử một phiên Zalo trên máy chủ (bằng ctdozlite) | Phiên chạy được, tin đến và đi về tới máy chủ trong vài giây; đang đo độ bền qua nhiều ngày |
-| 1 | `zeta-zalo`: lõi giao thức tách từ ctdozlite | Đang làm. Đã có: đăng nhập QR, lưu phiên, kiểm tra phiên, danh sách bạn bè, gửi tin, WebSocket |
-| 2 | Gateway: dịch vụ nền, SQLite, API, token theo thiết bị | Chưa bắt đầu |
+| 1 | `zeta-zalo`: lõi giao thức tách từ ctdozlite | Đã có: đăng nhập QR, lưu phiên, kiểm tra phiên, danh sách bạn bè, gửi tin, WebSocket |
+| 2 | Gateway: dịch vụ nền, SQLite, API, token theo thiết bị | Đang làm. Đã có: kho SQLite, API REST, luồng sự kiện SSE, token theo thiết bị, đăng nhập QR qua API, connector Zalo. Đã test offline; chưa chạy với Zalo thật |
 | 3 | Client: giao diện web (PWA), bản Windows bằng Tauri | Chưa bắt đầu |
 | 4 | Connector Telegram (TDLib) | Dự kiến |
 
@@ -46,7 +46,9 @@ Chi tiết trong [docs/KIEN_TRUC.md](docs/KIEN_TRUC.md). Những gì đã kiểm
 |---|---|
 | `crates/zeta-zalo` | Lõi giao thức: mã hóa, đăng nhập QR, phiên, API, WebSocket |
 | `crates/zeta-zalo/examples/zeta.rs` | CLI cho nhà phát triển, để thử với tài khoản thật |
-| `docs/` | Kiến trúc và ghi chú giao thức |
+| `crates/zeta-gateway` | Gateway (`zetachat-gateway`): SQLite, API REST và SSE, token thiết bị, connector Zalo |
+| `deploy/` | File dịch vụ systemd |
+| `docs/` | [Kiến trúc](docs/KIEN_TRUC.md), [giao thức](docs/GIAO_THUC.md), [API](docs/API.md), [triển khai](docs/TRIEN_KHAI.md) |
 
 ## Build và test
 
@@ -57,7 +59,16 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CLI thử nghiệm:
+Chạy gateway ở máy mình (dữ liệu nằm trong `./data`):
+
+```bash
+cargo run -p zeta-gateway -- device add "Laptop"   # tạo token cho một thiết bị
+cargo run -p zeta-gateway -- serve                 # lắng nghe 127.0.0.1:8370
+```
+
+Triển khai lên máy chủ: xem [docs/TRIEN_KHAI.md](docs/TRIEN_KHAI.md).
+
+CLI thử nghiệm lõi giao thức:
 
 ```bash
 cargo run --example zeta -- login   data/session.json      # quét mã QR bằng app Zalo

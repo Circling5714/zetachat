@@ -1,0 +1,24 @@
+[Unit]
+Description=zetachat gateway (one Zalo session for your own devices)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zetachat
+Group=zetachat
+# /var/lib/zetachat, created by systemd with mode 0700 for the zetachat user.
+StateDirectory=zetachat
+StateDirectoryMode=0700
+UMask=0077
+Environment=ZETACHAT_DATA_DIR=/var/lib/zetachat
+# Listen on the LAN so the reverse proxy can reach it; restrict the port with a firewall.
+Environment=ZETACHAT_LISTEN=0.0.0.0:8370
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/zetachat-gateway serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
