@@ -9,8 +9,11 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::events::EventBus;
+use crate::media::RECALLED_TEXT;
 use crate::media_cache::{MediaCache, LOCAL_URL_PREFIX};
-use crate::model::{now_ms, thread_id, Media, Message, NewMessage, ThreadKind, ThreadUpsert};
+use crate::model::{
+    now_ms, thread_id, Media, Message, NewMessage, Quote, ThreadKind, ThreadUpsert,
+};
 use crate::store::Store;
 use crate::zalo::{Attachment, LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus};
 
@@ -35,6 +38,7 @@ struct Sample {
     text: &'static str,
     minutes_ago: i64,
     media: Option<Media>,
+    quote: Option<Quote>,
 }
 
 fn say(outgoing: bool, sender: &'static str, text: &'static str, minutes_ago: i64) -> Sample {
@@ -45,6 +49,27 @@ fn say(outgoing: bool, sender: &'static str, text: &'static str, minutes_ago: i6
         text,
         minutes_ago,
         media: None,
+        quote: None,
+    }
+}
+
+/// An outgoing reply quoting `quoted` by `author`.
+fn reply(text: &'static str, minutes_ago: i64, author: &str, quoted: &str) -> Sample {
+    Sample {
+        quote: Some(Quote {
+            sender_name: author.into(),
+            text: quoted.into(),
+            remote_id: String::new(),
+        }),
+        ..say(true, "", text, minutes_ago)
+    }
+}
+
+/// A message its sender recalled.
+fn recalled(sender: &'static str, minutes_ago: i64) -> Sample {
+    Sample {
+        kind: "chat.undo",
+        ..say(false, sender, RECALLED_TEXT, minutes_ago)
     }
 }
 
@@ -63,6 +88,7 @@ fn share(
         text,
         minutes_ago,
         media: Some(media),
+        quote: None,
     }
 }
 
@@ -92,6 +118,7 @@ fn add_thread(store: &Store, kind: ThreadKind, remote: &str, name: &str, message
             kind: sample.kind.into(),
             text: sample.text.to_string(),
             media: sample.media,
+            quote: sample.quote,
             sent_at: now_ms() - sample.minutes_ago * 60_000,
             raw: "{}".into(),
         });
@@ -127,6 +154,13 @@ fn seed(store: &Store) {
                     url: svg_data(STICKER_SVG),
                     ..Media::default()
                 },
+            ),
+            recalled("Lan Anh", 86),
+            reply(
+                "Ok em, 5 giờ anh qua",
+                85,
+                "Lan Anh",
+                "Đi cà phê nhé, 5 giờ chỗ cũ ☕",
             ),
         ],
     );
@@ -265,6 +299,7 @@ fn store_and_publish(
             kind: content.kind.into(),
             text: content.text.into(),
             media: content.media,
+            quote: None,
             sent_at: now,
             raw: "{}".into(),
         })

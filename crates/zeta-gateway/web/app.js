@@ -477,12 +477,25 @@ function appendText(parent, text) {
 function messageNode(m, prev, isGroup) {
   const frag = document.createDocumentFragment();
   if (!prev || !sameDay(prev.sent_at, m.sent_at)) frag.appendChild(el('div', 'day', fmtDay(m.sent_at)));
-  const md = m.media;
+  const recalled = m.kind === 'chat.undo';
+  const md = recalled ? null : m.media;
   const media = md && MEDIA[md.kind];
-  const bubble = el('div', `msg ${m.outgoing ? 'out' : 'in'}${media ? ` ${media[1]}` : ''}`);
+  let cls = `msg ${m.outgoing ? 'out' : 'in'}`;
+  if (media) cls += ` ${media[1]}`;
+  if (recalled) cls += ' recalled';
+  const bubble = el('div', cls);
+  bubble.dataset.seq = String(m.seq);
   const newSender = !prev || prev.outgoing || prev.sender_id !== m.sender_id || !sameDay(prev.sent_at, m.sent_at);
   if (isGroup && !m.outgoing && newSender) bubble.appendChild(el('div', 'sender', m.sender_name || 'Thành viên'));
-  if (media) {
+  if (m.quote && !recalled) {
+    const quote = el('div', 'quote');
+    if (m.quote.sender_name) quote.appendChild(el('div', 'quote-name', m.quote.sender_name));
+    quote.appendChild(el('div', 'quote-text', m.quote.text || ''));
+    bubble.appendChild(quote);
+  }
+  if (recalled) {
+    bubble.appendChild(document.createTextNode(m.text));
+  } else if (media) {
     bubble.appendChild(media[0](md));
     if ((md.kind === 'image' || md.kind === 'video') && md.description) {
       const caption = el('div', 'caption');
@@ -796,6 +809,22 @@ function onMessage(payload) {
   renderThreads();
 }
 
+/** A stored message changed (recalled by its sender). */
+function onMessageUpdated(payload) {
+  const m = payload.message;
+  if (!m) return;
+  if (payload.thread) {
+    const t = state.threads.get(m.thread_id);
+    state.threads.set(m.thread_id, Object.assign(t || {}, payload.thread));
+    renderThreads();
+  }
+  if (m.thread_id !== state.current) return;
+  const i = state.messages.findIndex((x) => x.seq === m.seq);
+  if (i < 0) return;
+  state.messages[i] = m;
+  renderMessages(false);
+}
+
 function onStatus(s) {
   const wasValid = state.status && state.status.session === 'valid';
   renderStatus(s);
@@ -831,6 +860,7 @@ function openStream() {
   const es = new EventSource(`${API}/events/stream?since=${state.lastSeq}`);
   state.stream = es;
   es.addEventListener('message', (e) => { track(e); onMessage(JSON.parse(e.data)); });
+  es.addEventListener('message_updated', (e) => { track(e); onMessageUpdated(JSON.parse(e.data)); });
   es.addEventListener('status', (e) => { track(e); onStatus(JSON.parse(e.data)); });
   // History was loaded on the gateway: reload lists instead of replaying messages.
   es.addEventListener('threads_changed', (e) => { track(e); resync(); });

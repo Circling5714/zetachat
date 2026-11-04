@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::media::Media;
+pub use crate::media::{Media, Quote};
 
 /// One conversation: a 1-1 chat or a group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +101,8 @@ pub struct Message {
     pub text: String,
     /// Photo, video, sticker, file… carried by the message.
     pub media: Option<Media>,
+    /// The message this one replies to.
+    pub quote: Option<Quote>,
     /// Milliseconds since the epoch.
     pub sent_at: i64,
 }
@@ -117,6 +119,7 @@ pub struct NewMessage {
     pub kind: String,
     pub text: String,
     pub media: Option<Media>,
+    pub quote: Option<Quote>,
     pub sent_at: i64,
     /// Original JSON from Zalo, kept so content can be parsed again later.
     pub raw: String,

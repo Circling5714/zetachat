@@ -28,7 +28,9 @@ Mã hội thoại có dạng `zalo:u:<id người dùng>` hoặc `zalo:g:<id nh�
 
 ## Tin nhắn và media
 
-Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, `sender_name`, `outgoing`, `kind` (`msgType` của Zalo: `webchat`, `chat.photo`, `chat.video.msg`, `chat.sticker`, `share.file`…), `text`, `sent_at` (mili giây) và `media`.
+Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, `sender_name`, `outgoing`, `kind` (`msgType` của Zalo: `webchat`, `chat.photo`, `chat.video.msg`, `chat.sticker`, `share.file`…), `text`, `sent_at` (mili giây), `media` và `quote`.
+
+`quote` là tin được trả lời (`null` nếu không phải tin trả lời): `{ "sender_name", "text", "remote_id" }`. Tin bị người gửi thu hồi có `kind` là `chat.undo`, `text` là "Tin nhắn đã được thu hồi", không còn `media` hay `quote`; gateway xóa hẳn nội dung gốc khỏi kho.
 
 `text` luôn có nội dung đọc được: chữ của tin, hoặc tóm tắt như `[Hình ảnh]`, `[Video]`, `[Tập tin] bao-cao.pdf`, dùng cho danh sách hội thoại và thông báo. `media` là `null` với tin chữ, còn lại là:
 
@@ -50,6 +52,7 @@ Chỉ ảnh, video và âm thanh được trả về để hiển thị trực t
 | `event` | `data` |
 |---|---|
 | `message` | `{ "message": {…}, "thread": {…} }`: tin nhắn mới, đến hay đi |
+| `message_updated` | `{ "message": {…}, "thread": {…} }`: một tin đã lưu thay đổi (bị thu hồi); client thay tin có cùng `seq` |
 | `thread_read` | `{ "thread_id": "…" }` |
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |

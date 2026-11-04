@@ -67,6 +67,9 @@ Trường `content` của tin nhắn là chuỗi với tin chữ (`msgType` `web
 | `share.file` | `href`, `title` (tên tệp), `params.fileSize` (theo ctdozlite) |
 | `chat.recommended`, `chat.link` | Thẻ liên kết: `href`, `title`, `description`, `thumb` |
 | `chat.webcontent` | Thẻ đặc biệt; câu thay thế nằm ở `params.customMsg.msg` |
+| `chat.undo` | Thu hồi tin: `globalMsgId` và `cliMsgId` của tin bị thu hồi, `deleteMsg`, `srcId`, `destId`. Định tuyến như tin thường (cùng hội thoại với tin gốc) |
+
+Tin trả lời có thêm object `quote` ở cấp tin nhắn: `fromD` (tên người gửi tin gốc), `msg` (chữ của tin gốc), `attach` (chuỗi JSON khi tin gốc là tệp đính kèm), `globalMsgId`, `cliMsgId`, `ownerId`, `ts` (theo zca-js; chưa gặp trên tài khoản thử).
 
 CDN media trả tệp **không cần cookie phiên**, chỉ với User-Agent và `Referer: https://chat.zalo.me/`:
 

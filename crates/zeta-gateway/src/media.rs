@@ -61,6 +61,69 @@ impl Media {
     }
 }
 
+/// The message a reply quotes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Quote {
+    /// Display name of the quoted message's sender.
+    #[serde(default)]
+    pub sender_name: String,
+    /// Text of the quoted message, or a summary of its attachment.
+    #[serde(default)]
+    pub text: String,
+    /// Zalo id of the quoted message.
+    #[serde(default)]
+    pub remote_id: String,
+}
+
+/// Text shown for a recalled message.
+pub const RECALLED_TEXT: &str = "Tin nhắn đã được thu hồi";
+
+/// The quote of a reply: the message's `quote` object (`fromD`, `msg`,
+/// `attach`, `globalMsgId`), as described by zca-js.
+pub fn extract_quote(message: &Value) -> Option<Quote> {
+    let q = message.get("quote").filter(|q| q.is_object())?;
+    let text = q.get("msg").and_then(Value::as_str).unwrap_or("").trim();
+    let attached = match q.get("attach") {
+        Some(Value::String(s)) => !s.trim().is_empty() && s.trim() != "{}",
+        Some(Value::Object(o)) => !o.is_empty(),
+        _ => false,
+    };
+    let text = if !text.is_empty() {
+        text.to_string()
+    } else if attached {
+        "[Tệp đính kèm]".to_string()
+    } else {
+        String::new()
+    };
+    let remote_id = match q.get("globalMsgId") {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let sender_name = q
+        .get("fromD")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (!text.is_empty() || !sender_name.is_empty()).then_some(Quote {
+        sender_name,
+        text,
+        remote_id,
+    })
+}
+
+/// Ids of the message a `chat.undo` recalls: (global id, client id).
+pub fn recalled_ids(content: Option<&Value>) -> Option<(String, String)> {
+    let id = |key: &str| match content.and_then(|c| c.get(key)) {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.trim().to_string(),
+        _ => String::new(),
+    };
+    let ids = (id("globalMsgId"), id("cliMsgId"));
+    (!ids.0.is_empty() || !ids.1.is_empty()).then_some(ids)
+}
+
 fn get_str<'a>(v: Option<&'a Value>, key: &str) -> &'a str {
     v.and_then(|c| c.get(key))
         .and_then(Value::as_str)
@@ -116,7 +179,7 @@ pub fn summarize(msg_type: &str, content: Option<&Value>) -> String {
         "chat.video.msg" => with_caption("[Video]", get_str(content, "title")),
         "share.file" => with_caption("[Tập tin]", get_str(content, "title")),
         "chat.location.new" => "[Vị trí]".into(),
-        "chat.undo" => "[Tin nhắn đã thu hồi]".into(),
+        "chat.undo" => RECALLED_TEXT.into(),
         "chat.recommended" | "chat.link" => {
             let caption = ["title", "description", "href"]
                 .into_iter()
@@ -381,6 +444,34 @@ mod tests {
             ..Media::default()
         };
         assert!(huge.prefetch_urls().is_empty());
+    }
+
+    #[test]
+    fn quotes_and_recalls() {
+        let reply = json!({ "content": "đồng ý", "quote": {
+            "ownerId": "5", "cliMsgId": 11, "globalMsgId": 22, "cliMsgType": 1,
+            "ts": 1, "msg": " đi cà phê không? ", "attach": "", "fromD": "Lan", "ttl": 0
+        }});
+        assert_eq!(
+            extract_quote(&reply),
+            Some(Quote {
+                sender_name: "Lan".into(),
+                text: "đi cà phê không?".into(),
+                remote_id: "22".into(),
+            })
+        );
+        let photo_reply =
+            json!({ "quote": { "msg": "", "attach": "{\"thumb\":\"x\"}", "fromD": "Lan" } });
+        assert_eq!(extract_quote(&photo_reply).unwrap().text, "[Tệp đính kèm]");
+        assert_eq!(extract_quote(&json!({ "content": "x" })), None);
+        assert_eq!(extract_quote(&json!({ "quote": {} })), None);
+
+        let undo = json!({ "globalMsgId": 7_000_000_001_u64, "cliMsgId": 123, "deleteMsg": 1 });
+        assert_eq!(
+            recalled_ids(Some(&undo)),
+            Some(("7000000001".to_string(), "123".to_string()))
+        );
+        assert_eq!(recalled_ids(Some(&json!({}))), None);
     }
 
     #[test]

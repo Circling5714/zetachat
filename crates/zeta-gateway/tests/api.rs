@@ -54,6 +54,7 @@ fn fake_connector(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
                             kind: "webchat".into(),
                             text,
                             media: None,
+                            quote: None,
                             sent_at: 10,
                             raw: "{}".into(),
                         })
@@ -103,6 +104,7 @@ fn fake_connector(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
                             kind: attachment.mime.clone(),
                             text: String::new(),
                             media: Some(media),
+                            quote: None,
                             sent_at: 20,
                             raw: "{}".into(),
                         })

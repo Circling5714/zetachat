@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::auth;
 use crate::media;
 use crate::model::{
-    now_ms, Device, Media, Message, NewMessage, StoredEvent, Thread, ThreadKind, ThreadUpsert,
+    now_ms, Device, Message, NewMessage, StoredEvent, Thread, ThreadKind, ThreadUpsert,
 };
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -68,11 +68,14 @@ CREATE TABLE devices (
 /// Version 2: structured media (JSON) next to the text summary.
 const SCHEMA_V2: &str = "ALTER TABLE messages ADD COLUMN media TEXT NOT NULL DEFAULT '';";
 
+/// Version 3: the message a reply quotes (JSON).
+const SCHEMA_V3: &str = "ALTER TABLE messages ADD COLUMN quote TEXT NOT NULL DEFAULT '';";
+
 const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread, \
     COALESCE((SELECT m.text FROM messages m WHERE m.thread_id = threads.id \
               ORDER BY m.seq DESC LIMIT 1), '')";
 const MESSAGE_COLUMNS: &str = "seq, thread_id, remote_id, client_id, sender_id, sender_name, \
-    outgoing, kind, text, sent_at, media";
+    outgoing, kind, text, sent_at, media, quote";
 
 fn thread_from_row(row: &Row<'_>) -> Result<Thread> {
     let kind: String = row.get(1)?;
@@ -100,11 +103,13 @@ fn message_from_row(row: &Row<'_>) -> Result<Message> {
         kind: row.get(7)?,
         text: row.get(8)?,
         sent_at: row.get(9)?,
-        media: parse_media(&row.get::<_, String>(10)?),
+        media: from_json(&row.get::<_, String>(10)?),
+        quote: from_json(&row.get::<_, String>(11)?),
     })
 }
 
-fn parse_media(stored: &str) -> Option<Media> {
+/// A JSON column; empty means none.
+fn from_json<T: serde::de::DeserializeOwned>(stored: &str) -> Option<T> {
     if stored.is_empty() {
         None
     } else {
@@ -112,21 +117,22 @@ fn parse_media(stored: &str) -> Option<Media> {
     }
 }
 
-fn media_json(media: Option<&Media>) -> String {
-    media
-        .and_then(|m| serde_json::to_string(m).ok())
+fn to_json<T: serde::Serialize>(value: Option<&T>) -> String {
+    value
+        .and_then(|v| serde_json::to_string(v).ok())
         .unwrap_or_default()
 }
 
-/// Recompute text and media of stored messages from their original Zalo JSON,
-/// once the parsing has learned new kinds of content.
+/// Recompute text, media and quote of stored messages from their original Zalo
+/// JSON, once the parsing has learned new kinds of content.
 fn reparse_content(conn: &Connection) -> Result<usize> {
     let rows: Vec<(i64, String)> = {
         let mut stmt = conn.prepare("SELECT seq, raw FROM messages WHERE raw <> '{}'")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<Result<_>>()?
     };
-    let mut update = conn.prepare("UPDATE messages SET text = ?2, media = ?3 WHERE seq = ?1")?;
+    let mut update =
+        conn.prepare("UPDATE messages SET text = ?2, media = ?3, quote = ?4 WHERE seq = ?1")?;
     let mut updated = 0;
     for (seq, raw) in rows {
         let Ok(value) = serde_json::from_str::<Value>(&raw) else {
@@ -139,9 +145,73 @@ fn reparse_content(conn: &Connection) -> Result<usize> {
         let content = value.get("content");
         let text = media::summarize(msg_type, content);
         let found = media::extract(msg_type, content);
-        updated += update.execute(params![seq, text, media_json(found.as_ref())])?;
+        let quote = media::extract_quote(&value);
+        updated += update.execute(params![
+            seq,
+            text,
+            to_json(found.as_ref()),
+            to_json(quote.as_ref())
+        ])?;
     }
     Ok(updated)
+}
+
+/// Turn a message into a recalled one: its content is dropped for good.
+fn recall_in(
+    conn: &Connection,
+    thread_id: &str,
+    remote_id: &str,
+    client_id: &str,
+) -> Result<Option<Message>> {
+    let seq: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM messages WHERE thread_id = ?1 AND kind <> 'chat.undo'
+               AND ((?2 <> '' AND remote_id = ?2) OR (?3 <> '' AND client_id = ?3))
+             ORDER BY seq LIMIT 1",
+            params![thread_id, remote_id, client_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(seq) = seq else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE messages SET kind = 'chat.undo', text = ?2, media = '', quote = '', raw = '{}'
+         WHERE seq = ?1",
+        params![seq, media::RECALLED_TEXT],
+    )?;
+    conn.query_row(
+        &format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq = ?1"),
+        params![seq],
+        message_from_row,
+    )
+    .optional()
+}
+
+/// Recall notices stored as messages by earlier versions: apply them to the
+/// message they recall and drop them.
+fn apply_stored_recalls(conn: &Connection) -> Result<usize> {
+    let notices: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT seq, thread_id, raw FROM messages WHERE kind = 'chat.undo' AND raw <> '{}'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<_>>()?
+    };
+    let mut applied = 0;
+    for (seq, thread_id, raw) in notices {
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some((remote_id, client_id)) = media::recalled_ids(value.get("content")) else {
+            continue;
+        };
+        if recall_in(conn, &thread_id, &remote_id, &client_id)?.is_some() {
+            conn.execute("DELETE FROM messages WHERE seq = ?1", params![seq])?;
+            applied += 1;
+        }
+    }
+    Ok(applied)
 }
 
 fn device_from_row(row: &Row<'_>) -> Result<Device> {
@@ -176,14 +246,18 @@ impl Store {
             conn.execute_batch(SCHEMA_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
         }
-        if version < 2 {
+        if version < 3 {
             let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA_V2)?;
+            if version < 2 {
+                tx.execute_batch(SCHEMA_V2)?;
+            }
+            tx.execute_batch(SCHEMA_V3)?;
             let reparsed = reparse_content(&tx)?;
-            tx.pragma_update(None, "user_version", 2)?;
+            let recalls = apply_stored_recalls(&tx)?;
+            tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
             if reparsed > 0 {
-                tracing::info!(count = reparsed, "stored messages re-parsed for media");
+                tracing::info!(count = reparsed, recalls, "stored messages re-parsed");
             }
         }
         Ok(Self {
@@ -284,8 +358,8 @@ impl Store {
         tx.execute(
             "INSERT INTO messages
                 (thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text,
-                 sent_at, raw, media)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 sent_at, raw, media, quote)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 m.thread_id,
                 m.remote_id,
@@ -297,7 +371,8 @@ impl Store {
                 m.text,
                 m.sent_at,
                 m.raw,
-                media_json(m.media.as_ref())
+                to_json(m.media.as_ref()),
+                to_json(m.quote.as_ref())
             ],
         )?;
         let seq = tx.last_insert_rowid();
@@ -322,8 +397,21 @@ impl Store {
             kind: m.kind.clone(),
             text: m.text.clone(),
             media: m.media.clone(),
+            quote: m.quote.clone(),
             sent_at: m.sent_at,
         }))
+    }
+
+    /// Apply a recall: the message with `remote_id` (or, when it was sent from
+    /// here, `client_id`) loses its content. Returns the updated message, `None`
+    /// when it is not stored or already recalled.
+    pub fn recall_message(
+        &self,
+        thread_id: &str,
+        remote_id: &str,
+        client_id: &str,
+    ) -> Result<Option<Message>> {
+        recall_in(&self.conn(), thread_id, remote_id, client_id)
     }
 
     /// The message this gateway sent with `client_id`, if stored.
@@ -468,7 +556,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::thread_id;
+    use crate::model::{thread_id, Media, Quote};
 
     fn user(remote: &str, name: &str) -> ThreadUpsert {
         ThreadUpsert {
@@ -490,9 +578,48 @@ mod tests {
             kind: "webchat".into(),
             text: format!("text {remote}"),
             media: None,
+            quote: None,
             sent_at: at,
             raw: "{}".into(),
         }
+    }
+
+    #[test]
+    fn recalls_drop_the_content_of_a_message() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        let mut reply = msg(&t, "m1", "c1", false, 1);
+        reply.raw = r#"{"content":"secret"}"#.into();
+        reply.quote = Some(Quote {
+            sender_name: "B".into(),
+            text: "q".into(),
+            remote_id: "m0".into(),
+        });
+        let stored = s.insert_message(&reply).unwrap().unwrap();
+        assert_eq!(stored.quote, reply.quote);
+        s.insert_message(&msg(&t, "local:9", "9", true, 2)).unwrap();
+
+        let recalled = s.recall_message(&t, "m1", "").unwrap().unwrap();
+        assert_eq!(
+            (recalled.kind.as_str(), recalled.text.as_str()),
+            ("chat.undo", media::RECALLED_TEXT)
+        );
+        assert_eq!((recalled.media, recalled.quote), (None, None));
+        let raw: String = s
+            .conn()
+            .query_row(
+                "SELECT raw FROM messages WHERE seq = ?1",
+                [stored.seq],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, "{}");
+        // Already recalled, unknown, or matched by the client id of a message sent here.
+        assert!(s.recall_message(&t, "m1", "").unwrap().is_none());
+        assert!(s.recall_message(&t, "m404", "").unwrap().is_none());
+        assert!(s.recall_message(&t, "srv-9", "9").unwrap().is_some());
+        assert_eq!(s.thread(&t).unwrap().unwrap().preview, media::RECALLED_TEXT);
     }
 
     #[test]
@@ -516,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn version_1_databases_get_media_from_the_stored_json() {
+    fn version_1_databases_are_upgraded_from_the_stored_json() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
@@ -525,7 +652,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let raw = serde_json::json!({
+        let photo = serde_json::json!({
             "msgType": "chat.photo",
             "content": {
                 "href": "https://photo.zdn.vn/a.jpg",
@@ -533,25 +660,52 @@ mod tests {
                 "params": serde_json::json!({ "width": 800, "height": 600 }).to_string()
             }
         });
-        conn.execute(
-            "INSERT INTO messages (thread_id, remote_id, outgoing, kind, text, sent_at, raw)
-             VALUES ('zalo:u:1', 'm1', 0, 'chat.photo', '[Hình ảnh]', 1, ?1)",
-            params![raw.to_string()],
-        )
-        .unwrap();
+        let reply = serde_json::json!({
+            "msgType": "webchat", "content": "ok",
+            "quote": { "msg": "ăn chưa?", "fromD": "Lan", "globalMsgId": 5 }
+        });
+        let recalled = serde_json::json!({ "msgType": "webchat", "content": "oops" });
+        let notice = serde_json::json!({
+            "msgType": "chat.undo",
+            "content": { "globalMsgId": 900, "cliMsgId": 901, "deleteMsg": 1 }
+        });
+        for (remote, kind, raw) in [
+            ("m1", "chat.photo", photo),
+            ("m2", "webchat", reply),
+            ("900", "webchat", recalled),
+            ("m4", "chat.undo", notice),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (thread_id, remote_id, outgoing, kind, text, sent_at, raw)
+                 VALUES ('zalo:u:1', ?1, 0, ?2, '', 1, ?3)",
+                params![remote, kind, raw.to_string()],
+            )
+            .unwrap();
+        }
         let s = Store::init(conn).unwrap();
-        let m = &s.messages("zalo:u:1", None, 10).unwrap()[0];
-        let media = m.media.as_ref().unwrap();
+        let messages = s.messages("zalo:u:1", None, 10).unwrap();
+        // The recall notice was applied to its message and dropped.
+        assert_eq!(messages.len(), 3);
+        let media = messages[0].media.as_ref().unwrap();
         assert_eq!(
             (media.kind.as_str(), media.width, media.height),
             ("image", 800, 600)
         );
-        assert_eq!(m.text, "[Hình ảnh]");
+        assert_eq!(messages[0].text, "[Hình ảnh]");
+        let quote = messages[1].quote.as_ref().unwrap();
+        assert_eq!(
+            (quote.sender_name.as_str(), quote.text.as_str()),
+            ("Lan", "ăn chưa?")
+        );
+        assert_eq!(
+            (messages[2].kind.as_str(), messages[2].text.as_str()),
+            ("chat.undo", media::RECALLED_TEXT)
+        );
         let version: i64 = s
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]

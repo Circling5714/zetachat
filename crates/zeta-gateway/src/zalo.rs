@@ -21,7 +21,9 @@ use zeta_zalo::{Device, SessionData, ZaloClient};
 use crate::events::EventBus;
 use crate::media;
 use crate::media_cache::MediaCache;
-use crate::model::{now_ms, thread_id, Media, Message, NewMessage, ThreadKind, ThreadUpsert};
+use crate::model::{
+    now_ms, thread_id, Media, Message, NewMessage, Quote, ThreadKind, ThreadUpsert,
+};
 use crate::store::Store;
 
 /// How often the session is checked with Zalo (one light `me-v2` call).
@@ -212,6 +214,7 @@ pub struct ParsedMessage {
     pub msg_type: String,
     pub text: String,
     pub media: Option<Media>,
+    pub quote: Option<Quote>,
     pub sent_at: i64,
     pub raw: Value,
 }
@@ -273,6 +276,7 @@ fn parse_message(it: &Value, group_bucket: bool, self_uid: &str) -> Option<Parse
         outgoing,
         text: media::summarize(&msg_type, it.get("content")),
         media: media::extract(&msg_type, it.get("content")),
+        quote: media::extract_quote(it),
         msg_type,
         sent_at: field(it, &["ts"]).parse().unwrap_or(0),
         raw: it.clone(),
@@ -633,7 +637,10 @@ impl Connector {
     async fn load_recent(&self, client: &ZaloClient) {
         match client.recent_messages().await {
             Ok(data) => {
-                let stored = parse_frame_messages(&data, &self.self_uid)
+                let mut parsed = parse_frame_messages(&data, &self.self_uid);
+                // Oldest first, so a recall comes after the message it recalls.
+                parsed.sort_by_key(|m| m.sent_at);
+                let stored = parsed
                     .into_iter()
                     .filter(|m| self.store_parsed(m.clone(), false).is_some())
                     .count();
@@ -654,9 +661,32 @@ impl Connector {
         }
     }
 
+    /// A recall changes the recalled message instead of adding a message.
+    fn apply_recall(&self, m: &ParsedMessage) {
+        let Some((remote_id, client_id)) = media::recalled_ids(m.raw.get("content")) else {
+            return;
+        };
+        let thread = thread_id(m.kind, &m.peer);
+        match self.store.recall_message(&thread, &remote_id, &client_id) {
+            Ok(Some(message)) => {
+                let snapshot = self.store.thread(&thread).ok().flatten();
+                let payload = json!({ "message": message, "thread": snapshot });
+                if let Err(e) = self.bus.publish("message_updated", payload) {
+                    tracing::error!(error = %e, "cannot publish a recall");
+                }
+            }
+            Ok(None) => tracing::debug!("recall of a message that is not stored"),
+            Err(e) => tracing::error!(error = %e, "cannot apply a recall"),
+        }
+    }
+
     /// Store a parsed message; returns it when it was new. `live` messages count as
     /// unread when incoming.
     fn store_parsed(&self, m: ParsedMessage, live: bool) -> Option<Message> {
+        if m.msg_type == "chat.undo" {
+            self.apply_recall(&m);
+            return None;
+        }
         // A 1-1 sender's display name fills in an unnamed thread; contacts win.
         let name = if m.kind == ThreadKind::User && !m.outgoing {
             m.sender_name.clone()
@@ -679,6 +709,7 @@ impl Connector {
             kind: m.msg_type,
             text: m.text,
             media: m.media,
+            quote: m.quote,
             sent_at: m.sent_at,
             raw: m.raw.to_string(),
         };
@@ -795,6 +826,7 @@ fn store_sent(
         kind: sent.msg_type.into(),
         text: sent.text,
         media: sent.media,
+        quote: None,
         sent_at: now_ms(),
         raw: "{}".into(),
     };

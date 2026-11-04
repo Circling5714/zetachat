@@ -299,6 +299,7 @@ async fn threads_carry_a_preview_and_status_the_last_event() {
                 kind: "webchat".into(),
                 text: text.to_string(),
                 media: None,
+                quote: None,
                 sent_at: i as i64 + 1,
                 raw: "{}".into(),
             })
