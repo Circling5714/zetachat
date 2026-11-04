@@ -163,6 +163,48 @@ impl ZaloClient {
         self.execute(request, url, key).await
     }
 
+    /// POST one file part as `multipart/form-data` (uploads to the file service).
+    pub(crate) async fn post_multipart(
+        &self,
+        url: &str,
+        field: &str,
+        file_name: &str,
+        mime: &str,
+        bytes: &[u8],
+        key: Option<&[u8]>,
+    ) -> Result<Value> {
+        let boundary = format!("----WebKitFormBoundary{}", crypto::random_hex(16));
+        let safe_name: String = file_name
+            .chars()
+            .map(|c| {
+                if c == '"' || c == '\\' || c.is_control() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let head = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; \
+             filename=\"{safe_name}\"\r\nContent-Type: {mime}\r\n\r\n"
+        );
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let mut body = Vec::with_capacity(head.len() + bytes.len() + tail.len());
+        body.extend_from_slice(head.as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(tail.as_bytes());
+        let request = self
+            .http
+            .post(url)
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .timeout(Duration::from_secs(120))
+            .body(body);
+        self.execute(request, url, key).await
+    }
+
     /// GET on a service, moving to the next host on transport errors, 404 and 5xx.
     /// Zalo error codes never trigger failover.
     pub(crate) async fn get_service(

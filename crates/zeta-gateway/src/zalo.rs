@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use zeta_zalo::api::{Recipient, SessionHealth};
 use zeta_zalo::socket::{self, RealtimeEvent};
+use zeta_zalo::upload::{self, Photo};
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
 use crate::events::EventBus;
@@ -67,6 +68,29 @@ pub struct ZaloStatus {
     pub detail: String,
 }
 
+/// A photo or file a device wants to send.
+#[derive(Clone, Debug)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    /// Picture size, 0 when unknown.
+    pub width: u32,
+    pub height: u32,
+    /// Shown under a photo; may be empty.
+    pub caption: String,
+}
+
+impl Attachment {
+    /// Pictures Zalo shows as photos; everything else is sent as a file.
+    pub fn is_photo(&self) -> bool {
+        matches!(
+            self.mime.as_str(),
+            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+        )
+    }
+}
+
 pub enum ZaloCommand {
     SendText {
         kind: ThreadKind,
@@ -74,9 +98,59 @@ pub enum ZaloCommand {
         text: String,
         reply: oneshot::Sender<Result<Message, String>>,
     },
+    SendAttachment {
+        kind: ThreadKind,
+        remote_id: String,
+        attachment: Attachment,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
     },
+}
+
+/// How long to wait for Zalo to announce an uploaded file on the socket.
+const FILE_DONE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Files Zalo finished storing, announced on the socket (`file_done`); senders
+/// wait here for the URL of their upload.
+#[derive(Default)]
+struct UploadBoard {
+    done: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    changed: tokio::sync::Notify,
+}
+
+impl UploadBoard {
+    fn complete(&self, file_id: String, url: String) {
+        {
+            let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+            // Announcements nobody waits for (uploads from other devices) pile up.
+            if done.len() >= 64 {
+                done.clear();
+            }
+            done.insert(file_id, url);
+        }
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self, file_id: &str, timeout: Duration) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Registered before looking, so an announcement in between still wakes us.
+            let changed = self.changed.notified();
+            let found = self
+                .done
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(file_id);
+            if found.is_some() {
+                return found;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return None;
+            }
+        }
+    }
 }
 
 /// Handle used by the API to talk to the connector.
@@ -115,6 +189,7 @@ pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
         client: None,
         self_uid: String::new(),
         login_running: false,
+        uploads: Arc::new(UploadBoard::default()),
     };
     tokio::spawn(connector.run(rx));
     ZaloHandle { commands, status }
@@ -241,6 +316,7 @@ struct Connector {
     client: Option<Arc<ZaloClient>>,
     self_uid: String,
     login_running: bool,
+    uploads: Arc<UploadBoard>,
 }
 
 async fn next_realtime(
@@ -438,6 +514,32 @@ impl Connector {
                     let _ = reply.send(result);
                 });
             }
+            ZaloCommand::SendAttachment {
+                kind,
+                remote_id,
+                attachment,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let sender = AttachmentSender {
+                    client,
+                    store: self.store.clone(),
+                    bus: self.bus.clone(),
+                    media: self.cfg.media.clone(),
+                    uploads: self.uploads.clone(),
+                    self_uid: self.self_uid.clone(),
+                };
+                tokio::spawn(async move {
+                    let result = sender.send(kind, &remote_id, attachment).await;
+                    if let Err(e) = &result {
+                        tracing::warn!(error = %e, "attachment not sent");
+                    }
+                    let _ = reply.send(result);
+                });
+            }
             ZaloCommand::StartLogin { reply } => {
                 if self.login_running {
                     let current = self
@@ -514,6 +616,12 @@ impl Connector {
             }
             RealtimeEvent::Frame(frame) => {
                 tracing::debug!(cmd = frame.cmd, sub = frame.sub_cmd, "frame");
+                if frame.is_control() {
+                    for (file_id, url) in upload::file_done_events(&frame.payload) {
+                        tracing::debug!(%file_id, "file stored by Zalo");
+                        self.uploads.complete(file_id, url);
+                    }
+                }
                 true
             }
         }
@@ -639,23 +747,32 @@ impl Connector {
     }
 }
 
-async fn send_and_store(
-    client: &ZaloClient,
+fn recipient(kind: ThreadKind, remote_id: &str) -> Recipient<'_> {
+    match kind {
+        ThreadKind::User => Recipient::User(remote_id),
+        ThreadKind::Group => Recipient::Group(remote_id),
+    }
+}
+
+/// A message Zalo accepted, to be stored as outgoing.
+struct Sent {
+    msg_id: String,
+    client_id: u64,
+    msg_type: &'static str,
+    text: String,
+    media: Option<Media>,
+}
+
+/// Store a message this gateway sent and announce it. When the socket echo was
+/// faster than the HTTP answer, the copy stored from the echo is returned.
+fn store_sent(
     store: &Store,
     bus: &EventBus,
     self_uid: &str,
     kind: ThreadKind,
     remote_id: &str,
-    text: &str,
+    sent: Sent,
 ) -> Result<Message, String> {
-    let recipient = match kind {
-        ThreadKind::User => Recipient::User(remote_id),
-        ThreadKind::Group => Recipient::Group(remote_id),
-    };
-    let sent = client
-        .send_text(recipient, text)
-        .await
-        .map_err(|e| e.to_string())?;
     let thread = ThreadUpsert {
         kind,
         remote_id: remote_id.to_string(),
@@ -669,15 +786,15 @@ async fn send_and_store(
         remote_id: if sent.msg_id.is_empty() {
             format!("local:{client_id}")
         } else {
-            sent.msg_id.clone()
+            sent.msg_id
         },
         client_id: client_id.clone(),
         sender_id: self_uid.to_string(),
         sender_name: String::new(),
         outgoing: true,
-        kind: "webchat".into(),
-        text: text.to_string(),
-        media: None,
+        kind: sent.msg_type.into(),
+        text: sent.text,
+        media: sent.media,
         sent_at: now_ms(),
         raw: "{}".into(),
     };
@@ -689,11 +806,145 @@ async fn send_and_store(
             publish_message(store, bus, &message);
             Ok(message)
         }
-        // The socket echo was faster than the HTTP answer: return the stored copy.
         None => store
             .message_by_client_id(&id, &client_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "tin nhắn đã gửi nhưng không tìm thấy trong kho".to_string()),
+    }
+}
+
+async fn send_and_store(
+    client: &ZaloClient,
+    store: &Store,
+    bus: &EventBus,
+    self_uid: &str,
+    kind: ThreadKind,
+    remote_id: &str,
+    text: &str,
+) -> Result<Message, String> {
+    let sent = client
+        .send_text(recipient(kind, remote_id), text)
+        .await
+        .map_err(|e| e.to_string())?;
+    let sent = Sent {
+        msg_id: sent.msg_id,
+        client_id: sent.client_id,
+        msg_type: "webchat",
+        text: text.to_string(),
+        media: None,
+    };
+    store_sent(store, bus, self_uid, kind, remote_id, sent)
+}
+
+/// Everything a background send of a photo or file needs.
+struct AttachmentSender {
+    client: Arc<ZaloClient>,
+    store: Arc<Store>,
+    bus: EventBus,
+    media: Option<Arc<MediaCache>>,
+    uploads: Arc<UploadBoard>,
+    self_uid: String,
+}
+
+impl AttachmentSender {
+    async fn send(
+        &self,
+        kind: ThreadKind,
+        remote_id: &str,
+        a: Attachment,
+    ) -> Result<Message, String> {
+        let to = recipient(kind, remote_id);
+        let err = |e: zeta_zalo::Error| e.to_string();
+        let caption = a.caption.trim().to_string();
+        let size = a.bytes.len() as u64;
+        let sent = if a.is_photo() {
+            let photo = Photo {
+                bytes: &a.bytes,
+                file_name: &a.name,
+                mime: &a.mime,
+                width: a.width,
+                height: a.height,
+                caption: &caption,
+            };
+            let photo = self.client.send_photo(to, photo).await.map_err(err)?;
+            self.keep(&[&photo.hd_url, &photo.thumb_url], &a).await;
+            Sent {
+                msg_id: photo.msg_id,
+                client_id: photo.client_id,
+                msg_type: "chat.photo",
+                text: if caption.is_empty() {
+                    "[Hình ảnh]".into()
+                } else {
+                    format!("[Hình ảnh] {caption}")
+                },
+                media: Some(Media {
+                    kind: "image".into(),
+                    url: photo.hd_url,
+                    thumb: photo.thumb_url,
+                    width: a.width,
+                    height: a.height,
+                    description: caption,
+                    size,
+                    ..Media::default()
+                }),
+            }
+        } else {
+            let uploaded = self
+                .client
+                .upload_file(to, &a.bytes, &a.name, &a.mime)
+                .await
+                .map_err(err)?;
+            let url = self
+                .uploads
+                .wait(&uploaded.file_id, FILE_DONE_TIMEOUT)
+                .await
+                .ok_or_else(|| "Zalo chưa xác nhận đã nhận tệp, hãy thử lại".to_string())?;
+            let file = self
+                .client
+                .send_file(to, &uploaded, &url)
+                .await
+                .map_err(err)?;
+            self.keep(&[&url], &a).await;
+            Sent {
+                msg_id: file.msg_id,
+                client_id: file.client_id,
+                msg_type: "share.file",
+                text: format!("[Tập tin] {}", a.name),
+                media: Some(Media {
+                    kind: "file".into(),
+                    url,
+                    name: a.name.clone(),
+                    size,
+                    ..Media::default()
+                }),
+            }
+        };
+        store_sent(
+            &self.store,
+            &self.bus,
+            &self.self_uid,
+            kind,
+            remote_id,
+            sent,
+        )
+    }
+
+    /// Keep the sent bytes in the media cache under the URLs Zalo gave them, so
+    /// the sender sees them at once without downloading them back.
+    async fn keep(&self, urls: &[&String], a: &Attachment) {
+        let Some(cache) = &self.media else {
+            return;
+        };
+        let mut seen: Vec<&String> = Vec::new();
+        for url in urls.iter().copied() {
+            if url.is_empty() || seen.contains(&url) {
+                continue;
+            }
+            seen.push(url);
+            if let Err(e) = cache.insert(url, &a.bytes, &a.mime).await {
+                tracing::debug!(error = %e, "cannot cache a sent file");
+            }
+        }
     }
 }
 
@@ -820,6 +1071,42 @@ mod tests {
         );
         assert!(got[0].media.is_none());
         assert_eq!(parsed_thread_id(&got[3]), "zalo:g:777");
+    }
+
+    #[tokio::test]
+    async fn upload_announcements_reach_their_sender() {
+        let board = Arc::new(UploadBoard::default());
+        // Announced before anyone waits (the socket can beat the HTTP answer).
+        board.complete("1".into(), "https://f.zdn.vn/1".into());
+        assert_eq!(
+            board.wait("1", Duration::from_millis(10)).await.as_deref(),
+            Some("https://f.zdn.vn/1")
+        );
+        // Announced while waiting.
+        let waiter = {
+            let board = board.clone();
+            tokio::spawn(async move { board.wait("2", Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        board.complete("3".into(), "https://f.zdn.vn/3".into());
+        board.complete("2".into(), "https://f.zdn.vn/2".into());
+        assert_eq!(waiter.await.unwrap().as_deref(), Some("https://f.zdn.vn/2"));
+        assert_eq!(board.wait("9", Duration::from_millis(10)).await, None);
+    }
+
+    #[test]
+    fn photos_and_files() {
+        let a = |mime: &str| Attachment {
+            name: "x".into(),
+            mime: mime.into(),
+            bytes: vec![1],
+            width: 0,
+            height: 0,
+            caption: String::new(),
+        };
+        assert!(a("image/png").is_photo());
+        assert!(!a("image/svg+xml").is_photo());
+        assert!(!a("application/pdf").is_photo());
     }
 
     #[test]

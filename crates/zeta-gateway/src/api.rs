@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -28,7 +28,10 @@ use crate::events::EventBus;
 use crate::media_cache::{self, FetchError, MediaCache};
 use crate::model::{split_thread_id, Message, StoredEvent, Thread};
 use crate::store::Store;
-use crate::zalo::{LoginState, ZaloCommand, ZaloHandle};
+use crate::zalo::{Attachment, LoginState, ZaloCommand, ZaloHandle};
+
+/// Largest photo or file a device can send.
+pub const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 
 /// Shared state of the HTTP handlers.
 #[derive(Clone)]
@@ -98,6 +101,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/threads/{id}/messages",
             get(list_messages).post(send_message),
+        )
+        .route(
+            "/api/v1/threads/{id}/attachments",
+            post(send_attachment).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .route("/api/v1/threads/{id}/read", post(mark_read))
         .route("/api/v1/events", get(list_events))
@@ -275,6 +282,100 @@ async fn send_message(
     Ok(Json(message))
 }
 
+#[derive(Deserialize)]
+struct AttachmentQuery {
+    /// File name shown to the recipient.
+    name: String,
+    #[serde(default)]
+    caption: String,
+    /// Picture size, when the client knows it.
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+}
+
+/// A file name without directories or control characters, at most 180 characters.
+fn clean_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = base.chars().filter(|c| !c.is_control()).take(180).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        "tep".into()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// Content type from the file name, for clients that send none.
+fn type_from_name(name: &str) -> &'static str {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Send a photo or a file. The body is the file itself; pictures in common
+/// formats become photos, anything else a file.
+async fn send_attachment(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Query(q): Query<AttachmentQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Message> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request("file is empty"));
+    }
+    let name = clean_file_name(&q.name);
+    let declared = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty() && v != "application/octet-stream");
+    let mime = declared.unwrap_or_else(|| type_from_name(&name).to_string());
+    let attachment = Attachment {
+        name,
+        mime,
+        bytes: body.to_vec(),
+        width: q.width,
+        height: q.height,
+        caption: q.caption,
+    };
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::SendAttachment {
+            kind,
+            remote_id: remote_id.to_string(),
+            attachment,
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let message = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(message))
+}
+
 async fn mark_read(
     State(st): State<AppState>,
     _: AuthDevice,
@@ -383,6 +484,7 @@ async fn media(
 ) -> Result<Response, ApiError> {
     let file = st.media.get(&q.u).await.map_err(|e| match e {
         FetchError::NotAllowed => ApiError::bad_request("not a Zalo media URL"),
+        FetchError::NotFound => ApiError::not_found("media"),
         FetchError::TooLarge => ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "file too large for the gateway",
@@ -439,4 +541,21 @@ async fn start_login(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Log
         .await
         .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
     Ok(Json(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_names_are_cleaned() {
+        assert_eq!(clean_file_name(r"D:\docs\Báo cáo.pdf"), "Báo cáo.pdf");
+        assert_eq!(clean_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(clean_file_name("a\r\nb.txt"), "ab.txt");
+        assert_eq!(clean_file_name(".."), "tep");
+        assert_eq!(clean_file_name("  "), "tep");
+        assert_eq!(clean_file_name(&"x".repeat(500)).len(), 180);
+        assert_eq!(type_from_name("ẢNH.JPG"), "image/jpeg");
+        assert_eq!(type_from_name("noext"), "application/octet-stream");
+    }
 }

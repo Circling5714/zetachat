@@ -9,9 +9,10 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::events::EventBus;
+use crate::media_cache::{MediaCache, LOCAL_URL_PREFIX};
 use crate::model::{now_ms, thread_id, Media, Message, NewMessage, ThreadKind, ThreadUpsert};
 use crate::store::Store;
-use crate::zalo::{LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus};
+use crate::zalo::{Attachment, LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus};
 
 /// Sample pictures are inline SVG, so the demo needs no network at all.
 const PHOTO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fde68a"/><stop offset="1" stop-color="#f97316"/></linearGradient></defs><rect width="800" height="600" fill="url(#g)"/><ellipse cx="400" cy="330" rx="310" ry="205" fill="#7c2d12" opacity="0.85"/><circle cx="290" cy="270" r="84" fill="#fff"/><circle cx="290" cy="270" r="62" fill="#16a34a"/><circle cx="510" cy="270" r="84" fill="#fff"/><circle cx="510" cy="270" r="62" fill="#dc2626"/><circle cx="400" cy="420" r="74" fill="#fff"/><circle cx="400" cy="420" r="54" fill="#facc15"/></svg>"##;
@@ -225,6 +226,13 @@ fn seed(store: &Store) {
     let _ = store.mark_read(&thread_id(ThreadKind::User, "1002"));
 }
 
+/// What a demo message carries besides its text.
+struct Content<'a> {
+    kind: &'a str,
+    text: &'a str,
+    media: Option<Media>,
+}
+
 fn store_and_publish(
     store: &Store,
     bus: &EventBus,
@@ -232,7 +240,7 @@ fn store_and_publish(
     remote_id: &str,
     outgoing: bool,
     sender_name: &str,
-    text: &str,
+    content: Content<'_>,
 ) -> Option<Message> {
     let thread = ThreadUpsert {
         kind,
@@ -254,9 +262,9 @@ fn store_and_publish(
             },
             sender_name: sender_name.into(),
             outgoing,
-            kind: "webchat".into(),
-            text: text.into(),
-            media: None,
+            kind: content.kind.into(),
+            text: content.text.into(),
+            media: content.media,
             sent_at: now,
             raw: "{}".into(),
         })
@@ -266,8 +274,53 @@ fn store_and_publish(
     Some(message)
 }
 
+fn text(text: &str) -> Content<'_> {
+    Content {
+        kind: "webchat",
+        text,
+        media: None,
+    }
+}
+
+/// A demo "send": the file stays in the gateway's cache under a local URL.
+async fn keep_attachment(media: &MediaCache, a: &Attachment) -> Result<(Media, String), String> {
+    let url = format!("{LOCAL_URL_PREFIX}{}/{}", now_ms(), a.name);
+    media
+        .insert(&url, &a.bytes, &a.mime)
+        .await
+        .map_err(|e| e.to_string())?;
+    let size = a.bytes.len() as u64;
+    let caption = a.caption.trim().to_string();
+    Ok(if a.is_photo() {
+        let summary = if caption.is_empty() {
+            "[Hình ảnh]".to_string()
+        } else {
+            format!("[Hình ảnh] {caption}")
+        };
+        let media = Media {
+            kind: "image".into(),
+            url,
+            width: a.width,
+            height: a.height,
+            description: caption,
+            size,
+            ..Media::default()
+        };
+        (media, summary)
+    } else {
+        let media = Media {
+            kind: "file".into(),
+            url,
+            name: a.name.clone(),
+            size,
+            ..Media::default()
+        };
+        (media, format!("[Tập tin] {}", a.name))
+    })
+}
+
 /// Start the demo connector.
-pub fn spawn(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
+pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHandle {
     seed(&store);
     let status = Arc::new(RwLock::new(ZaloStatus {
         session: SessionState::Valid,
@@ -286,7 +339,15 @@ pub fn spawn(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
                     text,
                     reply,
                 } => {
-                    let sent = store_and_publish(&store, &bus, kind, &remote_id, true, "", &text);
+                    let sent = store_and_publish(
+                        &store,
+                        &bus,
+                        kind,
+                        &remote_id,
+                        true,
+                        "",
+                        self::text(&text),
+                    );
                     let ok = sent.is_some();
                     let _ = reply.send(sent.ok_or_else(|| "demo: không lưu được tin".to_string()));
                     if ok && kind == ThreadKind::User {
@@ -300,9 +361,41 @@ pub fn spawn(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
                                 .map(|t| t.name)
                                 .unwrap_or_default();
                             let echo = format!("Đã nhận: {text}");
-                            store_and_publish(&store, &bus, kind, &remote_id, false, &name, &echo);
+                            store_and_publish(
+                                &store,
+                                &bus,
+                                kind,
+                                &remote_id,
+                                false,
+                                &name,
+                                self::text(&echo),
+                            );
                         });
                     }
+                }
+                ZaloCommand::SendAttachment {
+                    kind,
+                    remote_id,
+                    attachment,
+                    reply,
+                } => {
+                    let result = match keep_attachment(&media, &attachment).await {
+                        Ok((found, summary)) => {
+                            let content = Content {
+                                kind: if attachment.is_photo() {
+                                    "chat.photo"
+                                } else {
+                                    "share.file"
+                                },
+                                text: &summary,
+                                media: Some(found),
+                            };
+                            store_and_publish(&store, &bus, kind, &remote_id, true, "", content)
+                                .ok_or_else(|| "demo: không lưu được tin".to_string())
+                        }
+                        Err(e) => Err(e),
+                    };
+                    let _ = reply.send(result);
                 }
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {

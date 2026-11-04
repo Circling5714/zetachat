@@ -52,7 +52,8 @@ pub struct SentMessage {
     pub client_id: u64,
 }
 
-fn first_str(v: &Value, keys: &[&str]) -> String {
+/// First non-empty string (or number) among `keys`.
+pub(crate) fn first_str(v: &Value, keys: &[&str]) -> String {
     keys.iter()
         .find_map(|k| match v.get(*k) {
             Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),

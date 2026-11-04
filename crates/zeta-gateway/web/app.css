@@ -317,6 +317,35 @@ a.btn { display: inline-block; text-decoration: none; }
   background: var(--panel);
   border-top: 1px solid var(--border);
 }
+.attach-btn {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--muted);
+}
+.attach-btn:hover { background: var(--hover); color: var(--primary); }
+.sending { padding: 5px 16px; font-size: 13px; color: var(--muted); background: var(--panel); border-top: 1px solid var(--border); }
+.conversation { position: relative; }
+.conversation.dropping::after {
+  content: "Thả vào đây để gửi";
+  position: absolute;
+  inset: 10px;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--primary);
+  border-radius: 16px;
+  background: rgb(37 99 235 / 0.1);
+  color: var(--primary);
+  font-size: 18px;
+  font-weight: 700;
+  pointer-events: none;
+}
 .composer textarea {
   flex: 1;
   resize: none;

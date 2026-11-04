@@ -19,6 +19,10 @@ use zeta_zalo::media::{is_media_url, MediaClient};
 /// Largest file the gateway downloads.
 pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Prefix of files the gateway stored itself (demo uploads): served from the
+/// cache only, never downloaded.
+pub const LOCAL_URL_PREFIX: &str = "https://local.zetachat.invalid/";
+
 /// Served for everything that is not displayable media, always as an attachment.
 pub const ATTACHMENT_TYPE: &str = "application/octet-stream";
 
@@ -119,6 +123,8 @@ fn is_key(name: &str) -> bool {
 pub enum FetchError {
     /// Not a URL of Zalo's media CDN.
     NotAllowed,
+    /// A local file that is not (or no longer) in the cache.
+    NotFound,
     /// Over [`MAX_FILE_BYTES`].
     TooLarge,
     /// The CDN refused or failed.
@@ -130,6 +136,7 @@ impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotAllowed => f.write_str("not a Zalo media URL"),
+            Self::NotFound => f.write_str("file not in the cache"),
             Self::TooLarge => write!(f, "file larger than {MAX_FILE_BYTES} bytes"),
             Self::Upstream(reason) => write!(f, "media download failed: {reason}"),
             Self::Io(e) => write!(f, "media cache I/O error: {e}"),
@@ -203,6 +210,10 @@ impl MediaCache {
 
     /// The cached copy of `url`, downloaded first when missing.
     pub async fn get(&self, url: &str) -> Result<CachedFile, FetchError> {
+        if url.starts_with(LOCAL_URL_PREFIX) {
+            let (_, data, meta) = self.paths(url);
+            return lookup(&data, &meta).await.ok_or(FetchError::NotFound);
+        }
         if !is_media_url(url) {
             return Err(FetchError::NotAllowed);
         }
@@ -436,6 +447,17 @@ mod tests {
             cache.get("https://example.com/a.jpg").await,
             Err(FetchError::NotAllowed)
         ));
+        // Local files come from the cache only.
+        let local = format!("{LOCAL_URL_PREFIX}1/a.pdf");
+        assert!(matches!(cache.get(&local).await, Err(FetchError::NotFound)));
+        cache
+            .insert(&local, b"%PDF-1.7", "application/pdf")
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get(&local).await.unwrap().content_type,
+            ATTACHMENT_TYPE
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

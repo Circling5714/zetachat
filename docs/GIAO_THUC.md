@@ -75,3 +75,14 @@ CDN media trả tệp **không cần cookie phiên**, chỉ với User-Agent và
 - Sticker ở `api.zaloapp.com` (`image/png`). Ảnh đại diện ở `*.zadn.vn`.
 
 Gateway chỉ tải từ các tên miền `zdn.vn`, `zadn.vn`, `dlmd.me`, `zaloapp.com`, `zalo.me` và tên miền con của chúng (`zeta_zalo::media::is_media_url`); chuyển hướng sang tên miền khác bị chặn.
+
+## 8. Gửi ảnh và tệp (đã kiểm chứng)
+
+Cả hai đều tải lên host `file` (`tt-files-wpa.zaloapp.com`) theo từng phần 1 MiB: `POST {file}/api/{message|group}/{loại}/upload?…&params=<mã hóa>&type=<2 cho người, 11 cho nhóm>`, thân `multipart/form-data` với trường `chunkContent`. `params` gồm `totalChunk`, `chunkId` (từ 1), `fileName`, `totalSize`, `clientId` (giữ nguyên cho mọi phần), `imei`, `isE2EE: 0`, `toid` hoặc `grid`; với ảnh thêm `jxl: 0`.
+
+- **Ảnh**: loại `photo_original`. Phần cuối trả về `photoId`, `normalUrl`, `hdUrl`, `thumbUrl`; sau đó `POST {file}/api/…/photo_original/send` với `photoId`, `clientId`, `desc` (chú thích), `width`, `height` và các URL. Ảnh nằm trên `*-zpcloud.zdn.vn`.
+- **Tệp**: loại `asyncfile`. Phần cuối trả về `fileId`. Khi lưu xong, Zalo báo qua WebSocket: `cmd 601`, `data.controls[].content` có `act_type: "file_done"`, `fileId` và `data.url`; sự kiện này có thể tới trước cả phản hồi HTTP của phần cuối. Sau đó `POST {file}/api/…/asyncfile/msg` với `fileId`, `fileUrl`, `checksum` (MD5), `fileName`, `totalSize`, `clientId`, `fType: 1`. Tệp nằm trên `*-zfcloud.zdn.vn`.
+
+Zalo gửi lại tin vừa gửi qua WebSocket với cùng `clientId` (`cliMsgId`), nên gateway không lưu trùng.
+
+"Cloud của tôi" là một hội thoại riêng có mã `send2me_id` (trả về ở `getLoginInfo`), không phải `uid` của chính tài khoản. Gửi ảnh với `toid` là `uid` của mình bị từ chối với lỗi `114` (tham số không hợp lệ).

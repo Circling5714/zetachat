@@ -65,7 +65,11 @@ proxy_buffering off;
 proxy_read_timeout 1h;
 ```
 
-Gateway trả tệp tối đa 256 MB; Nginx không giới hạn dung lượng phản hồi nên không cần chỉnh gì thêm cho ảnh và video.
+Gateway trả tệp tối đa 256 MB; Nginx không giới hạn dung lượng phản hồi nên không cần chỉnh gì thêm cho ảnh và video. Để gửi ảnh và tệp đến 100 MB, thêm vào ô *Advanced* (mặc định Nginx chỉ nhận request 1 MB):
+
+```nginx
+client_max_body_size 100m;
+```
 
 Chỉ cho Nginx Proxy Manager truy cập cổng của gateway:
 

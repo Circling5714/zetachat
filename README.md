@@ -37,7 +37,7 @@ Chi tiết trong [docs/KIEN_TRUC.md](docs/KIEN_TRUC.md). Những gì đã kiểm
 | 0 | Chạy thử một phiên Zalo trên máy chủ (bằng ctdozlite) | Phiên chạy được, tin đến và đi về tới máy chủ trong vài giây; đang đo độ bền qua nhiều ngày |
 | 1 | `zeta-zalo`: lõi giao thức tách từ ctdozlite | Đã có và đã chạy với Zalo thật: đăng nhập QR, lưu phiên, kiểm tra phiên, bạn bè, nhóm, tin gần đây, gửi tin, WebSocket thời gian thực |
 | 2 | Gateway: dịch vụ nền, SQLite, API, token theo thiết bị | Đã chạy với Zalo thật: nhận tin qua WebSocket, gửi tin (không trùng khi Zalo gửi lại bản sao), đồng bộ danh bạ và nhóm, proxy và bộ nhớ đệm media (ảnh, video, sticker, tệp). Bản release khoảng 10 MB, dùng vài MB RAM khi rảnh |
-| 3 | Client: giao diện web (PWA), bản Windows bằng Tauri | Đã có giao diện web do gateway phục vụ: hội thoại, gửi/nhận thời gian thực, ảnh (bấm để phóng to), video, sticker, tin nhắn thoại, tệp, thẻ liên kết, thông báo, đăng nhập Zalo bằng QR, cài được như app. Chưa có bản Tauri, chưa gửi được ảnh và tệp |
+| 3 | Client: giao diện web (PWA), bản Windows bằng Tauri | Đã có giao diện web do gateway phục vụ: hội thoại, gửi/nhận thời gian thực, ảnh (bấm để phóng to), video, sticker, tin nhắn thoại, tệp, thẻ liên kết; gửi ảnh và tệp (nút đính kèm, dán ảnh, kéo thả); thông báo, đăng nhập Zalo bằng QR, cài được như app. Chưa có bản Tauri |
 | 4 | Connector Telegram (TDLib) | Dự kiến |
 
 ## Cấu trúc

@@ -112,7 +112,12 @@ pub(crate) fn hex_upper(bytes: &[u8]) -> String {
 
 /// Lower-case hex MD5.
 pub fn md5_hex(s: &str) -> String {
-    hex_lower(&Md5::digest(s.as_bytes()))
+    md5_hex_bytes(s.as_bytes())
+}
+
+/// Lower-case hex MD5 of raw bytes (file checksums).
+pub fn md5_hex_bytes(bytes: &[u8]) -> String {
+    hex_lower(&Md5::digest(bytes))
 }
 
 /// How a JSON value is written into a query string and into the signature.

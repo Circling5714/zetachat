@@ -19,6 +19,7 @@ pub mod media;
 pub mod param_cipher;
 pub mod session;
 pub mod socket;
+pub mod upload;
 
 pub use client::ZaloClient;
 pub use domains::{Domains, Service};

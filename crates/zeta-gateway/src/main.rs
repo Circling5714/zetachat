@@ -149,7 +149,7 @@ async fn serve(data_dir: &Path, listen: SocketAddr, demo: bool, media_cache_mb: 
             );
         }
         tracing::warn!("demo mode: sample data, Zalo is not contacted");
-        demo::spawn(store.clone(), bus.clone())
+        demo::spawn(store.clone(), bus.clone(), media.clone())
     } else {
         zalo::spawn(
             ZaloConfig {

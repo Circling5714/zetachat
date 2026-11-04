@@ -639,6 +639,108 @@ $('composer').addEventListener('submit', async (e) => {
   }
 });
 
+// -------------------------------------------------------------- attachments
+
+const MAX_UPLOAD = 100 * 1024 * 1024; // the gateway's limit
+
+/** Width and height of a picture; zeros when the browser cannot read it. */
+async function pictureSize(file) {
+  if (!file.type.startsWith('image/') || typeof createImageBitmap !== 'function') return [0, 0];
+  try {
+    const bitmap = await createImageBitmap(file);
+    const size = [bitmap.width, bitmap.height];
+    bitmap.close();
+    return size;
+  } catch {
+    return [0, 0];
+  }
+}
+
+async function uploadFile(id, file) {
+  const [width, height] = await pictureSize(file);
+  const ext = (file.type.split('/')[1] || 'bin').replace('jpeg', 'jpg');
+  const name = file.name || `zetachat-${Date.now()}.${ext}`;
+  const query = new URLSearchParams({ name, width, height });
+  const res = await fetch(`${API}/threads/${encodeURIComponent(id)}/attachments?${query}`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': file.type || 'application/octet-stream' },
+    body: file,
+  });
+  if (res.status === 401) throw new Unauthorized('unauthorized');
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+  return data;
+}
+
+let uploading = 0;
+function showUploading(delta) {
+  uploading += delta;
+  const box = $('sending');
+  box.hidden = uploading === 0;
+  box.textContent = uploading > 1 ? `Đang gửi ${uploading} tệp…` : 'Đang gửi…';
+}
+
+/** Send files one after the other, in the conversation open when they were picked. */
+async function sendFiles(files) {
+  const id = state.current;
+  if (!id) return;
+  for (const file of files) {
+    if (file.size > MAX_UPLOAD) {
+      toast(`${file.name}: lớn hơn 100 MB, không gửi được qua gateway`);
+      continue;
+    }
+    showUploading(1);
+    try {
+      const message = await uploadFile(id, file);
+      onMessage({ message, thread: null });
+    } catch (err) {
+      handleError(err, `Không gửi được ${file.name || 'tệp'}: `);
+    } finally {
+      showUploading(-1);
+    }
+  }
+}
+
+$('attach').addEventListener('click', () => $('file-input').click());
+$('file-input').addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  sendFiles(files);
+});
+
+// Pasting a screenshot sends it.
+input.addEventListener('paste', (e) => {
+  const files = [...((e.clipboardData && e.clipboardData.files) || [])];
+  if (!files.length) return;
+  e.preventDefault();
+  sendFiles(files);
+});
+
+// Dropping files on the conversation sends them.
+const dropZone = $('conversation');
+let dragDepth = 0;
+const carriesFiles = (e) => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes('Files');
+dropZone.addEventListener('dragenter', (e) => {
+  if (!carriesFiles(e)) return;
+  dragDepth += 1;
+  dropZone.classList.add('dropping');
+});
+dropZone.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) dropZone.classList.remove('dropping');
+});
+dropZone.addEventListener('dragover', (e) => {
+  if (carriesFiles(e)) e.preventDefault();
+});
+dropZone.addEventListener('drop', (e) => {
+  if (!carriesFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  dropZone.classList.remove('dropping');
+  sendFiles([...e.dataTransfer.files]);
+});
+
 // ------------------------------------------------------------ notifications
 
 function askNotificationPermission() {

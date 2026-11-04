@@ -54,7 +54,12 @@
           </div>
         </header>
         <div id="messages" class="messages" aria-live="polite"></div>
+        <div id="sending" class="sending" role="status" hidden></div>
         <form id="composer" class="composer">
+          <button id="attach" class="attach-btn" type="button" title="Gửi ảnh hoặc tệp (có thể dán hoặc kéo thả)" aria-label="Gửi ảnh hoặc tệp">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M8.5 12.5l6.4-6.4a3 3 0 0 1 4.2 4.2l-8.1 8.1a5 5 0 0 1-7.1-7.1L11.6 3.6M10.6 15.2l6.3-6.3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <input id="file-input" type="file" multiple hidden>
           <textarea id="input" rows="1" placeholder="Nhập tin nhắn…" aria-label="Tin nhắn"></textarea>
           <button id="send" class="btn" type="submit">Gửi</button>
         </form>

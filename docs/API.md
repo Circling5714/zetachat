@@ -15,6 +15,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè chưa từng nhắn tin |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu |
+| POST | `/threads/{id}/attachments?name=&caption=&width=&height=` | Gửi ảnh hoặc tệp. Thân request là chính tệp (tối đa 100 MB), `Content-Type` là loại tệp. Ảnh JPEG, PNG, WebP, GIF được gửi dạng ảnh (`width`, `height` là kích thước ảnh nếu client biết); loại khác được gửi dạng tệp. Trả về tin nhắn đã lưu |
 | POST | `/threads/{id}/read` | Đánh dấu đã đọc |
 | GET | `/events?since=&limit=` | Nhật ký sự kiện sau `seq = since` |
 | GET | `/events/stream` | Luồng sự kiện (server-sent events). Gửi lại header `Last-Event-ID` khi nối lại để không sót sự kiện |
@@ -63,4 +64,6 @@ curl -H "Authorization: Bearer $T" https://chat.example.lan/api/v1/threads
 curl -H "Authorization: Bearer $T" -H 'content-type: application/json' \
      -d '{"text":"xin chào"}' https://chat.example.lan/api/v1/threads/zalo:u:123/messages
 curl -N -H "Authorization: Bearer $T" https://chat.example.lan/api/v1/events/stream
+curl -H "Authorization: Bearer $T" -H 'content-type: image/jpeg' --data-binary @anh.jpg \
+     'https://chat.example.lan/api/v1/threads/zalo:u:123/attachments?name=anh.jpg&width=1280&height=960'
 ```
