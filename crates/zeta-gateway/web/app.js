@@ -58,16 +58,26 @@ function initials(name) {
   return (first + last).toUpperCase();
 }
 
+function isWebUrl(url) {
+  return /^https?:\/\//i.test(url || '');
+}
+
+/** Where to load a media file from: Zalo's CDN only through the gateway's cache. */
+function mediaSrc(url) {
+  if (!url) return '';
+  if (url.startsWith('data:image/')) return url; // sample pictures of the demo
+  return `${API}/media?u=${encodeURIComponent(url)}`;
+}
+
 function avatar(t) {
   const box = el('div', 'avatar', initials(threadName(t)));
   box.style.background = `hsl(${hue(t.id)} 55% 48%)`;
-  if (t.avatar && t.avatar.startsWith('https://')) {
+  if (isWebUrl(t.avatar)) {
     const img = new Image();
     img.alt = '';
     img.loading = 'lazy';
-    img.referrerPolicy = 'no-referrer';
     img.onload = () => box.replaceChildren(img);
-    img.src = t.avatar;
+    img.src = mediaSrc(t.avatar);
   }
   return box;
 }
@@ -236,15 +246,252 @@ $('search').addEventListener('input', (e) => {
   renderThreads();
 });
 
+// -------------------------------------------------------------------- media
+
+/** Files over this size are not fetched by the gateway; they open from Zalo. */
+const GATEWAY_MAX_FILE = 256 * 1024 * 1024;
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let n = bytes;
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i += 1;
+  }
+  const value = n >= 10 || i === 0 ? String(Math.round(n)) : n.toFixed(1).replace('.', ',');
+  return `${value} ${units[i]}`;
+}
+
+function fmtDuration(ms) {
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function extOf(name) {
+  const m = /\.([a-z0-9]{1,5})$/i.exec(name || '');
+  return m ? m[1].toUpperCase() : '';
+}
+
+/** Size a picture box to fit 280×320 with the picture's proportions. */
+function fitBox(node, width, height) {
+  if (width > 0 && height > 0) {
+    const scale = Math.min(1, 280 / width, 320 / height);
+    node.style.width = `${Math.max(64, Math.round(width * scale))}px`;
+    node.style.aspectRatio = `${width} / ${height}`;
+  } else {
+    node.style.width = '280px';
+    node.style.aspectRatio = '4 / 3';
+  }
+}
+
+/** Shown when media cannot be loaded, with a link to the original on Zalo. */
+function mediaFailed(text, md) {
+  const box = el('div', 'media-failed', text);
+  if (isWebUrl(md.url)) {
+    const a = el('a', null, 'Mở bản gốc');
+    a.href = md.url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    box.append(' · ', a);
+  }
+  return box;
+}
+
+function imageNode(md) {
+  const img = new Image();
+  img.className = 'media-img';
+  img.alt = md.description || 'Hình ảnh';
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  fitBox(img, md.width, md.height);
+  // The thumbnail first; the full picture if it fails.
+  const sources = [...new Set([md.thumb, md.url].filter(Boolean))];
+  let tried = 0;
+  img.addEventListener('error', () => {
+    tried += 1;
+    if (tried < sources.length) img.src = mediaSrc(sources[tried]);
+    else img.replaceWith(mediaFailed('Không tải được hình ảnh', md));
+  });
+  img.addEventListener('click', () => openViewer(md));
+  img.src = mediaSrc(sources[0]);
+  return img;
+}
+
+function gifNode(md) {
+  if (!/\.mp4(\?|$)/i.test(md.url)) return imageNode({ ...md, thumb: '' });
+  const video = document.createElement('video');
+  video.className = 'media-img';
+  video.muted = true;
+  video.loop = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  fitBox(video, md.width, md.height);
+  video.src = mediaSrc(md.url);
+  return video;
+}
+
+function videoNode(md) {
+  const box = el('div', 'media-video-box');
+  fitBox(box, md.width, md.height);
+  const video = document.createElement('video');
+  video.className = 'media-video';
+  video.controls = true;
+  video.preload = 'none'; // nothing is downloaded before "play"
+  video.playsInline = true;
+  if (md.thumb) video.poster = mediaSrc(md.thumb);
+  video.addEventListener('error', () => box.replaceWith(mediaFailed('Không phát được video', md)));
+  video.src = mediaSrc(md.url);
+  box.append(video);
+  if (md.duration_ms) {
+    const badge = el('span', 'media-badge', fmtDuration(md.duration_ms));
+    video.addEventListener('play', () => badge.remove(), { once: true });
+    box.append(badge);
+  }
+  return box;
+}
+
+function stickerNode(md) {
+  const img = new Image();
+  img.className = 'sticker-img';
+  img.alt = 'Nhãn dán';
+  img.loading = 'lazy';
+  img.addEventListener('error', () => img.replaceWith(el('div', 'media-failed', '[Nhãn dán]')));
+  img.src = mediaSrc(md.url);
+  return img;
+}
+
+function audioNode(md) {
+  const audio = document.createElement('audio');
+  audio.className = 'media-audio';
+  audio.controls = true;
+  audio.preload = 'none';
+  audio.addEventListener('error', () => audio.replaceWith(mediaFailed('Không phát được tin nhắn thoại', md)));
+  audio.src = mediaSrc(md.url);
+  return audio;
+}
+
+function fileNode(md) {
+  const card = el('a', 'file-card');
+  if (md.size > GATEWAY_MAX_FILE && isWebUrl(md.url)) {
+    card.href = md.url;
+    card.target = '_blank';
+    card.rel = 'noopener noreferrer';
+  } else {
+    card.href = mediaSrc(md.url);
+    card.download = md.name || '';
+  }
+  const info = el('div', 'file-info');
+  const size = fmtSize(md.size);
+  info.append(el('div', 'file-name', md.name || 'Tập tin'), el('div', 'file-size', size ? `${size} · Tải về` : 'Tải về'));
+  card.append(el('div', 'file-icon', extOf(md.name) || 'TỆP'), info);
+  return card;
+}
+
+function linkNode(md) {
+  if (!isWebUrl(md.url)) return el('div', 'media-failed', md.name || 'Liên kết');
+  const card = el('a', 'link-card');
+  card.href = md.url;
+  card.target = '_blank';
+  card.rel = 'noopener noreferrer';
+  if (md.thumb) {
+    const img = new Image();
+    img.alt = '';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => img.remove());
+    img.src = mediaSrc(md.thumb);
+    card.append(img);
+  }
+  const info = el('div', 'link-info');
+  info.append(el('div', 'link-title', md.name || md.url));
+  if (md.description) info.append(el('div', 'link-desc', md.description));
+  info.append(el('div', 'link-host', hostOf(md.url)));
+  card.append(info);
+  return card;
+}
+
+/** Renderer and bubble style per media kind. */
+const MEDIA = {
+  image: [imageNode, 'media'],
+  gif: [gifNode, 'media'],
+  video: [videoNode, 'media'],
+  sticker: [stickerNode, 'sticker'],
+  audio: [audioNode, 'card'],
+  file: [fileNode, 'card'],
+  link: [linkNode, 'card'],
+};
+
+// ----------------------------------------------------------- picture viewer
+
+function openViewer(md) {
+  const src = mediaSrc(md.url || md.thumb);
+  $('viewer-img').src = src;
+  $('viewer-img').alt = md.description || 'Hình ảnh';
+  $('viewer-save').href = src;
+  $('viewer').hidden = false;
+  $('viewer-close').focus();
+}
+
+function closeViewer() {
+  $('viewer').hidden = true;
+  $('viewer-img').removeAttribute('src');
+}
+
+$('viewer-close').addEventListener('click', closeViewer);
+$('viewer').addEventListener('click', (e) => {
+  if (e.target === $('viewer') || e.target === $('viewer-stage')) closeViewer();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('viewer').hidden) closeViewer();
+});
+
 // ------------------------------------------------------------- conversation
+
+const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
+
+/** Append text to `parent`, turning web addresses into links. */
+function appendText(parent, text) {
+  let last = 0;
+  for (const match of text.matchAll(URL_PATTERN)) {
+    const url = match[0].replace(/[).,!?;:\]]+$/, '');
+    if (match.index > last) parent.append(text.slice(last, match.index));
+    const a = el('a', null, url);
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    parent.append(a);
+    last = match.index + url.length;
+  }
+  if (last < text.length) parent.append(text.slice(last));
+}
 
 function messageNode(m, prev, isGroup) {
   const frag = document.createDocumentFragment();
   if (!prev || !sameDay(prev.sent_at, m.sent_at)) frag.appendChild(el('div', 'day', fmtDay(m.sent_at)));
-  const bubble = el('div', `msg ${m.outgoing ? 'out' : 'in'}`);
+  const md = m.media;
+  const media = md && MEDIA[md.kind];
+  const bubble = el('div', `msg ${m.outgoing ? 'out' : 'in'}${media ? ` ${media[1]}` : ''}`);
   const newSender = !prev || prev.outgoing || prev.sender_id !== m.sender_id || !sameDay(prev.sent_at, m.sent_at);
   if (isGroup && !m.outgoing && newSender) bubble.appendChild(el('div', 'sender', m.sender_name || 'Thành viên'));
-  bubble.appendChild(document.createTextNode(m.text));
+  if (media) {
+    bubble.appendChild(media[0](md));
+    if ((md.kind === 'image' || md.kind === 'video') && md.description) {
+      const caption = el('div', 'caption');
+      appendText(caption, md.description);
+      bubble.appendChild(caption);
+    }
+  } else {
+    appendText(bubble, m.text || '');
+  }
   bubble.appendChild(el('span', 'time', fmtClock(m.sent_at)));
   frag.appendChild(bubble);
   return frag;

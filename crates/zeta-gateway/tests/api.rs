@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 use zeta_gateway::api::{self, AppState};
 use zeta_gateway::events::EventBus;
+use zeta_gateway::media_cache::MediaCache;
 use zeta_gateway::model::{thread_id, NewMessage, ThreadKind, ThreadUpsert};
 use zeta_gateway::store::Store;
 use zeta_gateway::zalo::{LoginState, ZaloCommand, ZaloHandle, ZaloStatus};
@@ -50,6 +51,7 @@ fn fake_connector(store: Arc<Store>, bus: EventBus) -> ZaloHandle {
                             outgoing: true,
                             kind: "webchat".into(),
                             text,
+                            media: None,
                             sent_at: 10,
                             raw: "{}".into(),
                         })
@@ -76,10 +78,12 @@ fn fixture() -> Fixture {
     let bus = EventBus::new(store.clone());
     let zalo = fake_connector(store.clone(), bus.clone());
     let (_, token) = store.add_device("test").unwrap();
+    let media = std::env::temp_dir().join(format!("zetachat-api-{:016x}", rand::random::<u64>()));
     let app = api::router(AppState {
         store: store.clone(),
         bus,
         zalo,
+        media: Arc::new(MediaCache::new(media).unwrap()),
     });
     Fixture { app, store, token }
 }

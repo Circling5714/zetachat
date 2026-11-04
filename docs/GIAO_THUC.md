@@ -54,3 +54,24 @@ Khi không dùng được phiên, đôi khi Zalo trả **HTTP 200 với thân r�
 - Khung: `u8 version | u16 LE cmd | u8 subCmd | JSON`. Máy chủ gửi trước `cmd 1` kèm khóa AES-GCM. Trường `encrypt`: 0 không mã hóa, 1 base64 + nén, 2 AES-GCM + nén, 3 AES-GCM (`iv 16 | aad 16 | ciphertext+tag`).
 - Sau khi xác thực, client kéo các hàng đợi có trong `ctrl_qCmds` / `qCmds`. Kéo hàng đợi ngoài danh sách sẽ bị đóng kết nối. Ping mỗi 15 giây.
 - `cmd` của tin nhắn: 501/521 (máy chủ đẩy), 510/511 (client kéo), 533 (có tin mới) rồi 570 (lấy tin). Điều khiển: 601–604.
+
+## 7. Nội dung tin nhắn và media (đã kiểm chứng)
+
+Trường `content` của tin nhắn là chuỗi với tin chữ (`msgType` `webchat`). Với các loại khác nó là object; `params` bên trong là **một chuỗi JSON** cần parse thêm lần nữa.
+
+| `msgType` | Nội dung |
+|---|---|
+| `chat.photo` | `href`, `thumb` (đều là URL ảnh), `title` (chú thích), `params`: `width`, `height`, `hd` (URL), `thumb_width`, `thumb_height`. Đã gặp `hd` trùng `href`, và `thumb` cùng dung lượng với ảnh gốc |
+| `chat.video.msg` | `href` (video), `thumb` (ảnh bìa), `params`: `video_width`, `video_height`, `video_rotation`, `duration` (ms), `fileSize` |
+| `chat.sticker` | Chỉ có `id`, `catId`, `type`. Ảnh: nếu `catId = 0` và `id` từ 1 đến 30 thì là `https://stc-chat.zdn.vn/images/stickers/default/thumb/{id}.png`, còn lại `https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={id}&size=130` (quy tắc của ctdozlite, đã kiểm chứng với một sticker `catId` khác 0) |
+| `share.file` | `href`, `title` (tên tệp), `params.fileSize` (theo ctdozlite) |
+| `chat.recommended`, `chat.link` | Thẻ liên kết: `href`, `title`, `description`, `thumb` |
+| `chat.webcontent` | Thẻ đặc biệt; câu thay thế nằm ở `params.customMsg.msg` |
+
+CDN media trả tệp **không cần cookie phiên**, chỉ với User-Agent và `Referer: https://chat.zalo.me/`:
+
+- Ảnh ở `photo-stal-*.zdn.vn`, gửi kèm `Content-Type: image/jpg` (không chuẩn; đúng phải là `image/jpeg`). Host ảnh trả `200` cho cả request có `Range`.
+- Video ở `video-stal-*.dlmd.me`, hỗ trợ `Range` (`206`). Ảnh bìa video ở `photo-stal-*.zdn.vn`.
+- Sticker ở `api.zaloapp.com` (`image/png`). Ảnh đại diện ở `*.zadn.vn`.
+
+Gateway chỉ tải từ các tên miền `zdn.vn`, `zadn.vn`, `dlmd.me`, `zaloapp.com`, `zalo.me` và tên miền con của chúng (`zeta_zalo::media::is_media_url`); chuyển hướng sang tên miền khác bị chặn.

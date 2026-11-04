@@ -5,6 +5,8 @@ pub mod api;
 pub mod auth;
 pub mod demo;
 pub mod events;
+pub mod media;
+pub mod media_cache;
 pub mod model;
 pub mod store;
 pub mod web;
@@ -15,6 +17,11 @@ use std::path::{Path, PathBuf};
 /// SQLite database inside the data directory.
 pub fn db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("zetachat.db")
+}
+
+/// Cached media files inside the data directory.
+pub fn media_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("media")
 }
 
 /// Saved Zalo session inside the data directory. Contains credentials.

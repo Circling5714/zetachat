@@ -11,8 +11,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 
 use crate::auth;
+use crate::media;
 use crate::model::{
-    now_ms, Device, Message, NewMessage, StoredEvent, Thread, ThreadKind, ThreadUpsert,
+    now_ms, Device, Media, Message, NewMessage, StoredEvent, Thread, ThreadKind, ThreadUpsert,
 };
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -64,11 +65,14 @@ CREATE TABLE devices (
 );
 ";
 
+/// Version 2: structured media (JSON) next to the text summary.
+const SCHEMA_V2: &str = "ALTER TABLE messages ADD COLUMN media TEXT NOT NULL DEFAULT '';";
+
 const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread, \
     COALESCE((SELECT m.text FROM messages m WHERE m.thread_id = threads.id \
               ORDER BY m.seq DESC LIMIT 1), '')";
-const MESSAGE_COLUMNS: &str =
-    "seq, thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text, sent_at";
+const MESSAGE_COLUMNS: &str = "seq, thread_id, remote_id, client_id, sender_id, sender_name, \
+    outgoing, kind, text, sent_at, media";
 
 fn thread_from_row(row: &Row<'_>) -> Result<Thread> {
     let kind: String = row.get(1)?;
@@ -96,7 +100,48 @@ fn message_from_row(row: &Row<'_>) -> Result<Message> {
         kind: row.get(7)?,
         text: row.get(8)?,
         sent_at: row.get(9)?,
+        media: parse_media(&row.get::<_, String>(10)?),
     })
+}
+
+fn parse_media(stored: &str) -> Option<Media> {
+    if stored.is_empty() {
+        None
+    } else {
+        serde_json::from_str(stored).ok()
+    }
+}
+
+fn media_json(media: Option<&Media>) -> String {
+    media
+        .and_then(|m| serde_json::to_string(m).ok())
+        .unwrap_or_default()
+}
+
+/// Recompute text and media of stored messages from their original Zalo JSON,
+/// once the parsing has learned new kinds of content.
+fn reparse_content(conn: &Connection) -> Result<usize> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT seq, raw FROM messages WHERE raw <> '{}'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_>>()?
+    };
+    let mut update = conn.prepare("UPDATE messages SET text = ?2, media = ?3 WHERE seq = ?1")?;
+    let mut updated = 0;
+    for (seq, raw) in rows {
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let msg_type = value
+            .get("msgType")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let content = value.get("content");
+        let text = media::summarize(msg_type, content);
+        let found = media::extract(msg_type, content);
+        updated += update.execute(params![seq, text, media_json(found.as_ref())])?;
+    }
+    Ok(updated)
 }
 
 fn device_from_row(row: &Row<'_>) -> Result<Device> {
@@ -122,7 +167,7 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -130,6 +175,16 @@ impl Store {
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
+        }
+        if version < 2 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V2)?;
+            let reparsed = reparse_content(&tx)?;
+            tx.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
+            if reparsed > 0 {
+                tracing::info!(count = reparsed, "stored messages re-parsed for media");
+            }
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -228,8 +283,9 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO messages
-                (thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text, sent_at, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text,
+                 sent_at, raw, media)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 m.thread_id,
                 m.remote_id,
@@ -240,7 +296,8 @@ impl Store {
                 m.kind,
                 m.text,
                 m.sent_at,
-                m.raw
+                m.raw,
+                media_json(m.media.as_ref())
             ],
         )?;
         let seq = tx.last_insert_rowid();
@@ -264,6 +321,7 @@ impl Store {
             outgoing: m.outgoing,
             kind: m.kind.clone(),
             text: m.text.clone(),
+            media: m.media.clone(),
             sent_at: m.sent_at,
         }))
     }
@@ -431,9 +489,69 @@ mod tests {
             outgoing,
             kind: "webchat".into(),
             text: format!("text {remote}"),
+            media: None,
             sent_at: at,
             raw: "{}".into(),
         }
+    }
+
+    #[test]
+    fn media_is_stored_with_the_message() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        let mut photo = msg(&t, "p1", "", false, 1);
+        photo.media = Some(Media {
+            kind: "image".into(),
+            url: "https://photo.zdn.vn/a.jpg".into(),
+            width: 4,
+            height: 3,
+            ..Media::default()
+        });
+        let stored = s.insert_message(&photo).unwrap().unwrap();
+        assert_eq!(stored.media, photo.media);
+        assert_eq!(s.messages(&t, None, 10).unwrap()[0].media, photo.media);
+        s.insert_message(&msg(&t, "p2", "", false, 2)).unwrap();
+        assert_eq!(s.messages(&t, None, 10).unwrap()[1].media, None);
+    }
+
+    #[test]
+    fn version_1_databases_get_media_from_the_stored_json() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, kind, remote_id) VALUES ('zalo:u:1', 'user', '1')",
+            [],
+        )
+        .unwrap();
+        let raw = serde_json::json!({
+            "msgType": "chat.photo",
+            "content": {
+                "href": "https://photo.zdn.vn/a.jpg",
+                "title": "",
+                "params": serde_json::json!({ "width": 800, "height": 600 }).to_string()
+            }
+        });
+        conn.execute(
+            "INSERT INTO messages (thread_id, remote_id, outgoing, kind, text, sent_at, raw)
+             VALUES ('zalo:u:1', 'm1', 0, 'chat.photo', '[Hình ảnh]', 1, ?1)",
+            params![raw.to_string()],
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let m = &s.messages("zalo:u:1", None, 10).unwrap()[0];
+        let media = m.media.as_ref().unwrap();
+        assert_eq!(
+            (media.kind.as_str(), media.width, media.height),
+            ("image", 800, 600)
+        );
+        assert_eq!(m.text, "[Hình ảnh]");
+        let version: i64 = s
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
     }
 
     #[test]

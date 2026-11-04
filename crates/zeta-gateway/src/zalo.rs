@@ -18,7 +18,9 @@ use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
 use crate::events::EventBus;
-use crate::model::{now_ms, thread_id, Message, NewMessage, ThreadKind, ThreadUpsert};
+use crate::media;
+use crate::media_cache::MediaCache;
+use crate::model::{now_ms, thread_id, Media, Message, NewMessage, ThreadKind, ThreadUpsert};
 use crate::store::Store;
 
 /// How often the session is checked with Zalo (one light `me-v2` call).
@@ -97,6 +99,8 @@ pub struct ZaloConfig {
     pub session_path: PathBuf,
     /// Shown as "Ứng dụng" on the phone when logging in.
     pub computer_name: String,
+    /// Where media of new messages is downloaded ahead of time, if anywhere.
+    pub media: Option<Arc<MediaCache>>,
 }
 
 /// Start the connector task.
@@ -132,6 +136,7 @@ pub struct ParsedMessage {
     pub outgoing: bool,
     pub msg_type: String,
     pub text: String,
+    pub media: Option<Media>,
     pub sent_at: i64,
     pub raw: Value,
 }
@@ -148,53 +153,6 @@ fn field(v: &Value, keys: &[&str]) -> String {
 
 fn is_zero(id: &str) -> bool {
     id.is_empty() || id == "0"
-}
-
-/// Text of a message, or a short Vietnamese summary for non-text content.
-pub fn summarize(msg_type: &str, content: Option<&Value>) -> String {
-    if let Some(Value::String(text)) = content {
-        return text.clone();
-    }
-    let get = |k: &str| {
-        content
-            .and_then(|c| c.get(k))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    };
-    let with_caption = |label: &str, caption: String| {
-        if caption.is_empty() {
-            label.to_string()
-        } else {
-            format!("{label} {caption}")
-        }
-    };
-    match msg_type {
-        "chat.photo" => with_caption("[Hình ảnh]", get("title")),
-        "chat.sticker" => "[Nhãn dán]".into(),
-        "chat.gif" => "[GIF]".into(),
-        "chat.voice" => "[Tin nhắn thoại]".into(),
-        "chat.video.msg" => "[Video]".into(),
-        "share.file" => with_caption("[Tập tin]", get("title")),
-        "chat.location.new" => "[Vị trí]".into(),
-        "chat.undo" => "[Tin nhắn đã thu hồi]".into(),
-        "chat.recommended" | "chat.link" => {
-            let caption = [get("title"), get("description"), get("href")]
-                .into_iter()
-                .find(|s| !s.is_empty())
-                .unwrap_or_default();
-            with_caption("[Liên kết]", caption)
-        }
-        other => {
-            let title = get("title");
-            if title.is_empty() {
-                format!("[{other}]")
-            } else {
-                title
-            }
-        }
-    }
 }
 
 fn parse_message(it: &Value, group_bucket: bool, self_uid: &str) -> Option<ParsedMessage> {
@@ -238,7 +196,8 @@ fn parse_message(it: &Value, group_bucket: bool, self_uid: &str) -> Option<Parse
         },
         sender_name: field(it, &["dName"]),
         outgoing,
-        text: summarize(&msg_type, it.get("content")),
+        text: media::summarize(&msg_type, it.get("content")),
+        media: media::extract(&msg_type, it.get("content")),
         msg_type,
         sent_at: field(it, &["ts"]).parse().unwrap_or(0),
         raw: it.clone(),
@@ -611,6 +570,7 @@ impl Connector {
             outgoing: m.outgoing,
             kind: m.msg_type,
             text: m.text,
+            media: m.media,
             sent_at: m.sent_at,
             raw: m.raw.to_string(),
         };
@@ -619,7 +579,13 @@ impl Connector {
             .upsert_thread(&thread, false)
             .and_then(|_| self.store.insert_message_with(&new, live))
         {
-            Ok(message) => message,
+            Ok(message) => {
+                let found = message.as_ref().and_then(|m| m.media.as_ref());
+                if let (Some(cache), Some(found)) = (&self.cfg.media, found) {
+                    cache.prefetch(found.prefetch_urls());
+                }
+                message
+            }
             Err(e) => {
                 tracing::error!(error = %e, "cannot store message");
                 None
@@ -711,6 +677,7 @@ async fn send_and_store(
         outgoing: true,
         kind: "webchat".into(),
         text: text.to_string(),
+        media: None,
         sent_at: now_ms(),
         raw: "{}".into(),
     };
@@ -816,7 +783,8 @@ mod tests {
             ],
             "groupMsgs": [
                 { "msgId": "4", "uidFrom": "200", "idTo": "group_777", "dName": "Minh", "ts": "4",
-                  "msgType": "chat.photo", "content": { "title": "ảnh đẹp" } }
+                  "msgType": "chat.photo",
+                  "content": { "title": "ảnh đẹp", "href": "https://photo.zdn.vn/a.jpg" } }
             ]
         }});
         let got = parse_frame_messages(&payload, ME);
@@ -845,6 +813,12 @@ mod tests {
             (ThreadKind::Group, "777")
         );
         assert_eq!(got[3].text, "[Hình ảnh] ảnh đẹp");
+        let photo = got[3].media.as_ref().unwrap();
+        assert_eq!(
+            (photo.kind.as_str(), photo.url.as_str()),
+            ("image", "https://photo.zdn.vn/a.jpg")
+        );
+        assert!(got[0].media.is_none());
         assert_eq!(parsed_thread_id(&got[3]), "zalo:g:777");
     }
 
@@ -858,26 +832,5 @@ mod tests {
             (got[0].kind, got[0].peer.as_str()),
             (ThreadKind::Group, "888")
         );
-    }
-
-    #[test]
-    fn summaries_for_non_text_content() {
-        assert_eq!(
-            summarize("chat.sticker", Some(&json!({ "id": 1 }))),
-            "[Nhãn dán]"
-        );
-        assert_eq!(
-            summarize("share.file", Some(&json!({ "title": "a.pdf" }))),
-            "[Tập tin] a.pdf"
-        );
-        assert_eq!(
-            summarize("chat.recommended", Some(&json!({ "href": "https://x" }))),
-            "[Liên kết] https://x"
-        );
-        assert_eq!(
-            summarize("chat.new.kind", Some(&json!({}))),
-            "[chat.new.kind]"
-        );
-        assert_eq!(summarize("webchat", Some(&json!("plain"))), "plain");
     }
 }

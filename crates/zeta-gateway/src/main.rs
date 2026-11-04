@@ -3,16 +3,18 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use zeta_gateway::api::{self, AppState};
 use zeta_gateway::demo;
 use zeta_gateway::events::EventBus;
+use zeta_gateway::media_cache::MediaCache;
 use zeta_gateway::model::now_ms;
 use zeta_gateway::store::Store;
 use zeta_gateway::zalo::{self, ZaloConfig};
-use zeta_gateway::{db_path, session_path};
+use zeta_gateway::{db_path, media_dir, session_path};
 use zeta_zalo::login::QrEvent;
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
@@ -44,6 +46,9 @@ enum Command {
         /// Dùng dữ liệu mẫu, không kết nối Zalo (để thử giao diện). Cần thư mục dữ liệu riêng.
         #[arg(long)]
         demo: bool,
+        /// Dung lượng tối đa của bộ nhớ đệm media (ảnh, video, tệp), tính bằng MB.
+        #[arg(long, env = "ZETACHAT_MEDIA_CACHE_MB", default_value_t = 2048)]
+        media_cache_mb: u64,
     },
     /// Quản lý thiết bị được phép dùng API.
     Device {
@@ -81,8 +86,13 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Serve {
         listen: "127.0.0.1:8370".parse()?,
         demo: false,
+        media_cache_mb: 2048,
     }) {
-        Command::Serve { listen, demo } => serve(&cli.data_dir, listen, demo).await,
+        Command::Serve {
+            listen,
+            demo,
+            media_cache_mb,
+        } => serve(&cli.data_dir, listen, demo, media_cache_mb).await,
         Command::Device { action } => device(&cli.data_dir, action),
         Command::Login => login(&cli.data_dir).await,
         Command::ImportCtdozlite { path } => import_ctdozlite(&cli.data_dir, &path),
@@ -103,8 +113,28 @@ fn prepare_data_dir(dir: &Path) -> Result<()> {
 /// Events older than this are dropped at start-up; clients away longer reload.
 const EVENT_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
 
-async fn serve(data_dir: &Path, listen: SocketAddr, demo: bool) -> Result<()> {
+/// Keep the media cache within its budget: at start-up, then every hour.
+fn spawn_media_trimming(media: Arc<MediaCache>, budget_mb: u64) {
+    let budget = budget_mb.saturating_mul(1024 * 1024);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            let cache = media.clone();
+            match tokio::task::spawn_blocking(move || cache.trim(budget)).await {
+                Ok(Ok((0, _))) => {}
+                Ok(Ok((files, bytes))) => tracing::info!(files, bytes, "media cache trimmed"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "cannot trim the media cache"),
+                Err(e) => tracing::warn!(error = %e, "media cache trimming failed"),
+            }
+        }
+    });
+}
+
+async fn serve(data_dir: &Path, listen: SocketAddr, demo: bool, media_cache_mb: u64) -> Result<()> {
     let store = Arc::new(Store::open(&db_path(data_dir))?);
+    let media = Arc::new(MediaCache::new(media_dir(data_dir))?);
+    spawn_media_trimming(media.clone(), media_cache_mb);
     match store.prune_events(now_ms() - EVENT_RETENTION_MS) {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "old events pruned"),
@@ -125,21 +155,45 @@ async fn serve(data_dir: &Path, listen: SocketAddr, demo: bool) -> Result<()> {
             ZaloConfig {
                 session_path: session_path(data_dir),
                 computer_name: COMPUTER_NAME.into(),
+                media: Some(media.clone()),
             },
             store.clone(),
             bus.clone(),
         )
     };
-    let app = api::router(AppState { store, bus, zalo });
+    let app = api::router(AppState {
+        store,
+        bus,
+        zalo,
+        media,
+    });
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("không mở được cổng {listen}"))?;
     tracing::info!(%listen, "zetachat gateway is listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (stopping, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = stopping.send(());
+    });
+    // Event streams never end by themselves: after a short grace period the
+    // remaining connections are dropped; clients reconnect and resume.
+    let grace = async {
+        if stopped.await.is_ok() {
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        result = server => result?,
+        () = grace => tracing::info!("open connections dropped after the grace period"),
+    }
     Ok(())
 }
+
+/// How long open connections get to finish once a shutdown is requested.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 async fn shutdown_signal() {
     let ctrl_c = async {

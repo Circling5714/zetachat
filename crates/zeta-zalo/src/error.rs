@@ -50,6 +50,10 @@ pub enum Error {
 
     #[error("websocket error: {0}")]
     WebSocket(String),
+
+    /// A download went over its size limit.
+    #[error("file larger than {limit} bytes")]
+    TooLarge { limit: u64 },
 }
 
 impl From<reqwest::Error> for Error {

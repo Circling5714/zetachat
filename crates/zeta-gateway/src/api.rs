@@ -8,9 +8,10 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::body::Body;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,9 +20,12 @@ use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot};
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 
 use crate::auth::AuthDevice;
 use crate::events::EventBus;
+use crate::media_cache::{self, FetchError, MediaCache};
 use crate::model::{split_thread_id, Message, StoredEvent, Thread};
 use crate::store::Store;
 use crate::zalo::{LoginState, ZaloCommand, ZaloHandle};
@@ -32,6 +36,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub bus: EventBus,
     pub zalo: ZaloHandle,
+    pub media: Arc<MediaCache>,
 }
 
 /// JSON error `{ "error": "…" }` with an HTTP status.
@@ -42,7 +47,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -97,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/threads/{id}/read", post(mark_read))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
+        .route("/api/v1/media", get(media))
         .route("/api/v1/zalo/login", get(login_state).post(start_login))
         .route("/api/v1/zalo/login/qr.svg", get(login_qr_svg))
         .route(
@@ -357,6 +363,64 @@ fn event_stream(
             }
         },
     )
+}
+
+#[derive(Deserialize)]
+struct MediaQuery {
+    /// URL on Zalo's media CDN, as found in a message's `media`.
+    u: String,
+}
+
+/// A file of Zalo's media CDN through the gateway's cache, so devices never
+/// contact Zalo themselves. Range requests work (video seeking). Only displayable
+/// media is served inline; everything else comes as an attachment. A sandbox CSP
+/// and `nosniff` keep any file from running as a page of the gateway.
+async fn media(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Query(q): Query<MediaQuery>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let file = st.media.get(&q.u).await.map_err(|e| match e {
+        FetchError::NotAllowed => ApiError::bad_request("not a Zalo media URL"),
+        FetchError::TooLarge => ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file too large for the gateway",
+        ),
+        FetchError::Upstream(reason) => {
+            tracing::warn!(%reason, "media download failed");
+            ApiError::bad_gateway("Zalo did not deliver the file")
+        }
+        FetchError::Io(e) => ApiError::internal(e),
+    })?;
+    let mut response = ServeFile::new(&file.path)
+        .oneshot(request)
+        .await
+        .map_err(ApiError::internal)?
+        .map(Body::new);
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(file.content_type));
+    // Zalo media URLs never change content; the token makes the answer private.
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    if !media_cache::is_inline(file.content_type) {
+        headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+    }
+    Ok(response)
 }
 
 async fn login_state(State(st): State<AppState>, _: AuthDevice) -> Json<LoginState> {

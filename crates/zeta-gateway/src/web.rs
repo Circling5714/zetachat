@@ -15,10 +15,12 @@ const SW_JS: &str = include_str!("../web/sw.js");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 const ICON: &str = include_str!("../web/icon.svg");
 
-/// Only our own scripts and styles run; avatars may come from Zalo's CDN.
+/// Only our own scripts and styles run. Pictures, video and audio come through
+/// the gateway's media proxy (`data:` is for inline sample pictures), so the page
+/// never contacts another host.
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-    img-src 'self' https: data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; \
-    frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+    img-src 'self' data:; media-src 'self'; connect-src 'self'; manifest-src 'self'; \
+    worker-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {
     (
@@ -34,7 +36,7 @@ async fn index() -> Response {
             (CONTENT_TYPE, "text/html; charset=utf-8"),
             (CACHE_CONTROL, "no-cache"),
             (HeaderName::from_static("content-security-policy"), CSP),
-            // Avatars load from Zalo's CDN: do not tell it where the gateway lives.
+            // Links open other sites: do not tell them where the gateway lives.
             (HeaderName::from_static("referrer-policy"), "no-referrer"),
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],

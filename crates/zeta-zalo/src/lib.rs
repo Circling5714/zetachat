@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod domains;
 pub mod error;
 pub mod login;
+pub mod media;
 pub mod param_cipher;
 pub mod session;
 pub mod socket;

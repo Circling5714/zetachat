@@ -26,7 +26,9 @@ sudo systemctl enable --now zetachat-gateway
 journalctl -u zetachat-gateway -f
 ```
 
-Dữ liệu (cơ sở dữ liệu và phiên Zalo) nằm trong `/var/lib/zetachat`, quyền `0700`. Thư mục này chứa thông tin đăng nhập Zalo, cần được sao lưu và bảo vệ như mật khẩu.
+Dữ liệu (cơ sở dữ liệu, phiên Zalo và bộ nhớ đệm media) nằm trong `/var/lib/zetachat`, quyền `0700`. Thư mục này chứa thông tin đăng nhập Zalo, cần được sao lưu và bảo vệ như mật khẩu.
+
+Ảnh, video và tệp được giữ trong `/var/lib/zetachat/media`, tối đa 2 GB theo mặc định; khi vượt, tệp lâu không dùng nhất bị xóa trước (kiểm tra mỗi giờ). Đổi giới hạn bằng `Environment=ZETACHAT_MEDIA_CACHE_MB=<số MB>` trong file dịch vụ. Thư mục `media` có thể bỏ qua khi sao lưu: tệp nào thiếu sẽ được tải lại từ Zalo khi còn link.
 
 ## 3. Thiết bị
 
@@ -62,6 +64,8 @@ Trong Nginx Proxy Manager, tạo một Proxy Host:
 proxy_buffering off;
 proxy_read_timeout 1h;
 ```
+
+Gateway trả tệp tối đa 256 MB; Nginx không giới hạn dung lượng phản hồi nên không cần chỉnh gì thêm cho ảnh và video.
 
 Chỉ cho Nginx Proxy Manager truy cập cổng của gateway:
 

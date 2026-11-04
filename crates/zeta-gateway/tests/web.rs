@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use zeta_gateway::api::{self, AppState};
 use zeta_gateway::events::EventBus;
+use zeta_gateway::media_cache::MediaCache;
 use zeta_gateway::model::{thread_id, NewMessage, ThreadKind, ThreadUpsert};
 use zeta_gateway::store::Store;
 use zeta_gateway::zalo::{LoginState, ZaloHandle, ZaloStatus};
@@ -16,6 +17,7 @@ use zeta_gateway::zalo::{LoginState, ZaloHandle, ZaloStatus};
 struct Fx {
     app: Router,
     store: Arc<Store>,
+    media: Arc<MediaCache>,
     status: Arc<RwLock<ZaloStatus>>,
     token: String,
 }
@@ -31,14 +33,18 @@ fn fx() -> Fx {
         status: status.clone(),
     };
     let (_, token) = store.add_device("web").unwrap();
+    let dir = std::env::temp_dir().join(format!("zetachat-web-{:016x}", rand::random::<u64>()));
+    let media = Arc::new(MediaCache::new(dir).unwrap());
     let app = api::router(AppState {
         store: store.clone(),
         bus,
         zalo,
+        media: media.clone(),
     });
     Fx {
         app,
         store,
+        media,
         status,
         token,
     }
@@ -59,6 +65,99 @@ fn get(uri: &str) -> axum::http::request::Builder {
     Request::builder().method("GET").uri(uri)
 }
 
+/// Percent-encoding for a query value.
+fn encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+async fn body_bytes(resp: Response<Body>) -> Vec<u8> {
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+#[tokio::test]
+async fn media_comes_from_the_cache_with_safe_headers() {
+    let f = fx();
+    let auth = format!("Bearer {}", f.token);
+    let request = |url: &str, authorized: bool, range: Option<&str>| {
+        let mut req = get(&format!("/api/v1/media?u={}", encode(url)));
+        if authorized {
+            req = req.header(header::AUTHORIZATION, &auth);
+        }
+        if let Some(range) = range {
+            req = req.header(header::RANGE, range);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+
+    let photo = "https://photo-stal-1.zdn.vn/jpg/a.jpg?sig=1";
+    let mut jpeg = b"\xFF\xD8\xFF\xE0".to_vec();
+    jpeg.extend([7u8; 96]);
+    // Zalo labels its photos `image/jpg`.
+    f.media.insert(photo, &jpeg, "image/jpg").await.unwrap();
+
+    let resp = send(&f, request(photo, false, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    for foreign in [
+        "https://example.com/a.jpg",
+        "http://127.0.0.1:8370/api/v1/status",
+        "file:///etc/passwd",
+    ] {
+        let resp = send(&f, request(foreign, true, None)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{foreign}");
+    }
+
+    let resp = send(&f, request(photo, true, None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers();
+    assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");
+    assert_eq!(
+        headers["content-security-policy"],
+        "default-src 'none'; sandbox"
+    );
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert!(headers[header::CACHE_CONTROL]
+        .to_str()
+        .unwrap()
+        .starts_with("private"));
+    assert!(headers.get(header::CONTENT_DISPOSITION).is_none());
+    assert_eq!(body_bytes(resp).await, jpeg);
+
+    // Ranges, for seeking in videos.
+    let resp = send(&f, request(photo, true, Some("bytes=0-3"))).await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes 0-3/100");
+    assert_eq!(body_bytes(resp).await, b"\xFF\xD8\xFF\xE0");
+
+    // A page sent as a file must not run in the gateway's origin.
+    let page = "https://f1.zdn.vn/files/page.html";
+    f.media
+        .insert(page, b"<html><script>alert(1)</script>", "text/html")
+        .await
+        .unwrap();
+    let resp = send(&f, request(page, true, None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()[header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+    assert_eq!(resp.headers()[header::CONTENT_DISPOSITION], "attachment");
+
+    std::fs::remove_dir_all(f.media.dir()).unwrap();
+}
+
 #[tokio::test]
 async fn client_is_served_with_a_strict_content_security_policy() {
     let f = fx();
@@ -69,6 +168,10 @@ async fn client_is_served_with_a_strict_content_security_policy() {
         .unwrap()
         .to_string();
     assert!(csp.contains("script-src 'self'"), "{csp}");
+    // Media comes through the gateway: the page loads nothing from other hosts.
+    assert!(csp.contains("img-src 'self' data:;"), "{csp}");
+    assert!(csp.contains("media-src 'self'"), "{csp}");
+    assert!(!csp.contains("https:"), "{csp}");
     assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
     assert!(body_text(resp).await.contains("<title>zetachat</title>"));
 
@@ -195,6 +298,7 @@ async fn threads_carry_a_preview_and_status_the_last_event() {
                 outgoing: false,
                 kind: "webchat".into(),
                 text: text.to_string(),
+                media: None,
                 sent_at: i as i64 + 1,
                 raw: "{}".into(),
             })
