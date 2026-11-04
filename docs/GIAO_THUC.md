@@ -47,9 +47,10 @@ Khi không dùng được phiên, đôi khi Zalo trả **HTTP 200 với thân r�
 - `getfriends` trả **404 trên cả hai host `tt-friend-wpa`** và chạy được trên `tt-profile-wpa.chat.zalo.me`. zeta-zalo thử host friend trước rồi chuyển sang host profile.
 - Mã lỗi `600` và `-102`: phiên bị từ chối, cần đăng nhập lại. `429`: gọi quá dày, nhất là `getfriends`.
 
-## 6. WebSocket thời gian thực (port từ ctdozlite, chưa kiểm chứng lại)
+## 6. WebSocket thời gian thực (đã kiểm chứng với gateway)
 
-- Địa chỉ `wss://ws{N}-msg.chat.zalo.me/?zpw_ver=…&zpw_type=…&t=<ms>`, kèm cookie `zpw_sek`.
+- Địa chỉ `wss://ws{N}-msg.chat.zalo.me/?zpw_ver=…&zpw_type=…&t=<ms>`, kèm cookie `zpw_sek` (không cần header `zpw_sek`).
+- Đã kiểm chứng tháng 11/2026: xác thực `cmd 1` thành công, sau đó máy chủ trả các hàng đợi tin offline (`510`, `511`, `515`, `517`, `518`, `603`, `610`, `611`); tin vừa gửi bằng HTTP được gửi lại qua `cmd 501` với cùng `cliMsgId`; ping `cmd 2` được trả lời.
 - Khung: `u8 version | u16 LE cmd | u8 subCmd | JSON`. Máy chủ gửi trước `cmd 1` kèm khóa AES-GCM. Trường `encrypt`: 0 không mã hóa, 1 base64 + nén, 2 AES-GCM + nén, 3 AES-GCM (`iv 16 | aad 16 | ciphertext+tag`).
 - Sau khi xác thực, client kéo các hàng đợi có trong `ctrl_qCmds` / `qCmds`. Kéo hàng đợi ngoài danh sách sẽ bị đóng kết nối. Ping mỗi 15 giây.
 - `cmd` của tin nhắn: 501/521 (máy chủ đẩy), 510/511 (client kéo), 533 (có tin mới) rồi 570 (lấy tin). Điều khiển: 601–604.

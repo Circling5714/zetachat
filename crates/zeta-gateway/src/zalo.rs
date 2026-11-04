@@ -524,7 +524,8 @@ impl Connector {
     /// Returns false when the real-time loop has to stop.
     fn handle_realtime(&mut self, event: RealtimeEvent) -> bool {
         match event {
-            RealtimeEvent::Connected { .. } => {
+            RealtimeEvent::Connected { endpoint } => {
+                tracing::info!(%endpoint, "real-time connected");
                 update_status(&self.status, |s| s.realtime = true);
                 publish_status(&self.status, &self.bus);
                 true
@@ -540,12 +541,22 @@ impl Connector {
                 false
             }
             RealtimeEvent::Frame(frame) if frame.is_message() => {
-                for message in parse_frame_messages(&frame.payload, &self.self_uid) {
+                let messages = parse_frame_messages(&frame.payload, &self.self_uid);
+                tracing::debug!(
+                    cmd = frame.cmd,
+                    sub = frame.sub_cmd,
+                    messages = messages.len(),
+                    "message frame"
+                );
+                for message in messages {
                     self.store_incoming(message);
                 }
                 true
             }
-            RealtimeEvent::Frame(_) => true,
+            RealtimeEvent::Frame(frame) => {
+                tracing::debug!(cmd = frame.cmd, sub = frame.sub_cmd, "frame");
+                true
+            }
         }
     }
 
