@@ -122,7 +122,8 @@ Theo ctdozlite (chép từ Zalo PC), host là `sticker` trong bảng dịch vụ
 - Nhãn dán của một gói: `GET /api/message/sticker/category/sticker_detail` với `{ cid }`, ra danh sách `{ id, cateId, type }`. Đã thử: một gói 30 nhãn.
 - Tìm theo từ khóa: `/api/message/sticker/suggest/stickers` (`{ keyword, gif: 1, guggy: 0, imei }`, kết quả trong `sugg_sticker`) và `/api/message/sticker/search` (`{ keyword, limit, srcType: 0, imei }`, ra danh sách); gateway gộp hai kết quả. Đã thử: "haha" ra 93 nhãn, "cảm ơn" ra 26 nhãn.
 - Gửi: `POST {chat}/api/message/sticker` (nhóm: `{group}/api/group/sticker`) với `toid` hoặc `grid`, `stickerId`, `cateId`, `type`, `clientId`, `imei`, `zsource: 101`. Đã thử gửi vào Cloud: Zalo nhận, bản sao gửi về không bị lưu trùng.
-- Ảnh: `https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=<id>&size=130`; 30 nhãn dán có sẵn (gói 0) nằm ở `stc-chat.zdn.vn`. Ảnh của gói và của nhãn dán tải được không cần cookie.
+- Ảnh: `https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=<id>&size=130`; 30 nhãn dán có sẵn (gói 0) nằm ở `stc-chat.zdn.vn`. Ảnh của gói và của nhãn dán tải được không cần cookie. Đây chỉ là khung hình đầu.
+- Nhãn động: `GET /api/message/sticker/sticker_detail` với `{ sid }` trả về `stickerSpriteUrl` (`https://zalo-api.zadn.vn/api/emoticon/sprite?eid=<id>&size=130`), `totalFrames` và `duration` (thời gian **mỗi khung**, mili giây); `stickerWebpUrl` thường là `null`. Đã kiểm chứng: sprite là một dải PNG cao 130, rộng `totalFrames × 130` (nhãn 101001: 10 khung × 70 ms; nhãn 1111: 2 khung × 300 ms). Sprite của nhãn tĩnh chỉ có một khung. Client chạy dải đó theo từng bước bằng CSS, như Zalo PC.
 
 ## 8g. Tìm người và kết bạn (một phần đã kiểm chứng)
 

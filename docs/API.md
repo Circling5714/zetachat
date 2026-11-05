@@ -28,6 +28,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/stickers/packs` | Các gói nhãn dán trong kho của Zalo, mới nhất trước: `[{ "id", "name", "icon", "count" }]`. Gateway giữ danh sách 12 giờ |
 | GET | `/stickers/packs/{id}` | Nhãn dán của một gói: `[{ "id", "cate_id", "type", "url" }]`; `url` là ảnh trên CDN của Zalo, tải qua `/media` |
 | GET | `/stickers/search?q=` | Nhãn dán theo từ khóa ("haha", "cảm ơn", "yêu"…), như Zalo gợi ý; cùng dạng như trên |
+| GET | `/stickers/motion?ids=` | Nhãn dán động ra sao, tối đa 50 id: `{ "<id>": { "sprite", "frames", "duration_ms" } }`, hoặc `null` với nhãn tĩnh. `sprite` là dải `frames` khung xếp ngang trên CDN của Zalo; mỗi khung hiện `duration_ms`. Gateway giữ kết quả, vì nhãn dán không đổi |
 | POST | `/threads/{id}/stickers` | Gửi nhãn dán `{ "id", "cate_id", "type" }` lấy từ các đường dẫn trên; trả về tin đã lưu (`kind` là `chat.sticker`) |
 | GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
@@ -66,6 +67,7 @@ Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, 
 | `width`, `height` | Kích thước ảnh hoặc video (0 khi không rõ), để giữ chỗ trước khi tải |
 | `name`, `description` | Tên tệp hoặc tiêu đề liên kết; chú thích ảnh hoặc mô tả liên kết |
 | `size`, `duration_ms` | Dung lượng (byte) và độ dài video hay tin nhắn thoại, 0 khi không rõ |
+| `sticker_id` | Id của nhãn dán (chỉ với `sticker`), để hỏi `/stickers/motion` |
 
 Client tải `url` và `thumb` qua `/media?u=…`, không gọi thẳng CDN của Zalo: thiết bị không cần ra Internet, và gateway giữ một bản trên đĩa. Gateway tự tải trước ảnh, sticker, tin nhắn thoại và video (đến 100 MB) của tin mới ngay khi tin đến, nên mở ra là có ngay và vẫn còn khi link của Zalo hết hạn. Tệp đính kèm chỉ được tải khi có người mở. Tệp lớn hơn 256 MB không đi qua gateway (`413`).
 

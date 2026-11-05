@@ -71,6 +71,31 @@ impl Sticker {
     }
 }
 
+/// How a sticker moves: Zalo draws animated stickers from a sprite sheet, the
+/// frames side by side, shown one after the other over `duration_ms`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickerMotion {
+    /// The sprite sheet on Zalo's CDN.
+    pub sprite: String,
+    /// An animated WebP, when Zalo has one (it often has not).
+    pub webp: String,
+    pub frames: u32,
+    pub duration_ms: u32,
+}
+
+/// The motion in a `sticker_detail` answer; `None` for a still sticker.
+fn motion_of(data: &Value) -> Option<StickerMotion> {
+    let url = |key: &str| first_str(data, &[key]).replace("http://", "https://");
+    let motion = StickerMotion {
+        sprite: url("stickerSpriteUrl"),
+        webp: url("stickerWebpUrl"),
+        frames: u32::try_from(number(data, &["totalFrames"])).unwrap_or(0),
+        duration_ms: u32::try_from(number(data, &["duration"])).unwrap_or(0),
+    };
+    let moves = (!motion.sprite.is_empty() && motion.frames > 1) || !motion.webp.is_empty();
+    moves.then_some(motion)
+}
+
 fn number(v: &Value, keys: &[&str]) -> u64 {
     keys.iter()
         .find_map(|k| match v.get(*k) {
@@ -192,6 +217,19 @@ impl ZaloClient {
         let bytes = gunzip_if_needed(self.get_bytes(&url, CATALOGUE_MAX_BYTES).await?)?;
         let catalogue: Value = serde_json::from_slice(&bytes)?;
         Ok(packs_of(&catalogue, &excluded))
+    }
+
+    /// How stickers move (`sticker_detail`, one call per sticker as Zalo PC
+    /// does): their sprite sheet, frame count and duration.
+    pub async fn sticker_motion(&self, id: u64) -> Result<Option<StickerMotion>> {
+        let key = self.session_key()?;
+        let params = self.encrypt_params(&json!({ "sid": id }))?;
+        let path = format!(
+            "/api/message/sticker/sticker_detail?{}&params={params}",
+            Self::common_params()
+        );
+        let data = self.get_service(Service::Sticker, &path, Some(key)).await?;
+        Ok(motion_of(&data))
     }
 
     /// The stickers of one pack.
@@ -324,6 +362,26 @@ mod tests {
         assert_eq!(merged.iter().map(|s| s.id).collect::<Vec<_>>(), [7, 8]);
         assert_eq!(merged[0].kind, 1);
         assert!(merge_found(None, None).is_empty());
+    }
+
+    #[test]
+    fn sticker_motion() {
+        let animated = json!({
+            "id": 101001, "stickerUrl": "https://zalo-api.zadn.vn/s.png",
+            "stickerSpriteUrl": "http://zalo-api.zadn.vn/sprite.png", "stickerWebpUrl": null,
+            "totalFrames": 12, "duration": 1200
+        });
+        assert_eq!(
+            motion_of(&animated),
+            Some(StickerMotion {
+                sprite: "https://zalo-api.zadn.vn/sprite.png".into(),
+                webp: String::new(),
+                frames: 12,
+                duration_ms: 1200,
+            })
+        );
+        let still = json!({ "stickerSpriteUrl": "https://x/s.png", "totalFrames": 1 });
+        assert_eq!(motion_of(&still), None);
     }
 
     #[test]

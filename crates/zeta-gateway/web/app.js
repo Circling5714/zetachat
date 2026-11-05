@@ -905,12 +905,92 @@ function videoNode(md) {
   return box;
 }
 
+// Animated stickers: Zalo draws them from a sprite sheet, the frames side by
+// side, each shown for a while. The still picture shows first; once the
+// gateway says the sticker moves and the sheet has loaded, it takes over.
+
+const MOTION_KEY = 'zetachat.stickerMotion';
+const motions = new Map(); // sticker id -> { sprite, frames, duration_ms } | null
+const motionWaiting = new Map(); // sticker id -> callbacks
+let motionTimer = 0;
+
+try {
+  for (const [id, m] of JSON.parse(localStorage.getItem(MOTION_KEY) || '[]')) motions.set(id, m);
+} catch {
+  // A convenience: without it the gateway is asked again.
+}
+
+function saveMotions() {
+  try {
+    localStorage.setItem(MOTION_KEY, JSON.stringify([...motions].slice(-1500)));
+  } catch {
+    // Same.
+  }
+}
+
+/** A sticker's id: kept with the message, else in its picture's address. */
+function stickerId(md) {
+  if (md.sticker_id) return Number(md.sticker_id);
+  const found = /[?&]eid=(\d+)/.exec(md.url || '');
+  return found ? Number(found[1]) : 0;
+}
+
+/** Call `then` with how sticker `id` moves (null when it does not). */
+function stickerMotion(id, then) {
+  if (!id) return;
+  if (motions.has(id)) {
+    then(motions.get(id));
+    return;
+  }
+  if (!motionWaiting.has(id)) motionWaiting.set(id, []);
+  motionWaiting.get(id).push(then);
+  if (!motionTimer) motionTimer = setTimeout(askMotions, 40);
+}
+
+async function askMotions() {
+  motionTimer = 0;
+  const ids = [...motionWaiting.keys()].slice(0, 50);
+  let answer = {};
+  try {
+    answer = await api(`/stickers/motion?ids=${ids.join(',')}`);
+  } catch {
+    // Still pictures, then.
+  }
+  for (const id of ids) {
+    const waiting = motionWaiting.get(id) || [];
+    motionWaiting.delete(id);
+    const m = Object.prototype.hasOwnProperty.call(answer, id) ? answer[id] : null;
+    if (Object.prototype.hasOwnProperty.call(answer, id)) motions.set(id, m);
+    for (const then of waiting) then(m);
+  }
+  saveMotions();
+  if (motionWaiting.size) motionTimer = setTimeout(askMotions, 40);
+}
+
+/** Replace a still sticker picture by its moving sprite, once loaded. */
+function animateSticker(img, m) {
+  if (!m || !(m.frames > 1) || !img.isConnected) return;
+  const strip = new Image();
+  strip.className = 'sticker-strip';
+  strip.alt = img.alt;
+  strip.addEventListener('load', () => {
+    if (!img.isConnected) return;
+    const box = el('div', `${img.className} sticker-moving`);
+    strip.style.animationDuration = `${m.frames * m.duration_ms}ms`;
+    strip.style.animationTimingFunction = `steps(${m.frames})`;
+    box.append(strip);
+    img.replaceWith(box);
+  }, { once: true });
+  strip.src = mediaSrc(m.sprite);
+}
+
 function stickerNode(md) {
   const img = new Image();
   img.className = 'sticker-img';
   img.alt = 'Nhãn dán';
   img.loading = 'lazy';
   img.addEventListener('error', () => img.replaceWith(el('div', 'media-failed', '[Nhãn dán]')));
+  img.addEventListener('load', () => stickerMotion(stickerId(md), (m) => animateSticker(img, m)), { once: true });
   img.src = mediaSrc(md.url);
   return img;
 }
@@ -2409,10 +2489,16 @@ function showStickers(list, emptyText) {
     cell.type = 'button';
     cell.title = 'Gửi nhãn dán';
     const img = new Image();
+    img.className = 'sticker-pick';
     img.alt = 'Nhãn dán';
     img.loading = 'lazy';
     img.src = mediaSrc(s.url);
     img.addEventListener('error', () => cell.remove());
+    // In the picker a sticker moves while the pointer is on it.
+    cell.addEventListener('mouseenter', () => {
+      const still = cell.querySelector('img.sticker-pick');
+      if (still) stickerMotion(Number(s.id), (m) => animateSticker(still, m));
+    }, { once: true });
     cell.append(img);
     cell.addEventListener('click', () => sendSticker(s));
     grid.append(cell);

@@ -35,6 +35,14 @@ pub struct Media {
     /// Length of a video or voice message, when known.
     #[serde(default)]
     pub duration_ms: u64,
+    /// A sticker's id, to ask how it moves (0 for other media, and for
+    /// stickers stored before it was kept).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sticker_id: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Videos up to this size are downloaded as soon as their message arrives.
@@ -305,6 +313,7 @@ pub fn extract(msg_type: &str, content: Option<&Value>) -> Option<Media> {
         "chat.sticker" => Media {
             kind: "sticker".into(),
             url: sticker_url(content),
+            sticker_id: content.map_or(0, |c| number(c, &["id"])),
             ..Media::default()
         },
         "share.file" => Media {

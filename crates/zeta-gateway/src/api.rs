@@ -137,6 +137,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stickers/packs", get(sticker_packs))
         .route("/api/v1/stickers/packs/{id}", get(pack_stickers))
         .route("/api/v1/stickers/search", get(search_stickers))
+        .route("/api/v1/stickers/motion", get(sticker_motion))
         .route("/api/v1/threads/{id}/stickers", post(send_sticker))
         .route("/api/v1/threads/{id}/members", get(group_members))
         .route("/api/v1/threads/{id}/presence", get(presence))
@@ -654,6 +655,36 @@ async fn pack_stickers(
     Path(id): Path<u64>,
 ) -> ApiResult<Value> {
     ask_stickers(&st, StickerQuery::Pack(id)).await
+}
+
+#[derive(Deserialize)]
+struct MotionQuery {
+    #[serde(default)]
+    ids: String,
+}
+
+/// How stickers move: `{ "<id>": { sprite, frames, duration_ms } | null }`
+/// for at most 50 ids. Animated stickers are a sprite sheet, `frames` side
+/// by side, each shown `duration_ms`; `null` is a still sticker.
+async fn sticker_motion(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Query(q): Query<MotionQuery>,
+) -> ApiResult<Value> {
+    let mut ids: Vec<u64> = Vec::new();
+    for id in q
+        .ids
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+    {
+        if id > 0 && !ids.contains(&id) && ids.len() < 50 {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(Json(json!({})));
+    }
+    ask_stickers(&st, StickerQuery::Motion(ids)).await
 }
 
 #[derive(Deserialize)]

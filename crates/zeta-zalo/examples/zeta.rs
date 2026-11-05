@@ -311,7 +311,28 @@ async fn stickers(args: &[String]) -> Result<()> {
                 println!("  {s:?}");
             }
         }
-        other => bail!("không hiểu \"{other}\": packs | pack <id> | search <từ khóa>"),
+        "motion" => {
+            let id: u64 = args.get(2).context("thiếu id nhãn dán")?.parse()?;
+            match client.sticker_motion(id).await? {
+                Some(m) => println!(
+                    "nhãn {id}: {} khung, {} ms
+  sprite {}
+  webp {}",
+                    m.frames,
+                    m.duration_ms,
+                    m.sprite,
+                    if m.webp.is_empty() {
+                        "(không có)"
+                    } else {
+                        &m.webp
+                    }
+                ),
+                None => println!("nhãn {id}: tĩnh"),
+            }
+        }
+        other => {
+            bail!("không hiểu \"{other}\": packs | pack <id> | search <từ khóa> | motion <id>")
+        }
     }
     Ok(())
 }

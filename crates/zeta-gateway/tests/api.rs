@@ -988,6 +988,17 @@ async fn stickers_are_listed_searched_and_sent() {
     // Nothing to search: no question to Zalo.
     let (_, none) = call(&f, "GET", "/api/v1/stickers/search?q=%20", None, true).await;
     assert_eq!(none, json!([]));
+    let (_, motion) = call(
+        &f,
+        "GET",
+        "/api/v1/stickers/motion?ids=7,x,7,0,8",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(motion["asked"], "Motion([7, 8])");
+    let (_, nothing) = call(&f, "GET", "/api/v1/stickers/motion?ids=", None, true).await;
+    assert_eq!(nothing, json!({}));
 
     let uri = format!(
         "/api/v1/threads/{}/stickers",
@@ -1007,6 +1018,7 @@ async fn stickers_are_listed_searched_and_sent() {
         (Some("chat.sticker"), Some("[Nhãn dán]"))
     );
     assert_eq!(body["media"]["kind"], "sticker");
+    assert_eq!(body["media"]["sticker_id"], 21300);
     assert!(body["media"]["url"]
         .as_str()
         .unwrap()

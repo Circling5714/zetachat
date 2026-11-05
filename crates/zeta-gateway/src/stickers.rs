@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use zeta_zalo::sticker::{Sticker, StickerPack};
+use zeta_zalo::sticker::{Sticker, StickerMotion, StickerPack};
 use zeta_zalo::ZaloClient;
 
 use crate::store::fold;
@@ -25,6 +25,24 @@ pub enum StickerQuery {
     Packs,
     Pack(u64),
     Search(String),
+    /// How these stickers move (at most 50).
+    Motion(Vec<u64>),
+}
+
+/// Motions kept at most; stickers never change, so only the count matters.
+const MAX_MOTIONS: usize = 5000;
+
+/// A sticker's motion for clients: `{ sprite, frames, duration_ms }` (per
+/// frame), `null` for a still one.
+fn motion_json(m: Option<&StickerMotion>) -> Value {
+    match m {
+        Some(m) if m.frames > 1 => json!({
+            "sprite": m.sprite,
+            "frames": m.frames,
+            "duration_ms": if m.duration_ms > 0 { m.duration_ms } else { 100 },
+        }),
+        _ => Value::Null,
+    }
 }
 
 /// A sticker for clients: what sending it takes, and its picture.
@@ -37,6 +55,7 @@ pub struct StickerCache {
     packs: Mutex<Option<(Instant, Vec<StickerPack>)>>,
     pack: Mutex<HashMap<u64, (Instant, Vec<Sticker>)>>,
     search: Mutex<HashMap<String, (Instant, Vec<Sticker>)>>,
+    motion: Mutex<HashMap<u64, Option<StickerMotion>>>,
 }
 
 /// Keep `value` under `key`, dropping the oldest entry when full.
@@ -90,6 +109,35 @@ impl StickerCache {
                 };
                 Ok(Value::Array(list.iter().map(sticker_json).collect()))
             }
+            StickerQuery::Motion(ids) => {
+                let mut answer = serde_json::Map::new();
+                for id in ids.iter().take(50) {
+                    let kept = self
+                        .motion
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(id)
+                        .cloned();
+                    let motion = match kept {
+                        Some(motion) => motion,
+                        None => {
+                            // A failed question is not kept: asked again next time.
+                            let Ok(motion) = client.sticker_motion(*id).await else {
+                                answer.insert(id.to_string(), Value::Null);
+                                continue;
+                            };
+                            let mut map = self.motion.lock().unwrap_or_else(|e| e.into_inner());
+                            if map.len() >= MAX_MOTIONS {
+                                map.clear();
+                            }
+                            map.insert(*id, motion.clone());
+                            motion
+                        }
+                    };
+                    answer.insert(id.to_string(), motion_json(motion.as_ref()));
+                }
+                Ok(Value::Object(answer))
+            }
             StickerQuery::Search(keyword) => {
                 let key = fold(keyword.trim());
                 let kept = self
@@ -133,6 +181,19 @@ mod tests {
         // Replacing a kept entry drops nothing.
         keep(&mut map, 1000, 1);
         assert_eq!(map.len(), MAX_KEPT);
+    }
+
+    #[test]
+    fn motions_for_clients() {
+        let moving = StickerMotion {
+            sprite: "https://zalo-api.zadn.vn/api/emoticon/sprite?eid=1&size=130".into(),
+            webp: String::new(),
+            frames: 10,
+            duration_ms: 0,
+        };
+        assert_eq!(motion_json(Some(&moving))["duration_ms"], 100);
+        assert_eq!(motion_json(Some(&moving))["frames"], 10);
+        assert!(motion_json(None).is_null());
     }
 
     #[test]

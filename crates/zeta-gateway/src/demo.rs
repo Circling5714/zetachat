@@ -104,6 +104,21 @@ fn demo_stickers() -> Vec<(u64, u64, &'static str, String)> {
     ]
 }
 
+/// The demo's moving sticker: three faces side by side, each 130 wide.
+fn demo_sprite() -> String {
+    let face = |x: u32, mouth: &str| {
+        format!(
+            r##"<g transform="translate({x} 0)"><circle cx="65" cy="67" r="54" fill="#facc15" stroke="#a16207" stroke-width="4"/><circle cx="46" cy="55" r="7" fill="#422006"/><circle cx="84" cy="55" r="7" fill="#422006"/><path d="{mouth}" fill="none" stroke="#422006" stroke-width="6" stroke-linecap="round"/></g>"##
+        )
+    };
+    svg_data(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="390" height="130" viewBox="0 0 390 130">{}{}{}</svg>"##,
+        face(0, "M37 80 Q65 108 93 80"),
+        face(130, "M40 86 L90 86"),
+        face(260, "M52 82 Q65 100 78 82 Q65 70 52 82")
+    ))
+}
+
 /// What the demo's sticker store answers.
 fn demo_sticker_answer(query: &StickerQuery) -> Value {
     let all = demo_stickers();
@@ -116,6 +131,18 @@ fn demo_sticker_answer(query: &StickerQuery) -> Value {
         ]),
         StickerQuery::Pack(id) => {
             Value::Array(all.iter().filter(|s| s.1 == *id).map(item).collect())
+        }
+        StickerQuery::Motion(ids) => {
+            let mut answer = serde_json::Map::new();
+            for id in ids {
+                let motion = if *id == 9001 {
+                    json!({ "sprite": demo_sprite(), "frames": 3, "duration_ms": 400 })
+                } else {
+                    Value::Null
+                };
+                answer.insert(id.to_string(), motion);
+            }
+            Value::Object(answer)
         }
         StickerQuery::Search(q) => {
             let q = fold(q);
@@ -466,6 +493,7 @@ fn seed(store: &Store) {
                 Media {
                     kind: "sticker".into(),
                     url: svg_data(STICKER_SVG),
+                    sticker_id: 9001,
                     ..Media::default()
                 },
             ),
@@ -1010,6 +1038,7 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                         media: Some(Media {
                             kind: "sticker".into(),
                             url,
+                            sticker_id: sticker.id,
                             ..Media::default()
                         }),
                         quote: None,
