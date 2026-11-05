@@ -37,7 +37,8 @@ use crate::stickers::StickerQuery;
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
 use crate::zalo::{
-    photo_type, Attachment, LoginState, ReplyTo, SessionState, ZaloCommand, ZaloHandle,
+    photo_type, Attachment, FriendAction, LoginState, ReplyTo, SessionState, ZaloCommand,
+    ZaloHandle,
 };
 
 /// Shared state of the HTTP handlers.
@@ -129,6 +130,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stickers/search", get(search_stickers))
         .route("/api/v1/threads/{id}/stickers", post(send_sticker))
         .route("/api/v1/threads/{id}/members", get(group_members))
+        .route("/api/v1/users/find", get(find_user))
+        .route(
+            "/api/v1/friends/requests",
+            get(friend_requests).post(send_friend_request),
+        )
+        .route(
+            "/api/v1/friends/requests/{uid}/accept",
+            post(accept_friend_request),
+        )
+        .route(
+            "/api/v1/friends/requests/{uid}/reject",
+            post(reject_friend_request),
+        )
         .route("/api/v1/threads/{id}/shared", get(shared))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
@@ -368,6 +382,92 @@ async fn group_members(
         .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
         .map_err(ApiError::bad_gateway)?;
     Ok(Json(members))
+}
+
+/// Ask the connector to do something on the friends side.
+async fn friends_side(st: &AppState, action: FriendAction) -> ApiResult<Value> {
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Friends { action, reply })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let value = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(value))
+}
+
+/// A user id from a path or a body: digits only.
+fn valid_uid(uid: &str) -> Result<String, ApiError> {
+    let uid = uid.trim();
+    if uid.is_empty() || uid.len() > 32 || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiError::bad_request("invalid user id"));
+    }
+    Ok(uid.to_string())
+}
+
+#[derive(Deserialize)]
+struct FindQuery {
+    #[serde(default)]
+    phone: String,
+}
+
+/// The Zalo account behind a phone number: `{ "user": { uid, name,
+/// zalo_name, avatar, friendship } }`, or `{ "user": null }` when there is
+/// none (or its owner does not let people find them by number). `friendship`
+/// is `friend`, `request_sent`, `request_received` or `none`.
+async fn find_user(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Query(q): Query<FindQuery>,
+) -> ApiResult<Value> {
+    let digits = q.phone.chars().filter(char::is_ascii_digit).count();
+    if !(9..=15).contains(&digits) {
+        return Err(ApiError::bad_request("Số điện thoại không hợp lệ"));
+    }
+    friends_side(&st, FriendAction::Find(q.phone)).await
+}
+
+/// Friend requests received and not answered yet: `[{ uid, display_name,
+/// zalo_name, avatar, message, time }]`.
+async fn friend_requests(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Value> {
+    friends_side(&st, FriendAction::Requests).await
+}
+
+#[derive(Deserialize)]
+struct FriendRequestBody {
+    uid: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// Ask a user to be friends: `{ "uid", "message" }`.
+async fn send_friend_request(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Json(body): Json<FriendRequestBody>,
+) -> ApiResult<Value> {
+    let uid = valid_uid(&body.uid)?;
+    let message: String = body.message.trim().chars().take(150).collect();
+    friends_side(&st, FriendAction::Send { uid, message }).await
+}
+
+async fn accept_friend_request(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(uid): Path<String>,
+) -> ApiResult<Value> {
+    friends_side(&st, FriendAction::Accept(valid_uid(&uid)?)).await
+}
+
+async fn reject_friend_request(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(uid): Path<String>,
+) -> ApiResult<Value> {
+    friends_side(&st, FriendAction::Reject(valid_uid(&uid)?)).await
 }
 
 #[derive(Deserialize)]

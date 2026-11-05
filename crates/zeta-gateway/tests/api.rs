@@ -186,6 +186,10 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog, asked: AskedL
                     seen.lock().unwrap().push((remote_id, ids));
                 }
                 ZaloCommand::Typing { .. } => {}
+                // The answer says what was asked.
+                ZaloCommand::Friends { action, reply } => {
+                    let _ = reply.send(Ok(json!({ "action": format!("{action:?}") })));
+                }
                 // Every group has its owner and one member.
                 ZaloCommand::GroupMembers { group_id, reply } => {
                     let member = |uid: &str, role| Member {
@@ -1011,5 +1015,54 @@ async fn group_members_and_shared_media() {
     .await;
     assert_eq!(kinds(&older), ["chat.photo"]);
     let (status, _) = call(&f, "GET", &format!("{shared}?type=all"), None, true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn friends_side_is_checked_then_handed_to_the_connector() {
+    let f = fixture();
+    let (status, _) = call(&f, "GET", "/api/v1/users/find?phone=123", None, true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, found) = call(
+        &f,
+        "GET",
+        "/api/v1/users/find?phone=0912%20345%20678",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found["action"], "Find(\"0912 345 678\")");
+
+    let (_, requests) = call(&f, "GET", "/api/v1/friends/requests", None, true).await;
+    assert_eq!(requests["action"], "Requests");
+    let send = |uid: &str| json!({ "uid": uid, "message": "  Chào bạn  " });
+    let (status, _) = call(
+        &f,
+        "POST",
+        "/api/v1/friends/requests",
+        Some(send("12a")),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, sent) = call(
+        &f,
+        "POST",
+        "/api/v1/friends/requests",
+        Some(send("12")),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sent["action"],
+        "Send { uid: \"12\", message: \"Chào bạn\" }"
+    );
+    let (_, accepted) = call(&f, "POST", "/api/v1/friends/requests/34/accept", None, true).await;
+    assert_eq!(accepted["action"], "Accept(\"34\")");
+    let (_, rejected) = call(&f, "POST", "/api/v1/friends/requests/34/reject", None, true).await;
+    assert_eq!(rejected["action"], "Reject(\"34\")");
+    let (status, _) = call(&f, "POST", "/api/v1/friends/requests/x/accept", None, true).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

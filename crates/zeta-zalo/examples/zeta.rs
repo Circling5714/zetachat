@@ -29,6 +29,7 @@ Cách dùng:
   zeta groups  <session.json> [--names]          đếm (hoặc liệt kê) nhóm
   zeta people  <session.json>                    hỏi tên, ảnh của thành viên nhóm không phải bạn bè (chỉ in số đếm)
   zeta stickers <session.json> [packs | pack <id> | search <từ khóa>]   kho nhãn dán của Zalo
+  zeta friend  <session.json> [requests | status [uid] | find <số>]     lời mời kết bạn, quan hệ, tìm theo số (chỉ đọc)
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
   zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
         Some("groups") => groups(rest).await,
         Some("people") => people(rest).await,
         Some("stickers") => stickers(rest).await,
+        Some("friend") => friend(rest).await,
         Some("recent") => recent(rest).await,
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
@@ -162,6 +164,51 @@ async fn groups(args: &[String]) -> Result<()> {
         for g in &list {
             println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
         }
+    }
+    Ok(())
+}
+
+/// Read-only friend calls: requests waiting, where the account stands with its
+/// first friend (or a uid), whether a phone number has an account. Prints no
+/// names.
+async fn friend(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    match args.get(1).map(String::as_str).unwrap_or("requests") {
+        "requests" => {
+            let list = client.friend_requests().await?;
+            let with_message = list.iter().filter(|r| !r.message.is_empty()).count();
+            println!(
+                "{} lời mời kết bạn đang chờ ({with_message} có lời nhắn)",
+                list.len()
+            );
+        }
+        "status" => {
+            let uid = match args.get(2) {
+                Some(uid) => uid.clone(),
+                None => {
+                    client
+                        .friends()
+                        .await?
+                        .into_iter()
+                        .next()
+                        .context("chưa có bạn bè nào")?
+                        .uid
+                }
+            };
+            println!("quan hệ: {:?}", client.friendship(&uid).await?);
+        }
+        "find" => {
+            let phone = args.get(2).context("thiếu số điện thoại")?;
+            match client.find_user(phone).await? {
+                Some(user) => println!(
+                    "tìm thấy một tài khoản (có tên: {}, có ảnh: {})",
+                    !user.display_name.is_empty(),
+                    !user.avatar.is_empty()
+                ),
+                None => println!("không có tài khoản nào với số này"),
+            }
+        }
+        other => bail!("không hiểu \"{other}\": requests | status [uid] | find <số điện thoại>"),
     }
     Ok(())
 }

@@ -176,9 +176,30 @@ pub enum ZaloCommand {
         group_id: String,
         reply: oneshot::Sender<Result<GroupMembers, String>>,
     },
+    /// Find people, ask them to be friends, answer their requests (JSON for
+    /// clients).
+    Friends {
+        action: FriendAction,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
     },
+}
+
+/// What to do on the friends side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FriendAction {
+    /// The account behind a phone number: `{ "user": {…} | null }`.
+    Find(String),
+    /// Requests received and not answered yet: `[{…}]`.
+    Requests,
+    Send {
+        uid: String,
+        message: String,
+    },
+    Accept(String),
+    Reject(String),
 }
 
 /// A stored message a new one replies to, with its original Zalo JSON (`Null`
@@ -932,6 +953,16 @@ impl Connector {
                     let _ = reply.send(group_members(&client, &store, &group_id).await);
                 });
             }
+            ZaloCommand::Friends { action, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                tokio::spawn(async move {
+                    let _ = reply.send(friend_action(&client, &store, &bus, action).await);
+                });
+            }
             ZaloCommand::Stickers { query, reply } => {
                 let Some(client) = self.client.clone() else {
                     let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
@@ -1279,6 +1310,115 @@ impl Connector {
                 }
                 true
             }
+        }
+    }
+}
+
+/// Zalo's own words for an error it gave (Vietnamese), else the error.
+fn friend_error(e: zeta_zalo::Error) -> String {
+    match e {
+        zeta_zalo::Error::Server { message, .. } if !message.trim().is_empty() => message,
+        other => other.to_string(),
+    }
+}
+
+/// A person as Zalo described them, for the store.
+fn person_of(uid: &str, name: &str, zalo_name: &str, avatar: &str) -> Person {
+    Person {
+        uid: uid.to_string(),
+        name: name.to_string(),
+        zalo_name: zalo_name.to_string(),
+        avatar: avatar.to_string(),
+        ..Person::default()
+    }
+}
+
+/// Carry out a friends-side action. People Zalo tells about are kept, so a chat
+/// with them has a name and a picture; an accepted request makes a friend, with
+/// a conversation.
+async fn friend_action(
+    client: &ZaloClient,
+    store: &Store,
+    bus: &EventBus,
+    action: FriendAction,
+) -> Result<Value, String> {
+    let keep = |p: &Person, friend: Option<bool>| {
+        if let Err(e) = store.upsert_person(p, friend) {
+            tracing::error!(error = %e, "cannot store a person");
+        }
+    };
+    match action {
+        FriendAction::Find(phone) => {
+            let Some(user) = client.find_user(&phone).await.map_err(friend_error)? else {
+                return Ok(json!({ "user": null }));
+            };
+            keep(
+                &person_of(&user.uid, &user.display_name, &user.zalo_name, &user.avatar),
+                None,
+            );
+            let friendship = match client.friendship(&user.uid).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::debug!(error = %e, "friendship not known");
+                    zeta_zalo::friend::Friendship::None
+                }
+            };
+            Ok(json!({ "user": {
+                "uid": user.uid,
+                "name": user.display_name,
+                "zalo_name": user.zalo_name,
+                "avatar": user.avatar,
+                "friendship": friendship,
+            }}))
+        }
+        FriendAction::Requests => {
+            let list = client.friend_requests().await.map_err(friend_error)?;
+            for r in &list {
+                keep(
+                    &person_of(&r.uid, &r.display_name, &r.zalo_name, &r.avatar),
+                    None,
+                );
+            }
+            Ok(json!(list))
+        }
+        FriendAction::Send { uid, message } => {
+            client
+                .send_friend_request(&uid, &message)
+                .await
+                .map_err(friend_error)?;
+            Ok(json!({ "ok": true }))
+        }
+        FriendAction::Accept(uid) => {
+            client
+                .accept_friend_request(&uid)
+                .await
+                .map_err(friend_error)?;
+            let person = store
+                .people(std::slice::from_ref(&uid))
+                .ok()
+                .and_then(|list| list.into_iter().next())
+                .unwrap_or_else(|| person_of(&uid, "", "", ""));
+            keep(&person, Some(true));
+            let thread = ThreadUpsert {
+                kind: ThreadKind::User,
+                remote_id: uid,
+                name: person.name,
+                avatar: person.avatar,
+            };
+            if let Err(e) = store.upsert_thread(&thread, true) {
+                tracing::error!(error = %e, "cannot store the new friend's chat");
+            }
+            if let Err(e) = bus.publish("threads_changed", json!({})) {
+                tracing::error!(error = %e, "cannot publish threads_changed");
+            }
+            Ok(json!({ "ok": true }))
+        }
+        FriendAction::Reject(uid) => {
+            client
+                .reject_friend_request(&uid)
+                .await
+                .map_err(friend_error)?;
+            Ok(json!({ "ok": true }))
         }
     }
 }

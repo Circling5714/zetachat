@@ -27,6 +27,7 @@ const state = {
   friends: [], // user ids of the friend list
   hits: null, // messages the search box found; null while searching
   meKey: '', // what the account's picture shows, to redraw it only on change
+  requests: [], // friend requests received and not answered
 };
 
 // ------------------------------------------------------------------ helpers
@@ -260,8 +261,38 @@ function renderConversations(ul) {
   for (const t of list) ul.appendChild(threadRow(t));
 }
 
-/** The friend list by name, under the first letter of each name. */
+/** A friend request in the list: who, their words, and the two answers. */
+function requestRow(r) {
+  const name = r.display_name || r.zalo_name || `Người dùng ${r.uid}`;
+  const li = el('li', 'thread request');
+  const body = el('div', 'body');
+  body.append(el('div', 'name', name));
+  if (r.message) body.append(el('div', 'preview', r.message));
+  const answers = el('div', 'request-actions');
+  const yes = el('button', 'btn small-btn', 'Đồng ý');
+  const no = el('button', 'btn secondary small-btn', 'Từ chối');
+  for (const [button, accept] of [[yes, true], [no, false]]) {
+    button.type = 'button';
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      answerRequest(r.uid, accept);
+    });
+    answers.append(button);
+  }
+  body.append(answers);
+  const meta = el('div', 'meta');
+  if (r.time) meta.append(el('span', null, fmtListTime(r.time)));
+  li.append(avatarBox(`zalo:u:${r.uid}`, name, r.avatar), body, meta);
+  li.addEventListener('click', () => openPerson({ uid: r.uid, name, avatar: r.avatar }));
+  return li;
+}
+
+/** Friend requests first, then the friend list by name, under first letters. */
 function renderFriends(ul) {
+  if (state.requests.length) {
+    ul.appendChild(el('li', 'list-section', `Lời mời kết bạn · ${state.requests.length}`));
+    for (const r of state.requests) ul.appendChild(requestRow(r));
+  }
   const list = friendList();
   if (!list.length) {
     ul.appendChild(el('li', 'list-empty', 'Chưa có bạn bè'));
@@ -378,6 +409,139 @@ async function loadFriends() {
   }
 }
 
+async function loadRequests() {
+  try {
+    state.requests = await api('/friends/requests');
+  } catch (err) {
+    if (err instanceof Unauthorized) handleError(err);
+    return;
+  }
+  updateRequestsBadge();
+  if (state.filter === 'friends' && !state.search.trim()) renderThreads();
+}
+
+function updateRequestsBadge() {
+  const badge = $('requests-badge');
+  const n = state.requests.length;
+  badge.hidden = !n;
+  badge.textContent = n > 99 ? '99+' : String(n);
+}
+
+/** Accept or decline a friend request; true when Zalo took the answer. */
+async function answerRequest(uid, accept) {
+  try {
+    await api(`/friends/requests/${encodeURIComponent(uid)}/${accept ? 'accept' : 'reject'}`, { method: 'POST' });
+  } catch (err) {
+    handleError(err, 'Không trả lời được lời mời: ');
+    return false;
+  }
+  state.requests = state.requests.filter((r) => r.uid !== uid);
+  updateRequestsBadge();
+  toast(accept ? 'Đã đồng ý kết bạn' : 'Đã từ chối lời mời kết bạn');
+  if (accept) loadFriends();
+  renderThreads();
+  return true;
+}
+
+// ------------------------------------------------------------ adding friends
+
+const FRIENDSHIP_TEXT = {
+  friend: 'Đã là bạn bè',
+  request_sent: 'Đã gửi lời mời kết bạn, đang chờ trả lời',
+  request_received: 'Người này đã gửi lời mời kết bạn cho bạn',
+};
+
+function openAddFriend() {
+  $('add-friend').hidden = false;
+  $('find-result').replaceChildren();
+  $('find-phone').value = '';
+  $('find-phone').focus();
+}
+
+function closeAddFriend() {
+  $('add-friend').hidden = true;
+}
+
+/** What a phone number search found: a card with what can be done next. */
+function renderFound(user) {
+  const box = $('find-result');
+  box.replaceChildren();
+  if (!user) {
+    box.append(el('p', 'muted find-none', 'Không tìm thấy tài khoản Zalo nào với số này, hoặc người đó không cho tìm bằng số điện thoại.'));
+    return;
+  }
+  const name = user.name || user.zalo_name || 'Người dùng Zalo';
+  const card = el('div', 'found-card');
+  const picture = avatarBox(`zalo:u:${user.uid}`, name, user.avatar);
+  picture.classList.add('info-avatar');
+  card.append(picture, el('div', 'info-name', name));
+  if (FRIENDSHIP_TEXT[user.friendship]) card.append(el('div', 'muted small', FRIENDSHIP_TEXT[user.friendship]));
+  const actions = el('div', 'row');
+  const chat = el('button', 'btn secondary', 'Nhắn tin');
+  chat.type = 'button';
+  chat.addEventListener('click', () => {
+    closeAddFriend();
+    openPerson({ uid: user.uid, name, avatar: user.avatar });
+  });
+  if (user.friendship === 'none') {
+    const note = el('textarea', 'field found-note');
+    note.rows = 2;
+    note.maxLength = 150;
+    note.setAttribute('aria-label', 'Lời nhắn kèm lời mời');
+    const me = state.status && state.status.display_name;
+    note.value = me ? `Xin chào, mình là ${me}. Kết bạn với mình nhé!` : 'Xin chào, kết bạn với mình nhé!';
+    const add = el('button', 'btn', 'Kết bạn');
+    add.type = 'button';
+    add.addEventListener('click', async () => {
+      add.disabled = true;
+      try {
+        await api('/friends/requests', { json: { uid: user.uid, message: note.value } });
+        toast('Đã gửi lời mời kết bạn');
+        renderFound({ ...user, friendship: 'request_sent' });
+      } catch (err) {
+        add.disabled = false;
+        handleError(err, 'Không gửi được lời mời: ');
+      }
+    });
+    card.append(note);
+    actions.append(add, chat);
+  } else if (user.friendship === 'request_received') {
+    const accept = el('button', 'btn', 'Đồng ý kết bạn');
+    accept.type = 'button';
+    accept.addEventListener('click', async () => {
+      if (await answerRequest(user.uid, true)) renderFound({ ...user, friendship: 'friend' });
+    });
+    actions.append(accept, chat);
+  } else {
+    actions.append(chat);
+  }
+  card.append(actions);
+  box.append(card);
+}
+
+$('add-friend-btn').addEventListener('click', openAddFriend);
+$('add-close').addEventListener('click', closeAddFriend);
+$('add-friend').addEventListener('click', (e) => {
+  if (e.target === $('add-friend')) closeAddFriend();
+});
+$('find-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const phone = $('find-phone').value.trim();
+  if (!phone) return;
+  const box = $('find-result');
+  box.replaceChildren(el('p', 'muted find-none', 'Đang tìm…'));
+  try {
+    const data = await api(`/users/find?phone=${encodeURIComponent(phone)}`);
+    renderFound(data.user);
+  } catch (err) {
+    if (err instanceof Unauthorized) {
+      handleError(err);
+      return;
+    }
+    box.replaceChildren(el('p', 'error', err.message));
+  }
+});
+
 // Names and pictures of people who are not friends (group members), asked for
 // as their messages show up, once per page load.
 const peopleAsked = new Set();
@@ -441,6 +605,8 @@ for (const tab of document.querySelectorAll('.tab')) {
     for (const other of document.querySelectorAll('.tab')) other.classList.toggle('active', other === tab);
     state.filter = tab.dataset.filter;
     renderThreads();
+    // Requests come and go: look again when the list is opened.
+    if (state.filter === 'friends') loadRequests();
   });
 }
 
@@ -895,7 +1061,8 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  if (picker) closePicker();
+  if (!$('add-friend').hidden) closeAddFriend();
+  else if (picker) closePicker();
   else if (panelKind) closePanel();
   else if (info.thread && $('viewer').hidden) closeInfo();
   else if (state.replyTo && document.activeElement === input) cancelReply();
@@ -2353,6 +2520,7 @@ async function start() {
   renderStatus(st.zalo);
   await loadThreads();
   loadFriends();
+  loadRequests();
   openStream();
   loadUploads();
   if (st.zalo.session === 'logged_out' || st.zalo.session === 'rejected') {

@@ -124,6 +124,15 @@ Theo ctdozlite (chép từ Zalo PC), host là `sticker` trong bảng dịch vụ
 - Gửi: `POST {chat}/api/message/sticker` (nhóm: `{group}/api/group/sticker`) với `toid` hoặc `grid`, `stickerId`, `cateId`, `type`, `clientId`, `imei`, `zsource: 101`. Đã thử gửi vào Cloud: Zalo nhận, bản sao gửi về không bị lưu trùng.
 - Ảnh: `https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=<id>&size=130`; 30 nhãn dán có sẵn (gói 0) nằm ở `stc-chat.zdn.vn`. Ảnh của gói và của nhãn dán tải được không cần cookie.
 
+## 8g. Tìm người và kết bạn (một phần đã kiểm chứng)
+
+Đều trên dịch vụ `friend`, theo zca-js và ctdozlite:
+
+- Tìm theo số điện thoại: `GET /api/friend/profile/get` với `{ phone, avatar_size, language: "vi", imei, reqSrc: 40 }`; số Việt Nam bắt đầu bằng 0 được đổi thành 84. Kết quả có `uid`, `display_name`, `zalo_name`, `avatar`. Mã `216`: không có tài khoản, hoặc chủ số không cho tìm bằng số điện thoại. Đã thử với một số không hợp lệ: Zalo trả mã `219` "Số điện thoại không hợp lệ", tức là yêu cầu tới đúng chỗ. Chưa thử với số thật.
+- Quan hệ: `GET /api/friend/reqstatus` với `{ fid, imei }` cho `is_friend`, `is_requested` (mình đã mời) và `is_requesting` (họ đã mời). Đã thử với một người bạn: đúng là bạn bè.
+- Lời mời đang chờ: `GET /api/friend/recommendsv2/list` với `{ imei }`. Lời mời là các mục có `dataInfo.recommType` bằng 2 (1 là gợi ý kết bạn), lời nhắn ở `dataInfo.recommInfo.message`. Đã gọi được, nhưng tài khoản thử chưa có lời mời nào, nên chưa thấy dữ liệu thật.
+- Gửi lời mời `POST /api/friend/sendreq` (`{ toid, msg, reqsrc: 30, imei, language }`), đồng ý `POST /api/friend/accept` (`{ fid, language }`), từ chối `POST /api/friend/reject` (`{ fid, imei }`): chưa thử, vì sẽ tác động tới người thật.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

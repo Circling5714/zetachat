@@ -33,11 +33,14 @@
       </header>
       <div class="search-wrap">
         <input id="search" class="field" type="search" placeholder="Tìm bạn bè, nhóm, tin nhắn" autocomplete="off">
+        <button id="add-friend-btn" class="attach-btn" type="button" title="Thêm bạn bằng số điện thoại" aria-label="Thêm bạn">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle cx="10" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 20c.8-3.6 3.6-5.5 7-5.5s6.2 1.9 7 5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M19 8v6M16 11h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
       </div>
       <div class="tabs" role="tablist">
         <button class="tab active" data-filter="all" type="button">Tất cả</button>
         <button class="tab" data-filter="unread" type="button">Chưa đọc</button>
-        <button class="tab" data-filter="friends" type="button">Bạn bè</button>
+        <button class="tab" data-filter="friends" type="button">Bạn bè<span id="requests-badge" class="badge tab-badge" hidden></span></button>
         <button class="tab" data-filter="groups" type="button">Nhóm</button>
       </div>
       <ul id="threads" class="threads"></ul>
@@ -103,6 +106,20 @@
       <div class="row">
         <button id="login-start" class="btn" type="button">Tạo mã QR</button>
         <button id="login-close" class="btn secondary" type="button">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="add-friend" class="modal" hidden>
+    <div class="card add-card" role="dialog" aria-modal="true" aria-labelledby="add-title">
+      <h2 id="add-title">Thêm bạn</h2>
+      <form id="find-form" class="find-row">
+        <input id="find-phone" class="field" type="tel" inputmode="tel" placeholder="Số điện thoại" autocomplete="off" required>
+        <button class="btn" type="submit">Tìm</button>
+      </form>
+      <div id="find-result" class="find-result"></div>
+      <div class="row">
+        <button id="add-close" class="btn secondary" type="button">Đóng</button>
       </div>
     </div>
   </div>

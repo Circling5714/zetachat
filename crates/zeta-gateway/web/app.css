@@ -113,7 +113,18 @@ a.btn { display: inline-block; text-decoration: none; }
 .status-pill.ok { background: rgb(21 128 61 / 0.12); color: var(--ok); }
 .status-pill.warn { background: rgb(180 83 9 / 0.14); color: var(--warn); }
 .status-pill.bad { background: rgb(220 38 38 / 0.12); color: var(--danger); }
-.search-wrap { padding: 4px 12px 8px; }
+.search-wrap { display: flex; gap: 6px; align-items: center; padding: 4px 12px 8px; }
+.search-wrap .attach-btn { width: 38px; height: 38px; }
+.tab-badge { margin-left: 5px; padding: 0 5px; min-width: 16px; font-size: 10px; vertical-align: 1px; }
+.thread.request { align-items: start; }
+.request-actions { display: flex; gap: 6px; margin-top: 6px; }
+.small-btn { padding: 4px 12px; border-radius: 8px; font-size: 13px; }
+.add-card { width: min(400px, 100%); display: grid; gap: 12px; }
+.add-card h2 { margin: 0; text-align: center; }
+.find-row { display: flex; gap: 8px; }
+.find-none { margin: 0; text-align: center; font-size: 14px; }
+.found-card { display: grid; justify-items: center; gap: 8px; text-align: center; }
+.found-note { resize: vertical; font: inherit; }
 .tabs { display: flex; gap: 4px; padding: 0 12px 8px; }
 .tab {
   border: 0;

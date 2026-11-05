@@ -17,6 +17,11 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/people?ids=<uid>,<uid>…` | Tên và ảnh đại diện của người dùng (người gửi tin trong nhóm, thành viên nhóm), tối đa 100 id. Người gateway chưa biết, hoặc đã hơn 3 ngày chưa hỏi lại, được hỏi Zalo trước (50 người mỗi lần). Trả về những người gateway biết, theo thứ tự đã hỏi; người Zalo không trả lời có `name` rỗng |
 | GET | `/threads/{id}/members` | Thành viên của nhóm, hỏi Zalo ngay lúc gọi: `{ "total", "members": [{ "uid", "name", "avatar", "friend", "role" }] }`, `role` là `owner` (trưởng nhóm), `admin` (phó nhóm) hoặc `member`; trưởng và phó nhóm đứng trước. Người gateway chưa biết được hỏi tên và ảnh trước. Liệt kê tối đa 300 người. `404` với chat 1-1 |
 | GET | `/threads/{id}/shared?type=&before=&limit=` | Những gì đã chia sẻ trong hội thoại, mới nhất trước: `type=media` (ảnh, video, GIF), `file` hoặc `link`. Trả về các tin nhắn mang chúng |
+| GET | `/users/find?phone=` | Tài khoản Zalo ứng với số điện thoại: `{ "user": { "uid", "name", "zalo_name", "avatar", "friendship" } }`, hoặc `{ "user": null }` khi không có (hay người đó không cho tìm bằng số). `friendship` là `friend`, `request_sent` (mình đã mời), `request_received` (họ đã mời mình) hoặc `none`. `400` với số quá ngắn hoặc quá dài |
+| GET | `/friends/requests` | Lời mời kết bạn đang chờ: `[{ "uid", "display_name", "zalo_name", "avatar", "message", "time" }]` |
+| POST | `/friends/requests` | Gửi lời mời kết bạn `{ "uid", "message" }` (lời nhắn tối đa 150 ký tự) |
+| POST | `/friends/requests/{uid}/accept` | Đồng ý kết bạn; người đó vào danh sách bạn bè, có hội thoại riêng |
+| POST | `/friends/requests/{uid}/reject` | Từ chối lời mời |
 | GET | `/stickers/packs` | Các gói nhãn dán trong kho của Zalo, mới nhất trước: `[{ "id", "name", "icon", "count" }]`. Gateway giữ danh sách 12 giờ |
 | GET | `/stickers/packs/{id}` | Nhãn dán của một gói: `[{ "id", "cate_id", "type", "url" }]`; `url` là ảnh trên CDN của Zalo, tải qua `/media` |
 | GET | `/stickers/search?q=` | Nhãn dán theo từ khóa ("haha", "cảm ơn", "yêu"…), như Zalo gợi ý; cùng dạng như trên |

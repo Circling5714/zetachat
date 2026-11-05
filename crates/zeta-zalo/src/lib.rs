@@ -14,6 +14,7 @@ pub mod client;
 pub mod crypto;
 pub mod domains;
 pub mod error;
+pub mod friend;
 pub mod login;
 pub mod media;
 pub mod message;

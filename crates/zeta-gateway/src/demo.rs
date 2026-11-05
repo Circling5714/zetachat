@@ -18,7 +18,9 @@ use crate::model::{
 use crate::stickers::StickerQuery;
 use crate::store::{fold, Store};
 use crate::uploads::UploadJob;
-use crate::zalo::{Attachment, LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus};
+use crate::zalo::{
+    Attachment, FriendAction, LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus,
+};
 
 /// Sample pictures are inline SVG, so the demo needs no network at all.
 const PHOTO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fde68a"/><stop offset="1" stop-color="#f97316"/></linearGradient></defs><rect width="800" height="600" fill="url(#g)"/><ellipse cx="400" cy="330" rx="310" ry="205" fill="#7c2d12" opacity="0.85"/><circle cx="290" cy="270" r="84" fill="#fff"/><circle cx="290" cy="270" r="62" fill="#16a34a"/><circle cx="510" cy="270" r="84" fill="#fff"/><circle cx="510" cy="270" r="62" fill="#dc2626"/><circle cx="400" cy="420" r="74" fill="#fff"/><circle cx="400" cy="420" r="54" fill="#facc15"/></svg>"##;
@@ -182,6 +184,64 @@ fn demo_members(store: &Store, group_id: &str) -> Result<GroupMembers, String> {
     Ok(GroupMembers { total, members })
 }
 
+/// A person of the demo as clients get them from the friends side.
+fn demo_person(store: &Store, uid: &str) -> Person {
+    store
+        .people(&[uid.to_string()])
+        .ok()
+        .and_then(|list| list.into_iter().next())
+        .unwrap_or_default()
+}
+
+/// The friends side of the demo: a number ending in 5678 finds Ngọc Hân, one
+/// ending in 0001 finds Lan Anh (a friend); Minh Khoa asked to be friends.
+fn demo_friends(store: &Store, bus: &EventBus, action: FriendAction, answered: &mut bool) -> Value {
+    match action {
+        FriendAction::Find(phone) => {
+            let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+            let (uid, friendship) = if digits.ends_with("5678") {
+                ("1010", "none")
+            } else if digits.ends_with("0001") {
+                ("1001", "friend")
+            } else {
+                return json!({ "user": null });
+            };
+            let p = demo_person(store, uid);
+            json!({ "user": {
+                "uid": p.uid, "name": p.name, "zalo_name": p.name, "avatar": p.avatar,
+                "friendship": friendship,
+            }})
+        }
+        FriendAction::Requests if *answered => json!([]),
+        FriendAction::Requests => {
+            let p = demo_person(store, "1011");
+            json!([{
+                "uid": p.uid, "display_name": p.name, "zalo_name": p.name, "avatar": p.avatar,
+                "message": "Chào bạn, mình là Khoa, bạn học cũ nè", "time": now_ms() - 3_600_000,
+            }])
+        }
+        FriendAction::Send { .. } => json!({ "ok": true }),
+        FriendAction::Accept(uid) => {
+            *answered = true;
+            let p = demo_person(store, &uid);
+            let _ = store.upsert_person(&p, Some(true));
+            let thread = ThreadUpsert {
+                kind: ThreadKind::User,
+                remote_id: uid,
+                name: p.name,
+                avatar: p.avatar,
+            };
+            let _ = store.upsert_thread(&thread, true);
+            let _ = bus.publish("threads_changed", json!({}));
+            json!({ "ok": true })
+        }
+        FriendAction::Reject(_) => {
+            *answered = true;
+            json!({ "ok": true })
+        }
+    }
+}
+
 /// This account in the demo.
 const ME: &str = "1000";
 
@@ -199,6 +259,9 @@ const PEOPLE: &[(&str, &str, Option<u32>, bool)] = &[
     ("3001", "Mẹ", Some(15), false),
     ("3002", "Minh", Some(120), false),
     ("3003", "Bố", None, false),
+    // Found by phone number, and a friend request.
+    ("1010", "Ngọc Hân", Some(45), false),
+    ("1011", "Minh Khoa", Some(250), false),
 ];
 
 fn picture_of(uid: &str) -> String {
@@ -675,6 +738,8 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
     };
     let shared = handle.status.clone();
     tokio::spawn(async move {
+        // Whether the demo's friend request was answered.
+        let mut answered = false;
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 ZaloCommand::SendText {
@@ -812,6 +877,9 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 }
                 ZaloCommand::GroupMembers { group_id, reply } => {
                     let _ = reply.send(demo_members(&store, &group_id));
+                }
+                ZaloCommand::Friends { action, reply } => {
+                    let _ = reply.send(Ok(demo_friends(&store, &bus, action, &mut answered)));
                 }
                 ZaloCommand::SendSticker {
                     kind,
