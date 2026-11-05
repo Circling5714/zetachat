@@ -425,18 +425,28 @@ async fn recent(args: &[String]) -> Result<()> {
 
 /// Keys, types and array sizes of a JSON value, never the values themselves.
 fn shape(v: &serde_json::Value, depth: usize) -> String {
+    shape_to(v, depth, 3)
+}
+
+/// [`shape`] down to `max` levels; JSON held in a string is opened too.
+fn shape_to(v: &serde_json::Value, depth: usize, max: usize) -> String {
     use serde_json::Value;
+    if let Value::String(s) = v {
+        if let Ok(inner @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str(s) {
+            return format!("chuỗi JSON {}", shape_to(&inner, depth, max));
+        }
+    }
     match v {
-        Value::Object(m) if depth < 3 => {
+        Value::Object(m) if depth < max => {
             let inner: Vec<String> = m
                 .iter()
-                .map(|(k, x)| format!("{k}: {}", shape(x, depth + 1)))
+                .map(|(k, x)| format!("{k}: {}", shape_to(x, depth + 1, max)))
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
         Value::Object(m) => format!("{{{} khóa}}", m.len()),
         Value::Array(a) => match a.first() {
-            Some(first) => format!("[{} × {}]", a.len(), shape(first, depth + 1)),
+            Some(first) => format!("[{} × {}]", a.len(), shape_to(first, depth + 1, max)),
             None => "[]".into(),
         },
         Value::String(_) => "chuỗi".into(),
@@ -463,6 +473,9 @@ async fn probe(args: &[String]) -> Result<()> {
         "group_cloud_message" => Service::GroupCloudMessage,
         "reaction" => Service::Reaction,
         "alias" => Service::Alias,
+        "group_board" => Service::GroupBoard,
+        "quick_message" => Service::QuickMessage,
+        "zimsg" => Service::Zimsg,
         other => bail!("dịch vụ không hỗ trợ: {other}"),
     };
     let mut params: serde_json::Value =
@@ -470,8 +483,9 @@ async fn probe(args: &[String]) -> Result<()> {
     if params.get("imei").is_some_and(|v| v == "auto") {
         params["imei"] = serde_json::json!(client.device().imei);
     }
+    let max = if args.get(4).map(String::as_str) == Some("--deep") { 7 } else { 3 };
     match client.get_encrypted(service, path, &params).await {
-        Ok(data) => println!("OK {}", shape(&data, 0)),
+        Ok(data) => println!("OK {}", shape_to(&data, 0, max)),
         Err(e) => println!("LỖI {e}"),
     }
     Ok(())
@@ -735,6 +749,22 @@ async fn board(args: &[String]) -> Result<()> {
                 .await
             {
                 Ok(()) => println!("REMOVED {reminder}"),
+                Err(e) => println!("LỖI {e}"),
+            }
+        }
+        "unremind-title" => {
+            // Only the reminder with exactly this title.
+            let (Some(kind), Some(id), Some(title)) = (args.get(2), args.get(3), args.get(4)) else {
+                bail!("cần: board <session.json> unremind-title user|group <id> <tiêu đề>");
+            };
+            let chat = recipient(&client, kind, id)?;
+            let list = client.reminders(chat).await?;
+            let found = list
+                .iter()
+                .find(|r| &r.title == title)
+                .context("không có nhắc hẹn với tiêu đề này")?;
+            match client.remove_reminder(chat, &found.id).await {
+                Ok(()) => println!("REMOVED \"{title}\""),
                 Err(e) => println!("LỖI {e}"),
             }
         }

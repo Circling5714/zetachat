@@ -34,7 +34,8 @@
 //! - Reminders: `GET /api/board/listReminder` with `{ objectData: JSON text of
 //!   { group_id, board_type: 1, page, count, last_id: 0, last_type: 0 }, imei }`,
 //!   or `GET /api/board/oneone/list` with `{ objectData: { uid, … } }` for a 1-1
-//!   chat; both answer `data` as JSON text.
+//!   chat; both answer `data` as JSON text. Seen live: a chat without
+//!   reminders answers error -1 instead of an empty list.
 //! - Delete: `POST /api/board/topic/remove` with `{ grid, topicId, imei }`, or
 //!   `/api/board/oneone/remove` with `{ uid, reminderId }`.
 
@@ -510,10 +511,15 @@ impl ZaloClient {
                 }),
             ),
         };
-        let data = self
+        match self
             .get_encrypted(Service::GroupBoard, path, &params)
-            .await?;
-        Ok(reminders_of(data))
+            .await
+        {
+            Ok(data) => Ok(reminders_of(data)),
+            // How Zalo says "none" (seen live on chats without reminders).
+            Err(Error::Server { code: -1, .. }) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Set a reminder in a chat; everyone in it is reminded when it is due.

@@ -157,7 +157,10 @@ ALTER TABLE messages ADD COLUMN urgency INTEGER NOT NULL DEFAULT 0;
 const CARD_ECHO_MS: i64 = 15_000;
 
 /// The version `init` brings every database to.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
+
+/// Version 13: polls, cards and tasks, shown as their message type before.
+const REPARSED_IN_V13: [&str; 3] = ["group.poll", "chat.ecard", "chat.todo"];
 
 /// Version 11: bank account cards, shown as "[Nội dung đặc biệt]" before.
 const REPARSED_IN_V11: [&str; 1] = ["chat.webcontent"];
@@ -670,6 +673,29 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA_V12)?;
             tx.pragma_update(None, "user_version", 12)?;
+            tx.commit()?;
+        }
+        if version < 13 {
+            let tx = conn.transaction()?;
+            reparse_kinds(&tx, &REPARSED_IN_V13)?;
+            // Zalo's own lines about what was done in a chat.
+            let notices: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT seq, raw FROM messages
+                     WHERE kind = 'webchat' AND raw LIKE '%msginfo.actionlist%'",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_>>()?
+            };
+            for (seq, raw) in notices {
+                let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                let found = media::extract("webchat", value.get("content"));
+                tx.execute(
+                    "UPDATE messages SET media = ?2 WHERE seq = ?1",
+                    params![seq, to_json(found.as_ref())],
+                )?;
+            }
+            tx.pragma_update(None, "user_version", 13)?;
             tx.commit()?;
         }
         Ok(Self {

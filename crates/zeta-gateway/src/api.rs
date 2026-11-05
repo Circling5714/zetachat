@@ -38,9 +38,10 @@ use crate::stickers::StickerQuery;
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
 use crate::zalo::{
-    photo_type, Attachment, CardAction, FriendAction, LoginState, QuickAction, ReplyTo,
-    SessionState, ZaloCommand, ZaloHandle,
+    photo_type, Attachment, BoardAction, CardAction, FriendAction, LoginState, QuickAction,
+    ReplyTo, SessionState, ZaloCommand, ZaloHandle,
 };
+use zeta_zalo::board::{NewPoll, NewReminder};
 
 /// Shared state of the HTTP handlers.
 #[derive(Clone)]
@@ -155,6 +156,23 @@ pub fn router(state: AppState) -> Router {
             delete(remove_bank_account),
         )
         .route("/api/v1/vietqr.svg", get(vietqr_svg))
+        .route("/api/v1/threads/{id}/board", get(group_board))
+        .route("/api/v1/threads/{id}/board/{topic}", delete(remove_topic))
+        .route("/api/v1/threads/{id}/polls", post(create_poll))
+        .route("/api/v1/polls/{poll}", get(get_poll))
+        .route("/api/v1/polls/{poll}/vote", post(vote_poll))
+        .route("/api/v1/polls/{poll}/options", post(add_poll_options))
+        .route("/api/v1/polls/{poll}/close", post(close_poll))
+        .route("/api/v1/threads/{id}/notes", post(create_note))
+        .route("/api/v1/threads/{id}/notes/{note}", put(update_note))
+        .route(
+            "/api/v1/threads/{id}/reminders",
+            get(list_reminders).post(create_reminder),
+        )
+        .route(
+            "/api/v1/threads/{id}/reminders/{reminder}",
+            delete(remove_reminder),
+        )
         .route(
             "/api/v1/quick-messages",
             get(quick_messages).post(add_quick_message),
@@ -893,6 +911,309 @@ async fn remove_bank_account(
     Ok(Json(
         ask_cards(&st, CardAction::RemoveAccount { id: account }).await?,
     ))
+}
+
+/// Ask the connector about polls, notes and reminders.
+async fn ask_boards(st: &AppState, action: BoardAction) -> Result<Value, ApiError> {
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Boards { action, reply })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)
+}
+
+/// The group of a thread id; polls and notes live in groups only.
+fn group_of(id: &str) -> Result<String, ApiError> {
+    match split_thread_id(id) {
+        Some((ThreadKind::Group, remote)) => Ok(remote.to_string()),
+        Some(_) => Err(ApiError::bad_request("chỉ nhóm mới có bảng tin")),
+        None => Err(ApiError::not_found("thread")),
+    }
+}
+
+/// A Zalo topic id (note, reminder): letters and digits only.
+fn topic_id(id: &str) -> Result<String, ApiError> {
+    let ok = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric());
+    ok.then(|| id.to_string())
+        .ok_or_else(|| ApiError::not_found("topic"))
+}
+
+async fn group_board(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    let group_id = group_of(&id)?;
+    Ok(Json(ask_boards(&st, BoardAction::Board { group_id }).await?))
+}
+
+async fn remove_topic(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, topic)): Path<(String, String)>,
+) -> ApiResult<Value> {
+    let group_id = group_of(&id)?;
+    let id = topic_id(&topic)?;
+    Ok(Json(
+        ask_boards(&st, BoardAction::RemoveTopic { group_id, id }).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct PollBody {
+    question: String,
+    options: Vec<String>,
+    #[serde(default)]
+    multiple: bool,
+    #[serde(default)]
+    add_options: bool,
+    #[serde(default)]
+    anonymous: bool,
+    #[serde(default)]
+    hide_results: bool,
+    /// Milliseconds since the epoch; 0 for never.
+    #[serde(default)]
+    expires_at: i64,
+}
+
+/// Most options a poll takes from here, and characters per option.
+const POLL_OPTIONS_MAX: usize = 30;
+const POLL_TEXT_MAX: usize = 200;
+
+/// Options that say something, each once, trimmed.
+fn poll_options(raw: &[String]) -> Result<Vec<String>, ApiError> {
+    let mut out: Vec<String> = Vec::new();
+    for o in raw {
+        let o = o.trim();
+        if o.chars().count() > POLL_TEXT_MAX {
+            return Err(ApiError::bad_request("phương án quá dài"));
+        }
+        if !o.is_empty() && !out.iter().any(|x| x == o) {
+            out.push(o.to_string());
+        }
+    }
+    if out.len() > POLL_OPTIONS_MAX {
+        return Err(ApiError::bad_request("quá nhiều phương án"));
+    }
+    Ok(out)
+}
+
+async fn create_poll(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Json(body): Json<PollBody>,
+) -> ApiResult<Value> {
+    let group_id = group_of(&id)?;
+    let question = body.question.trim();
+    let options = poll_options(&body.options)?;
+    if question.is_empty() || question.chars().count() > POLL_TEXT_MAX || options.len() < 2 {
+        return Err(ApiError::bad_request(
+            "bình chọn cần câu hỏi và ít nhất hai phương án",
+        ));
+    }
+    if body.expires_at != 0 && body.expires_at < now_ms() {
+        return Err(ApiError::bad_request("hạn bình chọn đã qua"));
+    }
+    let poll = NewPoll {
+        question: question.to_string(),
+        options,
+        multiple: body.multiple,
+        add_options: body.add_options,
+        anonymous: body.anonymous,
+        hide_results: body.hide_results,
+        expires_at: body.expires_at,
+    };
+    Ok(Json(
+        ask_boards(&st, BoardAction::CreatePoll { group_id, poll }).await?,
+    ))
+}
+
+async fn get_poll(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(poll): Path<u64>,
+) -> ApiResult<Value> {
+    Ok(Json(ask_boards(&st, BoardAction::Poll { id: poll }).await?))
+}
+
+#[derive(Deserialize)]
+struct VoteBody {
+    /// The options chosen; none takes the vote back.
+    #[serde(default)]
+    options: Vec<u64>,
+}
+
+async fn vote_poll(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(poll): Path<u64>,
+    Json(body): Json<VoteBody>,
+) -> ApiResult<Value> {
+    if body.options.len() > POLL_OPTIONS_MAX {
+        return Err(ApiError::bad_request("quá nhiều phương án"));
+    }
+    let action = BoardAction::Vote {
+        id: poll,
+        options: body.options,
+    };
+    Ok(Json(ask_boards(&st, action).await?))
+}
+
+#[derive(Deserialize)]
+struct OptionsBody {
+    options: Vec<String>,
+}
+
+async fn add_poll_options(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(poll): Path<u64>,
+    Json(body): Json<OptionsBody>,
+) -> ApiResult<Value> {
+    let options = poll_options(&body.options)?;
+    if options.is_empty() {
+        return Err(ApiError::bad_request("chưa có phương án nào để thêm"));
+    }
+    let action = BoardAction::AddOptions { id: poll, options };
+    Ok(Json(ask_boards(&st, action).await?))
+}
+
+async fn close_poll(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(poll): Path<u64>,
+) -> ApiResult<Value> {
+    Ok(Json(
+        ask_boards(&st, BoardAction::ClosePoll { id: poll }).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct NoteBody {
+    text: String,
+    /// Pin it on top of the chat too.
+    #[serde(default)]
+    pin: bool,
+}
+
+/// Most characters of a note.
+const NOTE_TEXT_MAX: usize = 4000;
+
+fn note_text(body: &NoteBody) -> Result<String, ApiError> {
+    let text = body.text.trim();
+    if text.is_empty() || text.chars().count() > NOTE_TEXT_MAX {
+        return Err(ApiError::bad_request("ghi chú trống hoặc quá dài"));
+    }
+    Ok(text.to_string())
+}
+
+async fn create_note(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Json(body): Json<NoteBody>,
+) -> ApiResult<Value> {
+    let group_id = group_of(&id)?;
+    let text = note_text(&body)?;
+    let action = BoardAction::CreateNote {
+        group_id,
+        text,
+        pin: body.pin,
+    };
+    Ok(Json(ask_boards(&st, action).await?))
+}
+
+async fn update_note(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, note)): Path<(String, String)>,
+    Json(body): Json<NoteBody>,
+) -> ApiResult<Value> {
+    let group_id = group_of(&id)?;
+    let text = note_text(&body)?;
+    let action = BoardAction::UpdateNote {
+        group_id,
+        id: topic_id(&note)?,
+        text,
+        pin: body.pin,
+    };
+    Ok(Json(ask_boards(&st, action).await?))
+}
+
+async fn list_reminders(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let action = BoardAction::Reminders {
+        kind,
+        remote_id: remote_id.to_string(),
+    };
+    Ok(Json(ask_boards(&st, action).await?))
+}
+
+#[derive(Deserialize)]
+struct ReminderBody {
+    title: String,
+    #[serde(default)]
+    emoji: String,
+    /// When it is due, milliseconds since the epoch.
+    start_at: i64,
+    /// 0 once, 1 daily, 2 weekly, 3 monthly.
+    #[serde(default)]
+    repeat: u8,
+}
+
+async fn create_reminder(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Json(body): Json<ReminderBody>,
+) -> ApiResult<Value> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let title = body.title.trim();
+    if title.is_empty() || title.chars().count() > POLL_TEXT_MAX {
+        return Err(ApiError::bad_request("nhắc hẹn cần tiêu đề (tối đa 200 ký tự)"));
+    }
+    if body.repeat > 3 {
+        return Err(ApiError::bad_request("kiểu lặp không hợp lệ"));
+    }
+    if body.start_at < now_ms() - 60_000 {
+        return Err(ApiError::bad_request("giờ nhắc đã qua"));
+    }
+    let reminder = NewReminder {
+        title: title.to_string(),
+        emoji: body.emoji.chars().take(8).collect(),
+        start_at: body.start_at,
+        repeat: body.repeat,
+    };
+    let action = BoardAction::CreateReminder {
+        kind,
+        remote_id: remote_id.to_string(),
+        reminder,
+    };
+    Ok(Json(ask_boards(&st, action).await?))
+}
+
+async fn remove_reminder(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, reminder)): Path<(String, String)>,
+) -> ApiResult<Value> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let action = BoardAction::RemoveReminder {
+        kind,
+        remote_id: remote_id.to_string(),
+        id: topic_id(&reminder)?,
+    };
+    Ok(Json(ask_boards(&st, action).await?))
 }
 
 /// Ask the connector about quick messages; answers the list.

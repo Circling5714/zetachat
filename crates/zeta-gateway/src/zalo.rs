@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeta_zalo::api::{LastOnline, Recipient, SessionHealth, TextExtras};
+use zeta_zalo::board::{NewPoll, NewReminder};
 use zeta_zalo::card::{account_number, holder_name, Bank};
 use zeta_zalo::message::QuotedMessage;
 use zeta_zalo::socket::{self, RealtimeEvent};
@@ -231,6 +232,11 @@ pub enum ZaloCommand {
         action: CardAction,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Polls, notes and reminders (JSON for clients).
+    Boards {
+        action: BoardAction,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// Quick messages ("tin nhắn nhanh"); every action answers the list.
     Quick {
         action: QuickAction,
@@ -238,6 +244,45 @@ pub enum ZaloCommand {
     },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
+    },
+}
+
+/// What to do with polls, notes and reminders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoardAction {
+    /// What a group's board holds: `[{ type: note | pinned | poll, … }]`.
+    Board { group_id: String },
+    /// A poll as it stands.
+    Poll { id: u64 },
+    CreatePoll { group_id: String, poll: NewPoll },
+    /// Vote for these options (none: take the vote back); answers the poll.
+    Vote { id: u64, options: Vec<u64> },
+    /// Add options to a poll that allows it; answers the poll.
+    AddOptions { id: u64, options: Vec<String> },
+    ClosePoll { id: u64 },
+    CreateNote {
+        group_id: String,
+        text: String,
+        pin: bool,
+    },
+    UpdateNote {
+        group_id: String,
+        id: String,
+        text: String,
+        pin: bool,
+    },
+    /// Delete a note or a group reminder.
+    RemoveTopic { group_id: String, id: String },
+    Reminders { kind: ThreadKind, remote_id: String },
+    CreateReminder {
+        kind: ThreadKind,
+        remote_id: String,
+        reminder: NewReminder,
+    },
+    RemoveReminder {
+        kind: ThreadKind,
+        remote_id: String,
+        id: String,
     },
 }
 
@@ -1398,6 +1443,15 @@ impl Connector {
                     let _ = reply.send(card_action(&client, &ctx, action).await);
                 });
             }
+            ZaloCommand::Boards { action, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _ = reply.send(board_action(&client, action).await);
+                });
+            }
             ZaloCommand::Quick { action, reply } => {
                 let Some(client) = self.client.clone() else {
                     let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
@@ -2123,6 +2177,96 @@ fn person_name(p: &Person) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or("Người dùng Zalo")
         .to_string()
+}
+
+async fn board_action(client: &ZaloClient, action: BoardAction) -> Result<Value, String> {
+    let err = |e: zeta_zalo::Error| e.to_string();
+    let poll = |id: u64| async move { client.poll(id).await.map(|p| json!(p)).map_err(err) };
+    match action {
+        BoardAction::Board { group_id } => client
+            .board(&group_id)
+            .await
+            .map(|items| json!(items))
+            .map_err(err),
+        BoardAction::Poll { id } => poll(id).await,
+        BoardAction::CreatePoll { group_id, poll } => client
+            .create_poll(&group_id, &poll)
+            .await
+            .map(|p| json!(p))
+            .map_err(err),
+        BoardAction::Vote { id, options } => {
+            client.vote_poll(id, &options).await.map_err(err)?;
+            poll(id).await
+        }
+        BoardAction::AddOptions { id, options } => {
+            // Votes the account has stay where they are.
+            let voted: Vec<u64> = client
+                .poll(id)
+                .await
+                .map_err(err)?
+                .options
+                .iter()
+                .filter(|o| o.voted)
+                .map(|o| o.id)
+                .collect();
+            client
+                .add_poll_options(id, &options, &voted)
+                .await
+                .map_err(err)?;
+            poll(id).await
+        }
+        BoardAction::ClosePoll { id } => {
+            client.close_poll(id).await.map_err(err)?;
+            poll(id).await
+        }
+        BoardAction::CreateNote {
+            group_id,
+            text,
+            pin,
+        } => client
+            .create_note(&group_id, &text, pin)
+            .await
+            .map(|t| json!(t))
+            .map_err(err),
+        BoardAction::UpdateNote {
+            group_id,
+            id,
+            text,
+            pin,
+        } => client
+            .update_note(&group_id, &id, &text, pin)
+            .await
+            .map(|t| json!(t))
+            .map_err(err),
+        BoardAction::RemoveTopic { group_id, id } => client
+            .remove_topic(&group_id, &id)
+            .await
+            .map(|()| json!({ "ok": true }))
+            .map_err(err),
+        BoardAction::Reminders { kind, remote_id } => client
+            .reminders(recipient(kind, &remote_id))
+            .await
+            .map(|list| json!(list))
+            .map_err(err),
+        BoardAction::CreateReminder {
+            kind,
+            remote_id,
+            reminder,
+        } => client
+            .create_reminder(recipient(kind, &remote_id), &reminder)
+            .await
+            .map(|t| json!(t))
+            .map_err(err),
+        BoardAction::RemoveReminder {
+            kind,
+            remote_id,
+            id,
+        } => client
+            .remove_reminder(recipient(kind, &remote_id), &id)
+            .await
+            .map(|()| json!({ "ok": true }))
+            .map_err(err),
+    }
 }
 
 async fn quick_action(client: &ZaloClient, action: QuickAction) -> Result<Value, String> {

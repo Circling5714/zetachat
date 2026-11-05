@@ -1303,6 +1303,31 @@ function bankNode(md, m) {
   return card;
 }
 
+/** A group poll in the chat: its question and a button to see and vote. */
+function pollNode(md) {
+  const card = el('div', 'poll-card');
+  card.append(el('div', 'card-kind', 'Bình chọn'), el('div', 'poll-question', md.name || 'Bình chọn'));
+  card.append(cardActions([['Xem bình chọn', () => openPoll(md.poll_id)]]));
+  return card;
+}
+
+/** A card ("thiệp"), such as the one a new reminder brings. */
+function ecardNode(md) {
+  const card = el('div', 'ecard');
+  if (md.thumb) {
+    const img = new Image();
+    img.alt = '';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => img.remove());
+    img.src = mediaSrc(md.thumb);
+    card.append(img);
+  }
+  card.append(el('div', 'ecard-title', md.name || ''));
+  if (md.description) card.append(el('div', 'ecard-desc', md.description));
+  if (md.url === 'reminder:') card.append(cardActions([['Xem nhắc hẹn', () => openBoard()]]));
+  return card;
+}
+
 /** Renderer and bubble style per media kind. */
 const MEDIA = {
   image: [imageNode, 'media'],
@@ -1314,6 +1339,8 @@ const MEDIA = {
   link: [linkNode, 'card'],
   contact: [contactNode, 'card'],
   bank: [bankNode, 'card'],
+  poll: [pollNode, 'card'],
+  ecard: [ecardNode, 'card'],
 };
 
 // ----------------------------------------------------------- picture viewer
@@ -1507,10 +1534,36 @@ function senderAvatar(m, t) {
   return box;
 }
 
+/** One of Zalo's own lines about what was done in the chat. */
+function noticeNode(m) {
+  const md = m.media;
+  const line = el('div', 'notice-line');
+  line.dataset.seq = String(m.seq);
+  if (md.thumb) {
+    const icon = new Image();
+    icon.alt = '';
+    icon.addEventListener('error', () => icon.remove());
+    icon.src = mediaSrc(md.thumb);
+    line.append(icon);
+  }
+  line.append(el('span', null, md.name || m.text));
+  if (md.description && /nhắc hẹn|bình chọn|ghi chú/i.test(md.name || '')) {
+    const b = el('button', null, md.description);
+    b.type = 'button';
+    b.addEventListener('click', () => openBoard());
+    line.append(b);
+  }
+  return line;
+}
+
 function messageNode(m, prev, t) {
   const isGroup = Boolean(t && t.kind === 'group');
   const frag = document.createDocumentFragment();
   if (!prev || !sameDay(prev.sent_at, m.sent_at)) frag.appendChild(el('div', 'day', fmtDay(m.sent_at)));
+  if (m.media && m.media.kind === 'notice' && m.kind !== 'chat.undo') {
+    frag.appendChild(noticeNode(m));
+    return frag;
+  }
   const recalled = m.kind === 'chat.undo';
   const md = recalled ? null : m.media;
   const media = md && MEDIA[md.kind];
@@ -1705,6 +1758,7 @@ document.addEventListener('keydown', (e) => {
   else if (!$('card-pick').hidden) closeCardPick();
   else if (!$('stk').hidden) closeStk();
   else if (!$('quick-modal').hidden) closeQuickModal();
+  else if (!$('sheet').hidden) closeSheet();
   else if (!$('bank-modal').hidden) closeBankModal();
   else if (!$('new-group').hidden) closeNewGroup();
   else if (!$('add-friend').hidden) closeAddFriend();
@@ -1872,6 +1926,407 @@ $('forward-cancel').addEventListener('click', closeForward);
 $('forward-send').addEventListener('click', sendForward);
 $('forward').addEventListener('click', (e) => {
   if (e.target === $('forward')) closeForward();
+});
+
+// --------------------------------------------- polls, reminders and notes
+//
+// "⋯" in the composer: polls and notes (groups), reminders (every chat), and
+// the group's board as Zalo keeps it. One dialog (the sheet) shows each.
+
+function openSheet(title, body, actions) {
+  $('sheet-title').textContent = title;
+  $('sheet-body').replaceChildren(...body);
+  const row = $('sheet-actions');
+  row.replaceChildren();
+  for (const [label, run, cls] of actions) {
+    const b = el('button', cls || 'btn', label);
+    b.type = 'button';
+    // The button is handed over as currentTarget: handlers still need it after an await.
+    b.addEventListener('click', () => run({ currentTarget: b }));
+    row.append(b);
+  }
+  $('sheet').hidden = false;
+  const first = $('sheet-body').querySelector('input:not([type=checkbox]):not([type=radio]), textarea');
+  if (first) first.focus();
+}
+
+function closeSheet() {
+  $('sheet').hidden = true;
+  sheetState.poll = null;
+}
+
+const sheetState = { poll: null };
+
+function field(tag, attrs) {
+  const node = el(tag, 'field');
+  Object.assign(node, attrs || {});
+  return node;
+}
+
+function checkRow(label, checked) {
+  const row = el('label', 'check-row');
+  const box = el('input');
+  box.type = 'checkbox';
+  box.checked = Boolean(checked);
+  row.append(box, document.createTextNode(` ${label}`));
+  return [row, box];
+}
+
+/** `<input type=datetime-local>` value of a time (local), and back. */
+function localInputValue(ms) {
+  const d = new Date(ms);
+  const two = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}T${two(d.getHours())}:${two(d.getMinutes())}`;
+}
+
+function fmtWhen(ms) {
+  if (!ms) return '';
+  return new Date(ms).toLocaleString('vi-VN', { weekday: 'long', day: 'numeric', month: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+const REPEAT_TEXT = ['Không lặp lại', 'Hàng ngày', 'Hàng tuần', 'Hàng tháng'];
+
+function nameOf(uid) {
+  const me = state.status && state.status.uid;
+  if (uid && uid === me) return 'Bạn';
+  const p = state.people.get(uid);
+  return p ? personName(p) : 'Thành viên';
+}
+
+/** What "⋯" offers in this chat. */
+function openMore(anchor) {
+  const t = state.threads.get(state.current);
+  if (!t) return;
+  const items = [];
+  if (t.kind === 'group') items.push(['Tạo bình chọn', newPoll]);
+  items.push(['Tạo nhắc hẹn', newReminder]);
+  if (t.kind === 'group') items.push(['Tạo ghi chú', () => editNote(null)]);
+  items.push([t.kind === 'group' ? 'Bảng tin nhóm' : 'Nhắc hẹn', () => openBoard()]);
+  openMenu(anchor, items, t.kind === 'group' ? 'Nhóm' : 'Trò chuyện');
+}
+
+function newPoll() {
+  const id = state.current;
+  const question = field('input', { placeholder: 'Đặt câu hỏi bình chọn', maxLength: 200 });
+  const list = el('div', 'sheet-body');
+  const addOption = (value) => {
+    const input = field('input', { placeholder: `Phương án ${list.childElementCount + 1}`, maxLength: 200, value: value || '' });
+    list.append(input);
+    return input;
+  };
+  addOption();
+  addOption();
+  const more = el('button', 'btn secondary', '+ Thêm phương án');
+  more.type = 'button';
+  more.addEventListener('click', () => addOption().focus());
+  const [multiRow, multi] = checkRow('Cho chọn nhiều phương án', true);
+  const [addRow, add] = checkRow('Cho thành viên thêm phương án', true);
+  const [hideRow, hide] = checkRow('Ẩn kết quả khi chưa bình chọn', false);
+  const [anonRow, anon] = checkRow('Ẩn người bình chọn', false);
+  const deadline = field('input', { type: 'datetime-local' });
+  const deadlineRow = el('div', 'sheet-row');
+  deadlineRow.append(el('span', 'sheet-meta', 'Hết hạn (không bắt buộc)'), deadline);
+  openSheet('Tạo bình chọn', [question, list, more, multiRow, addRow, hideRow, anonRow, deadlineRow], [
+    ['Hủy', closeSheet, 'btn secondary'],
+    ['Tạo bình chọn', async (e) => {
+      const options = [...list.querySelectorAll('input')].map((x) => x.value.trim()).filter(Boolean);
+      if (!question.value.trim() || options.length < 2) {
+        toast('Cần câu hỏi và ít nhất hai phương án');
+        return;
+      }
+      const body = {
+        question: question.value.trim(),
+        options,
+        multiple: multi.checked,
+        add_options: add.checked,
+        hide_results: hide.checked,
+        anonymous: anon.checked,
+        expires_at: deadline.value ? new Date(deadline.value).getTime() : 0,
+      };
+      e.currentTarget.disabled = true;
+      try {
+        const poll = await api(`/threads/${encodeURIComponent(id)}/polls`, { json: body });
+        showPoll(poll);
+      } catch (err) {
+        e.currentTarget.disabled = false;
+        handleError(err, 'Không tạo được bình chọn: ');
+      }
+    }],
+  ]);
+}
+
+async function openPoll(pollId) {
+  if (!pollId) return;
+  openSheet('Bình chọn', [el('p', 'muted', 'Đang tải…')], [['Đóng', closeSheet, 'btn secondary']]);
+  try {
+    showPoll(await api(`/polls/${pollId}`));
+  } catch (err) {
+    closeSheet();
+    handleError(err, 'Không tải được bình chọn: ');
+  }
+}
+
+/** A poll: options with their votes, the account's choice, what it can do. */
+function showPoll(p) {
+  sheetState.poll = p;
+  const me = state.status && state.status.uid;
+  const joined = p.options.some((o) => o.voted);
+  const showResults = !p.hide_results || joined || p.closed;
+  const total = Math.max(1, p.options.reduce((n, o) => n + o.votes, 0));
+  wantPeople([p.creator, ...p.options.flatMap((o) => o.voters || [])].filter(Boolean));
+  const body = [el('div', 'poll-question', p.question)];
+  const meta = [`${nameOf(p.creator)} tạo`, `${p.voters} người đã bình chọn`];
+  if (p.multiple) meta.push('chọn được nhiều phương án');
+  if (p.closed) meta.push('đã khóa');
+  else if (p.expires_at) meta.push(`hết hạn ${fmtWhen(p.expires_at)}`);
+  body.push(el('div', 'sheet-meta', meta.join(' · ')));
+  const inputs = [];
+  for (const o of p.options) {
+    const row = el('label', o.voted ? 'poll-option mine' : 'poll-option');
+    const pick = el('input');
+    pick.type = p.multiple ? 'checkbox' : 'radio';
+    pick.name = 'poll-pick';
+    pick.checked = o.voted;
+    pick.disabled = p.closed;
+    pick.value = String(o.id);
+    inputs.push(pick);
+    row.append(pick, el('span', null, o.text), el('span', 'poll-count', showResults ? String(o.votes) : ''));
+    if (showResults) {
+      const bar = el('div', 'poll-bar');
+      const fill = el('span');
+      fill.style.width = `${Math.round((o.votes / total) * 100)}%`;
+      bar.append(fill);
+      row.append(bar);
+      if (!p.anonymous && o.voters && o.voters.length) {
+        row.append(el('div', 'poll-voters', o.voters.slice(0, 8).map(nameOf).join(', ') + (o.voters.length > 8 ? `… (+${o.voters.length - 8})` : '')));
+      }
+    }
+    body.push(row);
+  }
+  if (!showResults) body.push(el('div', 'sheet-meta', 'Kết quả hiện sau khi bạn bình chọn.'));
+  if (p.add_options && !p.closed) {
+    const row = el('div', 'sheet-row');
+    const extra = field('input', { placeholder: 'Thêm phương án', maxLength: 200 });
+    const add = el('button', 'btn secondary', 'Thêm');
+    add.type = 'button';
+    add.addEventListener('click', async () => {
+      if (!extra.value.trim()) return;
+      add.disabled = true;
+      try {
+        showPoll(await api(`/polls/${p.id}/options`, { json: { options: [extra.value.trim()] } }));
+      } catch (err) {
+        add.disabled = false;
+        handleError(err, 'Không thêm được: ');
+      }
+    });
+    row.append(extra, add);
+    body.push(row);
+  }
+  const actions = [['Đóng', closeSheet, 'btn secondary']];
+  if (p.creator === me && !p.closed) {
+    actions.unshift(['Khóa bình chọn', async () => {
+      if (!window.confirm('Khóa bình chọn này? Sau đó không ai bình chọn được nữa.')) return;
+      try {
+        showPoll(await api(`/polls/${p.id}/close`, { method: 'POST' }));
+      } catch (err) {
+        handleError(err, 'Không khóa được: ');
+      }
+    }, 'btn secondary']);
+  }
+  if (!p.closed) {
+    actions.push([joined ? 'Đổi bình chọn' : 'Bình chọn', async (e) => {
+      const options = inputs.filter((x) => x.checked).map((x) => Number(x.value));
+      e.currentTarget.disabled = true;
+      try {
+        showPoll(await api(`/polls/${p.id}/vote`, { json: { options } }));
+        toast(options.length ? 'Đã bình chọn' : 'Đã bỏ bình chọn');
+      } catch (err) {
+        e.currentTarget.disabled = false;
+        handleError(err, 'Không bình chọn được: ');
+      }
+    }]);
+  }
+  openSheet('Bình chọn', body, actions);
+}
+
+function newReminder() {
+  const id = state.current;
+  const title = field('input', { placeholder: 'Nhắc về việc gì?', maxLength: 200 });
+  const when = field('input', { type: 'datetime-local' });
+  const soon = new Date(Date.now() + 3600000);
+  soon.setMinutes(soon.getMinutes() < 30 ? 30 : 60, 0, 0);
+  when.value = localInputValue(soon.getTime());
+  const repeat = field('select');
+  REPEAT_TEXT.forEach((label, i) => {
+    const o = el('option', null, label);
+    o.value = String(i);
+    repeat.append(o);
+  });
+  const emoji = field('input', { value: '⏰', maxLength: 4, title: 'Biểu tượng' });
+  emoji.style.maxWidth = '70px';
+  const row = el('div', 'sheet-row');
+  row.append(emoji, when);
+  const t = state.threads.get(id);
+  const note = el('div', 'sheet-meta', t && t.kind === 'group'
+    ? 'Cả nhóm sẽ được Zalo nhắc khi tới giờ.'
+    : 'Cả hai người sẽ được Zalo nhắc khi tới giờ.');
+  openSheet('Tạo nhắc hẹn', [title, row, repeat, note], [
+    ['Hủy', closeSheet, 'btn secondary'],
+    ['Tạo nhắc hẹn', async (e) => {
+      if (!title.value.trim() || !when.value) {
+        toast('Cần tiêu đề và thời gian');
+        return;
+      }
+      const startAt = new Date(when.value).getTime();
+      if (startAt < Date.now()) {
+        toast('Thời gian nhắc đã qua');
+        return;
+      }
+      e.currentTarget.disabled = true;
+      try {
+        await api(`/threads/${encodeURIComponent(id)}/reminders`, {
+          json: { title: title.value.trim(), emoji: emoji.value.trim(), start_at: startAt, repeat: Number(repeat.value) },
+        });
+        closeSheet();
+        toast('Đã tạo nhắc hẹn');
+      } catch (err) {
+        e.currentTarget.disabled = false;
+        handleError(err, 'Không tạo được nhắc hẹn: ');
+      }
+    }],
+  ]);
+}
+
+/** Write a new note (`topic` null) or change one. */
+function editNote(topic) {
+  const id = state.current;
+  const text = field('textarea', { rows: 5, maxLength: 4000, placeholder: 'Nội dung ghi chú', value: topic ? topic.title : '' });
+  const [pinRow, pin] = checkRow('Ghim lên đầu cuộc trò chuyện', !topic);
+  openSheet(topic ? 'Sửa ghi chú' : 'Tạo ghi chú', [text, pinRow], [
+    ['Hủy', closeSheet, 'btn secondary'],
+    ['Lưu ghi chú', async (e) => {
+      if (!text.value.trim()) {
+        toast('Ghi chú đang trống');
+        return;
+      }
+      e.currentTarget.disabled = true;
+      const body = { text: text.value.trim(), pin: pin.checked };
+      try {
+        if (topic) await api(`/threads/${encodeURIComponent(id)}/notes/${encodeURIComponent(topic.id)}`, { method: 'PUT', json: body });
+        else await api(`/threads/${encodeURIComponent(id)}/notes`, { json: body });
+        closeSheet();
+        toast('Đã lưu ghi chú');
+      } catch (err) {
+        e.currentTarget.disabled = false;
+        handleError(err, 'Không lưu được ghi chú: ');
+      }
+    }],
+  ]);
+}
+
+function boardButton(label, run, cls) {
+  const b = el('button', cls || 'btn secondary', label);
+  b.type = 'button';
+  b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    run();
+  });
+  return b;
+}
+
+/** The group's board (notes, polls, pinned messages) and the chat's reminders. */
+async function openBoard() {
+  const id = state.current;
+  const t = state.threads.get(id);
+  if (!t) return;
+  const group = t.kind === 'group';
+  const title = group ? 'Bảng tin nhóm' : 'Nhắc hẹn';
+  openSheet(title, [el('p', 'muted', 'Đang tải…')], [['Đóng', closeSheet, 'btn secondary']]);
+  let items = [];
+  let reminders = [];
+  try {
+    [items, reminders] = await Promise.all([
+      group ? api(`/threads/${encodeURIComponent(id)}/board`) : Promise.resolve([]),
+      api(`/threads/${encodeURIComponent(id)}/reminders`),
+    ]);
+  } catch (err) {
+    closeSheet();
+    handleError(err, 'Không tải được bảng tin: ');
+    return;
+  }
+  if (state.current !== id || $('sheet').hidden) return;
+  const people = [...items.map((x) => x.creator), ...reminders.map((r) => r.creator)].filter(Boolean);
+  wantPeople(people);
+  const body = [];
+  const section = (name, list, render, empty) => {
+    body.push(el('h3', null, `${name} (${list.length})`));
+    if (!list.length) body.push(el('div', 'sheet-meta', empty));
+    for (const x of list) body.push(render(x));
+  };
+  const reload = () => openBoard();
+  section('Nhắc hẹn', reminders, (r) => {
+    const item = el('div', 'board-item');
+    item.append(el('div', 'board-title', `${r.emoji || '⏰'} ${r.title}`));
+    const meta = [fmtWhen(r.start_at), REPEAT_TEXT[r.repeat] || ''];
+    if (group && (r.accepted || r.rejected)) meta.push(`${r.accepted} tham gia, ${r.rejected} không`);
+    item.append(el('div', 'sheet-meta', meta.filter(Boolean).join(' · ')));
+    const row = el('div', 'row');
+    row.append(boardButton('Xóa', async () => {
+      if (!window.confirm(`Xóa nhắc hẹn "${r.title}"? Mọi người trong cuộc trò chuyện sẽ không được nhắc nữa.`)) return;
+      try {
+        await api(`/threads/${encodeURIComponent(id)}/reminders/${encodeURIComponent(r.id)}`, { method: 'DELETE' });
+        reload();
+      } catch (err) {
+        handleError(err, 'Không xóa được: ');
+      }
+    }));
+    item.append(row);
+    return item;
+  }, 'Chưa có nhắc hẹn nào.');
+  if (group) {
+    const notes = items.filter((x) => x.type === 'note');
+    const polls = items.filter((x) => x.type === 'poll');
+    const pinned = items.filter((x) => x.type === 'pinned');
+    section('Ghi chú', notes, (n) => {
+      const item = el('div', 'board-item');
+      item.append(el('div', 'board-title', n.title), el('div', 'sheet-meta', `${nameOf(n.creator)} · ${fmtWhen(n.edited_at || n.created_at)}`));
+      const row = el('div', 'row');
+      row.append(boardButton('Sửa', () => editNote(n)), boardButton('Xóa', async () => {
+        if (!window.confirm('Xóa ghi chú này khỏi nhóm?')) return;
+        try {
+          await api(`/threads/${encodeURIComponent(id)}/board/${encodeURIComponent(n.id)}`, { method: 'DELETE' });
+          reload();
+        } catch (err) {
+          handleError(err, 'Không xóa được: ');
+        }
+      }));
+      item.append(row);
+      return item;
+    }, 'Chưa có ghi chú nào.');
+    section('Bình chọn', polls, (p) => {
+      const item = el('div', 'board-item clickable');
+      item.append(el('div', 'board-title', p.question), el('div', 'sheet-meta', `${p.voters} người đã bình chọn${p.closed ? ' · đã khóa' : ''}`));
+      item.addEventListener('click', () => showPoll(p));
+      return item;
+    }, 'Chưa có bình chọn nào.');
+    section('Tin đã ghim', pinned, (x) => {
+      const item = el('div', 'board-item');
+      item.append(el('div', 'board-title', x.title || '[Tin nhắn]'), el('div', 'sheet-meta', nameOf(x.creator)));
+      return item;
+    }, 'Chưa ghim tin nào.');
+  }
+  const actions = [['Đóng', closeSheet, 'btn secondary']];
+  if (group) actions.unshift(['Tạo ghi chú', () => editNote(null), 'btn secondary'], ['Tạo bình chọn', newPoll, 'btn secondary']);
+  actions.push(['Tạo nhắc hẹn', newReminder]);
+  openSheet(title, body, actions);
+}
+
+$('more-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  openMore($('more-btn'));
+});
+$('sheet').addEventListener('click', (e) => {
+  if (e.target === $('sheet')) closeSheet();
 });
 
 // ------------------------------------------------------- VietQR and STK sending

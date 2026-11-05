@@ -339,6 +339,9 @@ fn fake_connector(
                 }
                 // Zalo keeps one quick message; adding another is refused
                 // as Zalo does for a personal account (821).
+                ZaloCommand::Boards { action, reply } => {
+                    let _ = reply.send(Ok(json!({ "asked": format!("{action:?}") })));
+                }
                 ZaloCommand::Quick { action, reply } => {
                     let one = json!([{ "id": 7, "keyword": "chao", "text": "Xin chào",
                         "photo": "", "updated_at": 1 }]);
@@ -1491,6 +1494,63 @@ async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
     )
     .await;
     assert_eq!(sent["mentions"], json!([]));
+}
+
+#[tokio::test]
+async fn polls_notes_and_reminders_are_checked() {
+    let f = fixture();
+    let group = thread_id(ThreadKind::Group, "71");
+    let user = thread_id(ThreadKind::User, "70");
+    // Polls and notes live in groups only.
+    let poll = json!({ "question": " Đi đâu? ", "options": [" Biển ", "Núi", "Biển", ""], "multiple": true });
+    let (status, out) = call(&f, "POST", &format!("/api/v1/threads/{group}/polls"), Some(poll.clone()), true).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let asked = out["asked"].as_str().unwrap();
+    assert!(asked.contains(r#"question: "Đi đâu?""#), "{asked}");
+    assert!(asked.contains(r#"options: ["Biển", "Núi"]"#), "{asked}");
+    let (status, _) = call(&f, "POST", &format!("/api/v1/threads/{user}/polls"), Some(poll), true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{group}/polls"),
+        Some(json!({ "question": "?", "options": ["Một", " "] })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, out) = call(&f, "POST", "/api/v1/polls/501/vote", Some(json!({ "options": [2] })), true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(out["asked"], "Vote { id: 501, options: [2] }");
+    let (status, _) = call(&f, "POST", "/api/v1/polls/501/options", Some(json!({ "options": [" "] })), true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, out) = call(&f, "POST", &format!("/api/v1/threads/{group}/notes"), Some(json!({ "text": " Ghi chú ", "pin": true })), true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(out["asked"].as_str().unwrap().contains(r#"text: "Ghi chú", pin: true"#));
+    let (status, _) = call(&f, "POST", &format!("/api/v1/threads/{user}/notes"), Some(json!({ "text": "x" })), true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(&f, "DELETE", &format!("/api/v1/threads/{group}/board/a%20b"), None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Reminders: 1-1 chats too, never in the past.
+    let soon = zeta_gateway::model::now_ms() + 3_600_000;
+    let (status, out) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/reminders"),
+        Some(json!({ "title": " Gọi mẹ ", "start_at": soon, "repeat": 2 })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["asked"].as_str().unwrap().contains(r#"title: "Gọi mẹ""#));
+    for bad in [
+        json!({ "title": "x", "start_at": 1000 }),
+        json!({ "title": " ", "start_at": soon }),
+        json!({ "title": "x", "start_at": soon, "repeat": 4 }),
+    ] {
+        let (status, _) = call(&f, "POST", &format!("/api/v1/threads/{user}/reminders"), Some(bad), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]

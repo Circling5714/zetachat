@@ -214,6 +214,27 @@ Tin `type` 1 có thêm ảnh trong `media.items`.
 
 Đã thử thật: tài khoản thử có 1 tin. Thêm tin thứ hai thì Zalo trả mã **821** "Item size not support". `getServerInfo` cho biết lý do: `quick_message.max_creation_quantity` bằng 1, tức tài khoản cá nhân chỉ được giữ 1 tin; Zalo Web hiện "Tin nhắn nhanh (n/tối đa)". Mã 820 là phím tắt trùng. Vì vậy zetachat tự giữ các tin còn lại (schema v12, bảng `quick_messages`) và gộp với tin của Zalo.
 
+## 8r. Bình chọn, ghi chú, nhắc hẹn
+
+Tham số lấy theo zca-js; xem `crates/zeta-zalo/src/board.rs`. Bình chọn đi qua dịch vụ `group`, ghi chú và nhắc hẹn qua `group_board` (`groupboard-wpa.api.zaloapp.com`).
+
+Đã kiểm chứng (chỉ đọc, trên các nhóm thật):
+
+- `GET /api/board/list` trả về `{ count, items: [{ boardType, data }] }`. `boardType` 3 là bình chọn: `data` có `poll_id`, `question`, `options: [{ option_id, content, votes, voted, voters }]`, `closed`, `num_vote`… (đọc được 2 bình chọn). `boardType` 2 là tin ghim: `params` là chuỗi JSON `{ client_msg_id, global_msg_id, msg_type, senderName, senderUid, thumb, title }`.
+- `POST /api/poll/detail` trả về bình chọn như trên.
+- `GET /api/board/listReminder` trả `data` là chuỗi JSON của danh sách nhắc hẹn (`id`, `params: { title }`, `startTime`, `repeat`, `responseMem: { acceptMember, rejectMember, myResp }`). Nhóm không có nhắc hẹn thì Zalo trả **mã lỗi -1** thay cho danh sách rỗng; `/api/board/oneone/list` của chat 1-1 cũng vậy.
+
+Đã kiểm chứng (ghi, trong Cloud): tạo một nhắc hẹn 1-1 bằng `/api/board/oneone/create`, rồi xóa bằng `/api/board/oneone/remove`. Mỗi lần, Zalo đẩy vào cuộc trò chuyện:
+
+- một tin `webchat` có `content.action` là `msginfo.actionlist`. `title` là câu đã ghép sẵn ("… tạo nhắc hẹn mới <tiêu đề> - 17:53.", "… xóa nhắc hẹn …"); `params` có mẫu câu theo ngôn ngữ, `iconUrl` và nút (`actionLabelv2`: "Xem", "Tạo mới"). Người gửi là tài khoản Cloud, tên cũ "Truyền File".
+- khi tạo: một tin `chat.ecard` (thiệp): `title` "⏰ <tiêu đề>", `description` là giờ hẹn ("Thứ Năm, 5 tháng 11 lúc 17:53"), `thumb` là ảnh, `params.previewTxt`, và trong `params.actions` có `actionId` `action.open.reminder` kèm dữ liệu nhắc hẹn (`create_reminder11`).
+
+Client vẽ `msginfo.actionlist` thành dòng giữa khung chat, như Zalo. Schema v13 đọc lại các tin đã lưu.
+
+Tin bình chọn trong nhóm là `group.poll`. Theo mã Zalo Web, `content.params` là chuỗi JSON có `pollId` và `question`; chưa thấy thật.
+
+Chưa thử, vì phải ghi vào nhóm có người thật: tạo bình chọn, bình chọn, thêm phương án, khóa bình chọn, tạo ghi chú và nhắc hẹn nhóm.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

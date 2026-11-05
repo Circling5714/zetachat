@@ -35,6 +35,15 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/banks` | Các ngân hàng Zalo hỗ trợ: `[{ "bin", "name", "short_name", "logo", "keywords" }]` (gateway giữ một ngày) |
 | GET, POST | `/bank-accounts` | Tài khoản ngân hàng đã lưu trong Zalo (điện thoại cũng thấy): `[{ "id", "bin", "number", "holder", "default" }]`. POST `{ "bin", "number", "holder" }` lưu thêm một tài khoản và trả về danh sách mới |
 | DELETE | `/bank-accounts/{id}` | Xóa một tài khoản đã lưu; trả về danh sách mới |
+| GET | `/threads/{id}/board` | Bảng tin của nhóm: `[{ "type": "note" | "pinned" | "poll", … }]`. Ghi chú và tin ghim có `id`, `title`, `emoji`, `creator`, `created_at`, `edited_at`; bình chọn như `/polls/{id}`. Chat 1-1 thì `400` |
+| DELETE | `/threads/{id}/board/{topic}` | Xóa một ghi chú (hay nhắc hẹn) của nhóm |
+| POST | `/threads/{id}/polls` | Tạo bình chọn trong nhóm `{ "question", "options": […], "multiple", "add_options", "anonymous", "hide_results", "expires_at" }` (cần ít nhất 2 phương án; `expires_at` mili giây, 0 là không hạn); trả về bình chọn |
+| GET | `/polls/{id}` | Một bình chọn: `{ "id", "creator", "question", "options": [{ "id", "text", "votes", "voted", "voters" }], "multiple", "add_options", "anonymous", "hide_results", "closed", "created_at", "expires_at", "voters" }` (`voted` là tài khoản này đã chọn) |
+| POST | `/polls/{id}/vote` | Bình chọn `{ "options": [id…] }` (rỗng là bỏ bình chọn); trả về bình chọn |
+| POST | `/polls/{id}/options` | Thêm phương án `{ "options": ["…"] }` (khi bình chọn cho phép); `/polls/{id}/close` khóa bình chọn. Cả hai trả về bình chọn |
+| POST, PUT | `/threads/{id}/notes`, `/threads/{id}/notes/{note}` | Tạo hay sửa ghi chú của nhóm `{ "text", "pin" }` (`pin` ghim lên đầu cuộc trò chuyện) |
+| GET, POST | `/threads/{id}/reminders` | Nhắc hẹn của cuộc trò chuyện (cả 1-1): `[{ "id", "title", "emoji", "creator", "start_at", "repeat", "accepted", "rejected" }]`. POST `{ "title", "emoji", "start_at", "repeat" }` (`repeat`: 0 không lặp, 1 hàng ngày, 2 hàng tuần, 3 hàng tháng; thời điểm phải ở tương lai) |
+| DELETE | `/threads/{id}/reminders/{reminder}` | Xóa một nhắc hẹn |
 | GET, POST | `/quick-messages` | Tin nhắn nhanh: `[{ "id", "keyword", "text", "photo", "updated_at", "zalo" }]`, theo phím tắt. `id` là `zalo:<số>` (Zalo giữ, đồng bộ với điện thoại) hoặc `local:<số>` (zetachat giữ). POST `{ "keyword", "text", "zalo" }` thêm một tin (`zalo: true` để lưu lên Zalo); phím tắt không có khoảng trắng, tối đa 20 ký tự, dấu `/` ở đầu được bỏ. Phím tắt đã có thì `409`. Trả về danh sách mới |
 | PUT, DELETE | `/quick-messages/{id}` | Sửa `{ "keyword", "text" }` hoặc xóa một tin; trả về danh sách mới. Tin của Zalo có ảnh thì sửa trên điện thoại |
 | GET | `/vietqr.svg?bin=&number=&amount=&note=` | Mã VietQR (SVG) để app ngân hàng quét và chuyển tiền tới tài khoản; `amount` (đồng) và `note` không bắt buộc. Gateway tự tạo, không hỏi Zalo |
@@ -70,7 +79,7 @@ Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, 
 
 | Trường | Ý nghĩa |
 |---|---|
-| `kind` | `image`, `gif`, `video`, `sticker`, `audio` (tin nhắn thoại), `file`, `link`, `contact` (danh thiếp) hoặc `bank` (thẻ tài khoản ngân hàng) |
+| `kind` | `image`, `gif`, `video`, `sticker`, `audio` (tin nhắn thoại), `file`, `link`, `contact` (danh thiếp), `bank` (thẻ tài khoản ngân hàng), `poll` (bình chọn trong nhóm: `poll_id`, câu hỏi ở `name`), `ecard` (thiệp, như thiệp của nhắc hẹn: `name`, `description`, `thumb`; `url` là `reminder:` với nhắc hẹn) hoặc `notice` (dòng Zalo ghi việc vừa làm trong cuộc trò chuyện, như "… tạo nhắc hẹn mới …": `name`, biểu tượng ở `thumb`, nút ở `description`) |
 | `url` | Tệp gốc trên CDN của Zalo; với `link` là trang được chia sẻ |
 | `thumb` | Ảnh xem trước: ảnh thu nhỏ, ảnh bìa video, ảnh của thẻ liên kết |
 | `width`, `height` | Kích thước ảnh hoặc video (0 khi không rõ), để giữ chỗ trước khi tải |

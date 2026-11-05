@@ -550,6 +550,19 @@ fn seed(store: &Store) {
         vec![
             say(false, "Mẹ", "Cuối tuần về ăn cơm nha các con", 300),
             say(false, "Minh", "Dạ con về ạ", 280),
+            share(
+                false,
+                "Mẹ",
+                "group.poll",
+                "[Bình chọn] Cuối tuần cả nhà đi đâu chơi?",
+                275,
+                Media {
+                    kind: "poll".into(),
+                    name: "Cuối tuần cả nhà đi đâu chơi?".into(),
+                    poll_id: DEMO_POLL,
+                    ..Media::default()
+                },
+            ),
             say(true, "", "Con cũng về ạ, con mang trái cây", 270),
             share(
                 false,
@@ -767,6 +780,265 @@ fn store_and_publish(
     let snapshot = store.thread(&message.thread_id).ok().flatten();
     let _ = bus.publish("message", json!({ "message": message, "thread": snapshot }));
     Some(message)
+}
+
+/// The demo's board: polls, notes and reminders, kept in memory.
+struct DemoBoard {
+    polls: Vec<zeta_zalo::board::Poll>,
+    /// Notes and pinned messages of the "Gia đình" group: (pinned message?, topic).
+    topics: Vec<(bool, zeta_zalo::board::Topic)>,
+    /// (thread id, reminder).
+    reminders: Vec<(String, zeta_zalo::board::Topic)>,
+    next: u64,
+}
+
+static DEMO_BOARD: std::sync::Mutex<Option<DemoBoard>> = std::sync::Mutex::new(None);
+
+/// The demo poll of the "Gia đình" group.
+const DEMO_POLL: u64 = 501;
+
+fn demo_board_seed() -> DemoBoard {
+    use zeta_zalo::board::{Poll, PollOption, Topic};
+    let option = |id: u64, text: &str, voters: &[&str]| PollOption {
+        id,
+        text: text.into(),
+        votes: voters.len() as u32,
+        voted: voters.contains(&ME),
+        voters: voters.iter().map(|v| (*v).to_string()).collect(),
+    };
+    let day = 24 * 3600 * 1000;
+    DemoBoard {
+        polls: vec![Poll {
+            id: DEMO_POLL,
+            creator: uid_of("Mẹ").into(),
+            question: "Cuối tuần cả nhà đi đâu chơi?".into(),
+            options: vec![
+                option(1, "Đi biển Vũng Tàu", &["3001", "3002"]),
+                option(2, "Lên Đà Lạt", &["3003"]),
+                option(3, "Ở nhà nấu lẩu", &[]),
+            ],
+            multiple: false,
+            add_options: true,
+            anonymous: false,
+            hide_results: false,
+            closed: false,
+            created_at: now_ms() - 40 * 60_000,
+            expires_at: now_ms() + 2 * day,
+            voters: 3,
+        }],
+        topics: vec![
+            (
+                false,
+                Topic {
+                    id: "n1".into(),
+                    title: "Wifi nhà: ZetaHome, mật khẩu ghi trên tủ lạnh 😄".into(),
+                    creator: uid_of("Minh").into(),
+                    created_at: now_ms() - 3 * day,
+                    ..Topic::default()
+                },
+            ),
+            (
+                true,
+                Topic {
+                    id: "p1".into(),
+                    title: "Cuối tuần về ăn cơm nha các con".into(),
+                    creator: uid_of("Mẹ").into(),
+                    created_at: now_ms() - day,
+                    ..Topic::default()
+                },
+            ),
+        ],
+        reminders: vec![(
+            thread_id(ThreadKind::Group, "2001"),
+            Topic {
+                id: "r1".into(),
+                title: "Sinh nhật Bố".into(),
+                emoji: "🎂".into(),
+                creator: uid_of("Mẹ").into(),
+                created_at: now_ms() - day,
+                start_at: now_ms() + 5 * day,
+                repeat: 0,
+                accepted: 2,
+                ..Topic::default()
+            },
+        )],
+        next: 100,
+    }
+}
+
+/// Polls, notes and reminders in the demo.
+fn demo_boards(action: crate::zalo::BoardAction) -> Result<Value, String> {
+    use crate::zalo::BoardAction;
+    use zeta_zalo::board::{BoardItem, Poll, PollOption, Topic};
+    let mut guard = DEMO_BOARD.lock().unwrap_or_else(|e| e.into_inner());
+    let board = guard.get_or_insert_with(demo_board_seed);
+    let find = |polls: &[Poll], id: u64| {
+        polls
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| "demo: không có bình chọn này".to_string())
+    };
+    let recount = |p: &mut Poll| {
+        for o in &mut p.options {
+            o.votes = o.voters.len() as u32;
+            o.voted = o.voters.iter().any(|v| v == ME);
+        }
+        let mut people: Vec<&String> = p.options.iter().flat_map(|o| &o.voters).collect();
+        people.sort();
+        people.dedup();
+        p.voters = people.len() as u32;
+    };
+    match action {
+        BoardAction::Board { group_id } => {
+            if group_id != "2001" {
+                return Ok(json!([]));
+            }
+            let mut items: Vec<BoardItem> = board
+                .topics
+                .iter()
+                .map(|(pinned, t)| {
+                    if *pinned {
+                        BoardItem::Pinned(t.clone())
+                    } else {
+                        BoardItem::Note(t.clone())
+                    }
+                })
+                .collect();
+            items.extend(board.polls.iter().cloned().map(BoardItem::Poll));
+            Ok(json!(items))
+        }
+        BoardAction::Poll { id } => {
+            let i = find(&board.polls, id)?;
+            Ok(json!(board.polls[i]))
+        }
+        BoardAction::CreatePoll { poll, .. } => {
+            board.next += 1;
+            let p = Poll {
+                id: board.next,
+                creator: ME.into(),
+                question: poll.question,
+                options: poll
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| PollOption {
+                        id: i as u64 + 1,
+                        text: text.clone(),
+                        ..PollOption::default()
+                    })
+                    .collect(),
+                multiple: poll.multiple,
+                add_options: poll.add_options,
+                anonymous: poll.anonymous,
+                hide_results: poll.hide_results,
+                closed: false,
+                created_at: now_ms(),
+                expires_at: poll.expires_at,
+                voters: 0,
+            };
+            board.polls.push(p.clone());
+            Ok(json!(p))
+        }
+        BoardAction::Vote { id, options } => {
+            let i = find(&board.polls, id)?;
+            let p = &mut board.polls[i];
+            if p.closed {
+                return Err("demo: bình chọn đã khóa".into());
+            }
+            for o in &mut p.options {
+                o.voters.retain(|v| v != ME);
+                if options.contains(&o.id) {
+                    o.voters.push(ME.into());
+                }
+            }
+            recount(p);
+            Ok(json!(p))
+        }
+        BoardAction::AddOptions { id, options } => {
+            let i = find(&board.polls, id)?;
+            let p = &mut board.polls[i];
+            for text in options {
+                let next = p.options.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+                p.options.push(PollOption {
+                    id: next,
+                    text,
+                    ..PollOption::default()
+                });
+            }
+            Ok(json!(p))
+        }
+        BoardAction::ClosePoll { id } => {
+            let i = find(&board.polls, id)?;
+            board.polls[i].closed = true;
+            Ok(json!(board.polls[i]))
+        }
+        BoardAction::CreateNote { text, .. } => {
+            board.next += 1;
+            let t = Topic {
+                id: format!("n{}", board.next),
+                title: text,
+                creator: ME.into(),
+                created_at: now_ms(),
+                ..Topic::default()
+            };
+            board.topics.insert(0, (false, t.clone()));
+            Ok(json!(t))
+        }
+        BoardAction::UpdateNote { id, text, .. } => {
+            let (_, t) = board
+                .topics
+                .iter_mut()
+                .find(|(_, t)| t.id == id)
+                .ok_or_else(|| "demo: không có ghi chú này".to_string())?;
+            t.title = text;
+            t.edited_at = now_ms();
+            Ok(json!(t))
+        }
+        BoardAction::RemoveTopic { id, .. } => {
+            board.topics.retain(|(_, t)| t.id != id);
+            board.reminders.retain(|(_, t)| t.id != id);
+            Ok(json!({ "ok": true }))
+        }
+        BoardAction::Reminders { kind, remote_id } => {
+            let thread = thread_id(kind, &remote_id);
+            let list: Vec<&Topic> = board
+                .reminders
+                .iter()
+                .filter(|(t, _)| *t == thread)
+                .map(|(_, r)| r)
+                .collect();
+            Ok(json!(list))
+        }
+        BoardAction::CreateReminder {
+            kind,
+            remote_id,
+            reminder,
+        } => {
+            board.next += 1;
+            let t = Topic {
+                id: format!("r{}", board.next),
+                title: reminder.title,
+                emoji: if reminder.emoji.is_empty() {
+                    "⏰".into()
+                } else {
+                    reminder.emoji
+                },
+                creator: ME.into(),
+                created_at: now_ms(),
+                start_at: reminder.start_at,
+                repeat: reminder.repeat,
+                ..Topic::default()
+            };
+            board
+                .reminders
+                .push((thread_id(kind, &remote_id), t.clone()));
+            Ok(json!(t))
+        }
+        BoardAction::RemoveReminder { id, .. } => {
+            board.reminders.retain(|(_, t)| t.id != id);
+            Ok(json!({ "ok": true }))
+        }
+    }
 }
 
 /// The demo's quick messages, changed by adding, changing and removing.
@@ -1324,6 +1596,9 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 }
                 ZaloCommand::Quick { action, reply } => {
                     let _ = reply.send(Ok(demo_quick(action)));
+                }
+                ZaloCommand::Boards { action, reply } => {
+                    let _ = reply.send(demo_boards(action));
                 }
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {

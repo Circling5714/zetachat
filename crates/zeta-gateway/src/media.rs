@@ -48,6 +48,10 @@ pub struct Media {
     /// on Zalo's CDN, read on demand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bank: Option<BankCard>,
+    /// A group poll (`poll`): its id, to ask how it stands; `name` is the
+    /// question.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub poll_id: u64,
 }
 
 /// What a bank account card shows.
@@ -289,6 +293,30 @@ pub fn summarize(msg_type: &str, content: Option<&Value>) -> String {
         "share.file" => with_caption("[Tập tin]", get_str(content, "title")),
         "chat.location.new" => "[Vị trí]".into(),
         "chat.undo" => RECALLED_TEXT.into(),
+        "group.poll" => {
+            let p = params(content);
+            let question = p
+                .get("question")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .unwrap_or_else(|| get_str(content, "title"));
+            with_caption("[Bình chọn]", question)
+        }
+        // Cards ("thiệp"), as Zalo Web: the preview text they carry.
+        "chat.ecard" => {
+            let p = params(content);
+            let preview = p
+                .get("previewTxt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty());
+            match preview {
+                Some(t) => t.to_string(),
+                None => with_caption("[Thiệp]", get_str(content, "title")),
+            }
+        }
+        "chat.todo" => with_caption("[Công việc]", get_str(content, "title")),
         "chat.recommended" if contact_card(content) => {
             with_caption("[Danh thiếp]", get_str(content, "title"))
         }
@@ -418,6 +446,79 @@ fn bank_media(content: Option<&Value>) -> Option<Media> {
     (!media.url.is_empty() || media.bank.is_some()).then_some(media)
 }
 
+/// A group poll message (`group.poll`): `params` is the JSON text of `{
+/// pollId, question, … }`, as Zalo Web reads it.
+fn poll_media(content: Option<&Value>) -> Option<Media> {
+    let p = params(content);
+    let poll_id = number(&p, &["pollId", "poll_id"]);
+    let question = p
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .unwrap_or_else(|| get_str(content, "title"))
+        .to_string();
+    (poll_id > 0).then(|| Media {
+        kind: "poll".into(),
+        name: question,
+        poll_id,
+        ..Media::default()
+    })
+}
+
+/// A line Zalo writes into a chat about something done in it ("Lan tạo nhắc
+/// hẹn mới …", "… xóa nhắc hẹn …"): a `webchat` whose `content.action` is
+/// `msginfo.actionlist` (seen live). `name` is the sentence, `thumb` its
+/// icon, `description` the label of the button Zalo shows with it.
+fn notice_media(content: Option<&Value>) -> Option<Media> {
+    if get_str(content, "action") != "msginfo.actionlist" {
+        return None;
+    }
+    let p = params(content);
+    let label = p
+        .pointer("/actions/0/actionLabelv2")
+        .and_then(|l| ["vi", "en"].into_iter().find_map(|k| l.get(k).and_then(Value::as_str)))
+        .unwrap_or("")
+        .to_string();
+    Some(Media {
+        kind: "notice".into(),
+        name: get_str(content, "title").trim().to_string(),
+        thumb: http_url(p.get("iconUrl").and_then(Value::as_str).unwrap_or("")),
+        description: label,
+        ..Media::default()
+    })
+}
+
+/// A card ("thiệp"), such as the one a new reminder brings (seen live:
+/// `title` "⏰ <title>", `description` when it is due, `thumb` a picture).
+/// A reminder's card says so with `url` `reminder:`.
+fn ecard_media(content: Option<&Value>) -> Option<Media> {
+    let title = get_str(content, "title").trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let p = params(content);
+    let reminder = p
+        .get("actions")
+        .and_then(Value::as_array)
+        .is_some_and(|a| {
+            a.iter()
+                .any(|x| x.get("actionId").and_then(Value::as_str) == Some("action.open.reminder"))
+        });
+    Some(Media {
+        kind: "ecard".into(),
+        url: if reminder {
+            "reminder:".into()
+        } else {
+            http_url(get_str(content, "href"))
+        },
+        thumb: http_url(get_str(content, "thumb")),
+        name: title,
+        description: get_str(content, "description").trim().to_string(),
+        ..Media::default()
+    })
+}
+
 /// Media carried by a message, if any.
 pub fn extract(msg_type: &str, content: Option<&Value>) -> Option<Media> {
     if !matches!(content, Some(Value::Object(_))) {
@@ -428,6 +529,15 @@ pub fn extract(msg_type: &str, content: Option<&Value>) -> Option<Media> {
     }
     if msg_type == "chat.webcontent" && bank_card(content) {
         return bank_media(content);
+    }
+    if msg_type == "group.poll" {
+        return poll_media(content);
+    }
+    if msg_type == "webchat" {
+        return notice_media(content);
+    }
+    if msg_type == "chat.ecard" {
+        return ecard_media(content);
     }
     let p = params(content);
     let href = http_url(get_str(content, "href"));
@@ -725,6 +835,44 @@ mod tests {
         );
         let broken = json!({ "action": "recommened.user", "params": "abc" });
         assert!(extract("chat.recommended", Some(&broken)).is_none());
+    }
+
+    #[test]
+    fn notices_and_reminder_cards() {
+        // As seen live after a reminder was made in the Cloud thread (cut down).
+        let notice = json!({
+            "action": "msginfo.actionlist", "title": "Lan tạo nhắc hẹn mới Họp - 17:53.",
+            "params": "{\"msg\":{\"vi\":\"%1$s tạo nhắc hẹn mới %2$s - %3$s.\"},\"iconUrl\":\"https://res-zalo.zadn.vn/i.png\",\"actions\":[{\"actionLabelv2\":{\"vi\":\"Xem\",\"en\":\"View\"},\"actionType\":\"action.open.grouptopic.detail\"}]}"
+        });
+        let m = extract("webchat", Some(&notice)).unwrap();
+        assert_eq!((m.kind.as_str(), m.description.as_str()), ("notice", "Xem"));
+        assert_eq!(m.name, "Lan tạo nhắc hẹn mới Họp - 17:53.");
+        assert_eq!(summarize("webchat", Some(&notice)), "Lan tạo nhắc hẹn mới Họp - 17:53.");
+        let card = json!({
+            "action": "show.profile", "title": "⏰ Họp", "description": "Thứ Năm, 5 tháng 11 lúc 17:53",
+            "href": "https://zalo.me/x", "thumb": "https://res-zalo.zadn.vn/r.png",
+            "params": "{\"previewTxt\":\"⏰ Họp\",\"actions\":[{\"actionId\":\"action.open.reminder\"}]}"
+        });
+        let m = extract("chat.ecard", Some(&card)).unwrap();
+        assert_eq!((m.kind.as_str(), m.url.as_str()), ("ecard", "reminder:"));
+        assert_eq!(m.description, "Thứ Năm, 5 tháng 11 lúc 17:53");
+        assert!(extract("webchat", Some(&json!({ "action": "rtf", "title": "x" }))).is_none());
+    }
+
+    #[test]
+    fn polls_and_other_group_cards() {
+        let poll = json!({
+            "title": "", "action": "",
+            "params": "{\"pollId\":501,\"question\":\"Đi đâu chơi?\"}"
+        });
+        let m = extract("group.poll", Some(&poll)).unwrap();
+        assert_eq!((m.kind.as_str(), m.poll_id, m.name.as_str()), ("poll", 501, "Đi đâu chơi?"));
+        assert_eq!(summarize("group.poll", Some(&poll)), "[Bình chọn] Đi đâu chơi?");
+        assert!(extract("group.poll", Some(&json!({ "title": "x" }))).is_none());
+        let card = json!({ "title": "Sinh nhật", "params": { "previewTxt": "Chúc mừng sinh nhật!" } });
+        assert_eq!(summarize("chat.ecard", Some(&card)), "Chúc mừng sinh nhật!");
+        assert_eq!(summarize("chat.ecard", Some(&json!({ "title": "Tết" }))), "[Thiệp] Tết");
+        assert_eq!(summarize("chat.todo", Some(&json!({ "title": "Báo cáo" }))), "[Công việc] Báo cáo");
     }
 
     #[test]
