@@ -15,6 +15,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè chưa từng nhắn tin |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu |
+| POST | `/threads/{id}/messages/{seq}/reactions` | Thả cảm xúc `{ "icon": "/-heart" }`, một trong sáu biểu tượng Zalo cho dùng: `/-strong` 👍, `/-heart` ❤️, `:>` 😆, `:o` 😮, `:-((` 😭, `:-h` 😡. `icon` rỗng gỡ mọi cảm xúc của mình khỏi tin. Trả về tin kèm `reactions` mới; `409` với tin chưa được Zalo xác nhận hoặc đã thu hồi |
 | POST | `/threads/{id}/attachments?name=&caption=&width=&height=&as=` | Gửi ảnh hoặc tệp, xem mục "Gửi ảnh và tệp" bên dưới. Trả về `202` với `{ "upload": {…} }` |
 | GET | `/uploads` | Các lượt gửi tệp đang chạy và vừa xong (giữ 10 phút) |
 | DELETE | `/uploads/{id}` | Hủy một lượt gửi chưa tới bước gửi tin; `409` nếu đã quá muộn |
@@ -32,7 +33,7 @@ Mã hội thoại có dạng `zalo:u:<id người dùng>` hoặc `zalo:g:<id nh�
 
 Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, `sender_name`, `outgoing`, `kind` (`msgType` của Zalo: `webchat`, `chat.photo`, `chat.video.msg`, `chat.sticker`, `share.file`…), `text`, `sent_at` (mili giây), `media` và `quote`.
 
-`quote` là tin được trả lời (`null` nếu không phải tin trả lời): `{ "sender_name", "text", "remote_id" }`. Tin bị người gửi thu hồi có `kind` là `chat.undo`, `text` là "Tin nhắn đã được thu hồi", không còn `media` hay `quote`; gateway xóa hẳn nội dung gốc khỏi kho.
+`quote` là tin được trả lời (`null` nếu không phải tin trả lời): `{ "sender_name", "text", "remote_id" }`. `reactions` là cảm xúc dưới tin, nhiều nhất trước: `[{ "icon": "/-heart", "emoji": "❤️", "count": 3, "mine": true }]`; mỗi người thả được nhiều lần, `count` đếm tất cả, `mine` cho biết tài khoản này có thả biểu tượng đó. Tin bị người gửi thu hồi có `kind` là `chat.undo`, `text` là "Tin nhắn đã được thu hồi", không còn `media` hay `quote`; gateway xóa hẳn nội dung gốc khỏi kho.
 
 `text` luôn có nội dung đọc được: chữ của tin, hoặc tóm tắt như `[Hình ảnh]`, `[Video]`, `[Tập tin] bao-cao.pdf`, dùng cho danh sách hội thoại và thông báo. `media` là `null` với tin chữ, còn lại là:
 
@@ -73,7 +74,7 @@ Lượt gửi không sống qua lần khởi động lại gateway: tệp chưa 
 | `event` | `data` |
 |---|---|
 | `message` | `{ "message": {…}, "thread": {…} }`: tin nhắn mới, đến hay đi |
-| `message_updated` | `{ "message": {…}, "thread": {…} }`: một tin đã lưu thay đổi (bị thu hồi); client thay tin có cùng `seq` |
+| `message_updated` | `{ "message": {…}, "thread": {…} }`: một tin đã lưu thay đổi (bị thu hồi, có cảm xúc mới); client thay tin có cùng `seq` |
 | `thread_read` | `{ "thread_id": "…" }` |
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |

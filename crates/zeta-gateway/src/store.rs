@@ -10,10 +10,13 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 
+use zeta_zalo::reaction::reaction_emoji;
+
 use crate::auth;
 use crate::media;
 use crate::model::{
-    now_ms, Device, Message, NewMessage, StoredEvent, Thread, ThreadKind, ThreadUpsert,
+    now_ms, Device, Message, NewMessage, NewReaction, ReactionCount, StoredEvent, Thread,
+    ThreadKind, ThreadUpsert,
 };
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -71,6 +74,25 @@ const SCHEMA_V2: &str = "ALTER TABLE messages ADD COLUMN media TEXT NOT NULL DEF
 /// Version 3: the message a reply quotes (JSON).
 const SCHEMA_V3: &str = "ALTER TABLE messages ADD COLUMN quote TEXT NOT NULL DEFAULT '';";
 
+/// Version 4: reactions, one row per reaction and message reacted to. A row
+/// with an empty icon takes back the user's earlier reactions to that message.
+const SCHEMA_V4: &str = "
+CREATE TABLE reactions (
+    thread_id  TEXT NOT NULL,
+    action_id  TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    client_id  TEXT NOT NULL DEFAULT '',
+    user_id    TEXT NOT NULL,
+    mine       INTEGER NOT NULL DEFAULT 0,
+    icon       TEXT NOT NULL,
+    sent_at    INTEGER NOT NULL,
+    PRIMARY KEY (thread_id, action_id, message_id)
+);
+CREATE INDEX reactions_message ON reactions (thread_id, message_id);
+CREATE UNIQUE INDEX reactions_client ON reactions (thread_id, user_id, client_id, message_id)
+    WHERE client_id <> '';
+";
+
 const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread, \
     COALESCE((SELECT m.text FROM messages m WHERE m.thread_id = threads.id \
               ORDER BY m.seq DESC LIMIT 1), '')";
@@ -105,7 +127,74 @@ fn message_from_row(row: &Row<'_>) -> Result<Message> {
         sent_at: row.get(9)?,
         media: from_json(&row.get::<_, String>(10)?),
         quote: from_json(&row.get::<_, String>(11)?),
+        reactions: Vec::new(),
     })
+}
+
+/// Count reactions given in order (`(user, mine, icon)`, oldest first): every
+/// row adds one, an empty icon clears what that user gave before. Most given
+/// icon first, then the earliest.
+fn count_reactions(rows: &[(String, bool, String)]) -> Vec<ReactionCount> {
+    let mut by_user: Vec<(&str, Vec<(bool, &str)>)> = Vec::new();
+    for (user, mine, icon) in rows {
+        let given = match by_user.iter_mut().find(|(u, _)| u == user) {
+            Some((_, given)) => given,
+            None => {
+                by_user.push((user, Vec::new()));
+                &mut by_user.last_mut().expect("just pushed").1
+            }
+        };
+        if icon.is_empty() {
+            given.clear();
+        } else {
+            given.push((*mine, icon));
+        }
+    }
+    let mut counts: Vec<ReactionCount> = Vec::new();
+    // Earliest first, over everyone.
+    let mut order: Vec<&str> = Vec::new();
+    for (_, _, icon) in rows {
+        if !icon.is_empty() && !order.contains(&icon.as_str()) {
+            order.push(icon);
+        }
+    }
+    for icon in order {
+        let given = by_user
+            .iter()
+            .flat_map(|(_, given)| given.iter())
+            .filter(|(_, i)| *i == icon);
+        let (count, mine) = given.fold((0u32, false), |(n, m), (mine, _)| (n + 1, m || *mine));
+        if count > 0 {
+            counts.push(ReactionCount {
+                icon: icon.to_string(),
+                emoji: reaction_emoji(icon).unwrap_or(icon).to_string(),
+                count,
+                mine,
+            });
+        }
+    }
+    // Stable: equal counts keep the earliest first.
+    counts.sort_by_key(|c| std::cmp::Reverse(c.count));
+    counts
+}
+
+/// Fill in the reactions of messages of one thread.
+fn attach_reactions(conn: &Connection, thread_id: &str, messages: &mut [Message]) -> Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT user_id, mine, icon FROM reactions WHERE thread_id = ?1 AND message_id = ?2
+         ORDER BY sent_at, rowid",
+    )?;
+    for message in messages.iter_mut() {
+        let rows = stmt.query_map(params![thread_id, message.remote_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        let rows: Vec<(String, bool, String)> = rows.collect::<Result<_>>()?;
+        message.reactions = count_reactions(&rows);
+    }
+    Ok(())
 }
 
 /// A JSON column; empty means none.
@@ -163,16 +252,16 @@ fn recall_in(
     remote_id: &str,
     client_id: &str,
 ) -> Result<Option<Message>> {
-    let seq: Option<i64> = conn
+    let found: Option<(i64, String)> = conn
         .query_row(
-            "SELECT seq FROM messages WHERE thread_id = ?1 AND kind <> 'chat.undo'
+            "SELECT seq, remote_id FROM messages WHERE thread_id = ?1 AND kind <> 'chat.undo'
                AND ((?2 <> '' AND remote_id = ?2) OR (?3 <> '' AND client_id = ?3))
              ORDER BY seq LIMIT 1",
             params![thread_id, remote_id, client_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some(seq) = seq else {
+    let Some((seq, stored_id)) = found else {
         return Ok(None);
     };
     conn.execute(
@@ -180,6 +269,18 @@ fn recall_in(
          WHERE seq = ?1",
         params![seq, media::RECALLED_TEXT],
     )?;
+    // Reactions go with the content. (The table exists from version 4 on.)
+    let has_reactions: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reactions')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_reactions {
+        conn.execute(
+            "DELETE FROM reactions WHERE thread_id = ?1 AND message_id = ?2",
+            params![thread_id, stored_id],
+        )?;
+    }
     conn.query_row(
         &format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq = ?1"),
         params![seq],
@@ -259,6 +360,12 @@ impl Store {
             if reparsed > 0 {
                 tracing::info!(count = reparsed, recalls, "stored messages re-parsed");
             }
+        }
+        if version < 4 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V4)?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -417,6 +524,7 @@ impl Store {
             media: m.media.clone(),
             quote: m.quote.clone(),
             sent_at: m.sent_at,
+            reactions: Vec::new(),
         }))
     }
 
@@ -465,7 +573,82 @@ impl Store {
         )?;
         let mut out: Vec<Message> = rows.collect::<Result<_>>()?;
         out.reverse();
+        attach_reactions(&conn, thread_id, &mut out)?;
         Ok(out)
+    }
+
+    /// One message, with its reactions.
+    pub fn message(&self, seq: i64) -> Result<Option<Message>> {
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                &format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq = ?1"),
+                params![seq],
+                message_from_row,
+            )
+            .optional()?;
+        let Some(message) = found else {
+            return Ok(None);
+        };
+        let thread_id = message.thread_id.clone();
+        let mut one = [message];
+        attach_reactions(&conn, &thread_id, &mut one)?;
+        let [message] = one;
+        Ok(Some(message))
+    }
+
+    /// Store a reaction once (by its id, or by its sender's client id). Returns
+    /// the stored messages it changed, with their reactions; a reaction to a
+    /// message that is not stored is kept for when it is.
+    pub fn add_reaction(&self, r: &NewReaction) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut changed = Vec::new();
+        for (global_id, client_id) in &r.targets {
+            // The stored message, by server id or, for one sent from here, client id.
+            let found: Option<i64> = conn
+                .query_row(
+                    "SELECT seq FROM messages WHERE thread_id = ?1
+                       AND ((?2 <> '' AND ?2 <> '0' AND remote_id = ?2)
+                         OR (?3 <> '' AND ?3 <> '0' AND client_id = ?3))
+                     ORDER BY seq LIMIT 1",
+                    params![r.thread_id, global_id, client_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let message_id: String = match found {
+                Some(seq) => conn.query_row(
+                    "SELECT remote_id FROM messages WHERE seq = ?1",
+                    params![seq],
+                    |row| row.get(0),
+                )?,
+                None => global_id.clone(),
+            };
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO reactions
+                    (thread_id, action_id, message_id, client_id, user_id, mine, icon, sent_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    r.thread_id,
+                    r.action_id,
+                    message_id,
+                    r.client_id,
+                    r.user_id,
+                    r.mine,
+                    r.icon,
+                    r.sent_at
+                ],
+            )?;
+            if let (1, Some(seq)) = (inserted, found) {
+                let message = conn.query_row(
+                    &format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq = ?1"),
+                    params![seq],
+                    message_from_row,
+                )?;
+                changed.push(message);
+            }
+        }
+        attach_reactions(&conn, &r.thread_id, &mut changed)?;
+        Ok(changed)
     }
 
     /// Append to the event log; returns the event's sequence number.
@@ -658,6 +841,81 @@ mod tests {
     }
 
     #[test]
+    fn reactions_add_up_per_icon_and_can_be_taken_back() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        let first = s
+            .insert_message(&msg(&t, "m1", "c1", false, 1))
+            .unwrap()
+            .unwrap();
+        s.insert_message(&msg(&t, "local:7", "7", true, 2)).unwrap();
+        let react = |action: &str, client: &str, user: &str, icon: &str, at: i64| NewReaction {
+            thread_id: t.clone(),
+            action_id: action.into(),
+            client_id: client.into(),
+            targets: vec![("m1".into(), "c1".into())],
+            user_id: user.into(),
+            mine: user == "me",
+            icon: icon.into(),
+            sent_at: at,
+        };
+        let counts = |m: &Message| {
+            m.reactions
+                .iter()
+                .map(|r| (r.emoji.clone(), r.count, r.mine))
+                .collect::<Vec<_>>()
+        };
+
+        let changed = s
+            .add_reaction(&react("a1", "", "1", "/-heart", 10))
+            .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].seq, first.seq);
+        s.add_reaction(&react("a2", "", "1", "/-heart", 11))
+            .unwrap();
+        s.add_reaction(&react("a3", "55", "me", "/-strong", 12))
+            .unwrap();
+        let both = s
+            .add_reaction(&react("a4", "", "me", "/-heart", 13))
+            .unwrap();
+        assert_eq!(
+            counts(&both[0]),
+            [("❤️".to_string(), 3, true), ("👍".to_string(), 1, true)]
+        );
+        // Seen again (by id, or as the echo of our own client id): not counted.
+        assert!(s
+            .add_reaction(&react("a1", "", "1", "/-heart", 10))
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .add_reaction(&react("echo", "55", "me", "/-strong", 12))
+            .unwrap()
+            .is_empty());
+
+        // Taking back clears that user's reactions only, even if older ones come late.
+        s.add_reaction(&react("a5", "", "me", "", 14)).unwrap();
+        s.add_reaction(&react("a0", "", "me", ":>", 9)).unwrap();
+        let listed = s.messages(&t, None, 10).unwrap();
+        assert_eq!(counts(&listed[0]), [("❤️".to_string(), 2, false)]);
+        assert!(listed[1].reactions.is_empty());
+        assert_eq!(
+            counts(&s.message(first.seq).unwrap().unwrap()),
+            counts(&listed[0])
+        );
+
+        // A message sent from here is found by its client id; unknown messages
+        // keep the reaction for later; a recall drops the reactions.
+        let mut by_client = react("b1", "", "1", ":o", 20);
+        by_client.targets = vec![("0".into(), "7".into()), ("m404".into(), "x".into())];
+        let changed = s.add_reaction(&by_client).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(counts(&changed[0]), [("😮".to_string(), 1, false)]);
+        s.recall_message(&t, "m1", "").unwrap();
+        assert!(s.messages(&t, None, 10).unwrap()[0].reactions.is_empty());
+    }
+
+    #[test]
     fn media_is_stored_with_the_message() {
         let s = Store::open_in_memory().unwrap();
         s.upsert_thread(&user("1", "A"), true).unwrap();
@@ -740,7 +998,7 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]

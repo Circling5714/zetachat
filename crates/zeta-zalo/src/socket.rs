@@ -75,6 +75,52 @@ impl WsEvent {
     }
 }
 
+/// Keys, types and array sizes of a payload, never its values: safe to log
+/// while learning the shape of frames. Keys that look like ids are masked.
+pub fn payload_shape(v: &Value) -> String {
+    fn walk(v: &Value, depth: usize, out: &mut String) {
+        match v {
+            Value::Object(map) if depth < 8 => {
+                out.push('{');
+                for (i, (key, value)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let id_like = key.len() >= 6 && key.bytes().all(|b| b.is_ascii_digit());
+                    out.push_str(if id_like { "<id>" } else { key });
+                    out.push_str(": ");
+                    walk(value, depth + 1, out);
+                }
+                out.push('}');
+            }
+            Value::Object(map) => out.push_str(&format!("{{{} keys}}", map.len())),
+            Value::Array(items) => match items.first() {
+                Some(first) => {
+                    out.push_str(&format!("[{} × ", items.len()));
+                    walk(first, depth + 1, out);
+                    out.push(']');
+                }
+                None => out.push_str("[]"),
+            },
+            // JSON inside a string (Zalo nests some contents this way).
+            Value::String(s) if s.starts_with('{') => match serde_json::from_str::<Value>(s) {
+                Ok(inner) => {
+                    out.push_str("json");
+                    walk(&inner, depth + 1, out);
+                }
+                Err(_) => out.push_str("str"),
+            },
+            Value::String(_) => out.push_str("str"),
+            Value::Number(_) => out.push_str("num"),
+            Value::Bool(_) => out.push_str("bool"),
+            Value::Null => out.push_str("null"),
+        }
+    }
+    let mut out = String::new();
+    walk(v, 0, &mut out);
+    out
+}
+
 /// What the real-time loop reports.
 #[derive(Clone, Debug)]
 pub enum RealtimeEvent {
@@ -494,6 +540,18 @@ mod tests {
         }});
         assert_eq!(queues_from_auth(&auth), vec![(610, 1), (603, 1), (511, 1)]);
         assert!(queues_from_auth(&json!({ "data": {} })).is_empty());
+    }
+
+    #[test]
+    fn shapes_hide_values_and_ids() {
+        // serde_json keeps keys sorted.
+        let v = json!({ "data": { "reacts": [{ "msgId": "123", "content": "{\"rIcon\":\"/-heart\"}" }] } });
+        assert_eq!(
+            payload_shape(&v),
+            "{data: {reacts: [1 × {content: json{rIcon: str}, msgId: str}]}}"
+        );
+        assert_eq!(payload_shape(&json!({ "1234567": 1 })), "{<id>: num}");
+        assert_eq!(payload_shape(&json!([])), "[]");
     }
 
     #[test]

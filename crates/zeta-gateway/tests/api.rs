@@ -12,7 +12,7 @@ use tower::ServiceExt;
 use zeta_gateway::api::{self, AppState};
 use zeta_gateway::events::EventBus;
 use zeta_gateway::media_cache::MediaCache;
-use zeta_gateway::model::{thread_id, Media, NewMessage, ThreadKind, ThreadUpsert};
+use zeta_gateway::model::{thread_id, Media, NewMessage, NewReaction, ThreadKind, ThreadUpsert};
 use zeta_gateway::store::Store;
 use zeta_gateway::uploads::Uploads;
 use zeta_gateway::zalo::{LoginState, ZaloCommand, ZaloHandle};
@@ -138,6 +138,28 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                         .unwrap();
                     job.finish(Ok(message));
                     job.remove_file().await;
+                }
+                ZaloCommand::React {
+                    kind,
+                    remote_id,
+                    message_id,
+                    message_client_id,
+                    icon,
+                    reply,
+                } => {
+                    let changed = store
+                        .add_reaction(&NewReaction {
+                            thread_id: thread_id(kind, &remote_id),
+                            action_id: format!("r{sent}"),
+                            client_id: String::new(),
+                            targets: vec![(message_id, message_client_id)],
+                            user_id: "me".into(),
+                            mine: true,
+                            icon,
+                            sent_at: sent,
+                        })
+                        .unwrap();
+                    let _ = reply.send(Ok(changed.into_iter().next()));
                 }
                 ZaloCommand::MarkSeen {
                     remote_id,
@@ -431,6 +453,49 @@ async fn uploads_can_be_cancelled_until_they_end() {
     assert_eq!(status, StatusCode::CONFLICT, "already ended");
     let (status, _) = call(&f, "DELETE", "/api/v1/uploads/up_nope", None, true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reactions_go_to_zalo_and_come_back_counted() {
+    let f = fixture();
+    let id = thread_id(ThreadKind::User, "42");
+    let (_, sent) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{id}/messages"),
+        Some(json!({ "text": "hi" })),
+        true,
+    )
+    .await;
+    let seq = sent["seq"].as_i64().unwrap();
+    let uri = format!("/api/v1/threads/{id}/messages/{seq}/reactions");
+    let (status, body) = call(&f, "POST", &uri, Some(json!({ "icon": "/-heart" })), true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["reactions"],
+        json!([{ "icon": "/-heart", "emoji": "❤️", "count": 1, "mine": true }])
+    );
+    let (_, body) = call(&f, "POST", &uri, Some(json!({ "icon": "" })), true).await;
+    assert_eq!(body["reactions"], json!([]), "taken back");
+    let (_, messages) = call(
+        &f,
+        "GET",
+        &format!("/api/v1/threads/{id}/messages"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(messages[0]["reactions"], json!([]));
+
+    let (status, _) = call(&f, "POST", &uri, Some(json!({ "icon": "/-beer" })), true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "only the six Zalo offers");
+    let other = format!("/api/v1/threads/zalo:u:9/messages/{seq}/reactions");
+    let (status, _) = call(&f, "POST", &other, Some(json!({ "icon": ":>" })), true).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the message is in another thread"
+    );
 }
 
 #[tokio::test]

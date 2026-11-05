@@ -28,10 +28,12 @@ pub enum Service {
     Sticker,
     /// "Cloud của tôi" and group history.
     GroupCloudMessage,
+    /// Reactions to messages.
+    Reaction,
 }
 
 /// Services that `zpw_service_map_v3` can list.
-const MAPPED_SERVICES: [Service; 8] = [
+const MAPPED_SERVICES: [Service; 9] = [
     Service::Chat,
     Service::Conversation,
     Service::Friend,
@@ -40,6 +42,7 @@ const MAPPED_SERVICES: [Service; 8] = [
     Service::File,
     Service::Sticker,
     Service::GroupCloudMessage,
+    Service::Reaction,
 ];
 
 impl Service {
@@ -56,6 +59,7 @@ impl Service {
             Self::File => "file",
             Self::Sticker => "sticker",
             Self::GroupCloudMessage => "group_cloud_message",
+            Self::Reaction => "reaction",
         }
     }
 }
@@ -73,6 +77,9 @@ pub struct Domains {
     pub file: String,
     pub sticker: String,
     pub group_cloud_message: String,
+    /// Sessions saved before reactions existed lack it.
+    #[serde(default = "default_reaction_host")]
+    pub reaction: String,
     /// `zpw_chts_new[0]`: HTTP long-polling for messages.
     pub lp_chat: String,
     /// `zpw_ctrs_new[0]`: HTTP long-polling for control events.
@@ -97,6 +104,7 @@ impl Default for Domains {
             file: "https://tt-files-wpa.zaloapp.com".into(),
             sticker: "https://tt-sticker-wpa.chat.zalo.me".into(),
             group_cloud_message: "https://tt-group-cm.api.zaloapp.com".into(),
+            reaction: default_reaction_host(),
             lp_chat: "https://p4-msg-chat.zaloapp.com".into(),
             lp_control: "https://p4-ctl-chat.zaloapp.com".into(),
             ws: (1..=8)
@@ -105,6 +113,10 @@ impl Default for Domains {
             alternates: BTreeMap::new(),
         }
     }
+}
+
+fn default_reaction_host() -> String {
+    "https://reaction.api.zaloapp.com".into()
 }
 
 /// URLs of a service-map entry, which can be a string or an array of strings.
@@ -141,6 +153,7 @@ impl Domains {
             Service::File => &self.file,
             Service::Sticker => &self.sticker,
             Service::GroupCloudMessage => &self.group_cloud_message,
+            Service::Reaction => &self.reaction,
         }
     }
 

@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeta_zalo::api::{Recipient, SessionHealth};
+use zeta_zalo::reaction;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::upload::{self, FileLimits, FileSource, UploadedFile};
 use zeta_zalo::{Device, SessionData, ZaloClient};
@@ -22,7 +23,7 @@ use crate::events::EventBus;
 use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
-    now_ms, thread_id, Media, Message, NewMessage, Quote, ThreadKind, ThreadUpsert,
+    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Quote, ThreadKind, ThreadUpsert,
 };
 use crate::store::Store;
 use crate::uploads::UploadJob;
@@ -110,6 +111,16 @@ pub enum ZaloCommand {
         remote_id: String,
         attachment: Attachment,
         job: Arc<UploadJob>,
+    },
+    /// React with `icon` (empty: take back) to the message `message_id` /
+    /// `message_client_id`; answers with the message and its reactions.
+    React {
+        kind: ThreadKind,
+        remote_id: String,
+        message_id: String,
+        message_client_id: String,
+        icon: String,
+        reply: oneshot::Sender<Result<Option<Message>, String>>,
     },
     /// The account read these incoming messages (original Zalo JSON): send a
     /// read receipt, if enabled.
@@ -278,6 +289,31 @@ fn is_zero(id: &str) -> bool {
     id.is_empty() || id == "0"
 }
 
+/// Thread of something sent by `uid_from` to `id_to` (a message, a reaction):
+/// kind, remote id of the thread, and whether this account sent it.
+fn route(
+    uid_from: &str,
+    id_to: &str,
+    grid: &str,
+    group_bucket: bool,
+    self_uid: &str,
+) -> Option<(ThreadKind, String, bool)> {
+    let outgoing = is_zero(uid_from) || uid_from == self_uid;
+    let (kind, peer) = if group_bucket || !is_zero(grid) {
+        let group = if is_zero(grid) { id_to } else { grid };
+        (ThreadKind::Group, group.trim_start_matches("group_"))
+    } else if is_zero(id_to) && is_zero(uid_from) {
+        (ThreadKind::User, self_uid)
+    } else if !outgoing && (is_zero(id_to) || id_to == self_uid) {
+        (ThreadKind::User, uid_from)
+    } else if !is_zero(id_to) {
+        (ThreadKind::User, id_to)
+    } else {
+        (ThreadKind::User, uid_from)
+    };
+    (!is_zero(peer)).then(|| (kind, peer.to_string(), outgoing))
+}
+
 fn parse_message(it: &Value, group_bucket: bool, self_uid: &str) -> Option<ParsedMessage> {
     let remote_id = field(it, &["msgId", "globalMsgId", "cliMsgId"]);
     if remote_id.is_empty() {
@@ -286,26 +322,7 @@ fn parse_message(it: &Value, group_bucket: bool, self_uid: &str) -> Option<Parse
     let uid_from = field(it, &["uidFrom"]);
     let id_to = field(it, &["idTo"]);
     let grid = field(it, &["grid", "groupId"]);
-    let outgoing = is_zero(&uid_from) || uid_from == self_uid;
-
-    let (kind, peer) = if group_bucket || !is_zero(&grid) {
-        let group = if is_zero(&grid) { &id_to } else { &grid };
-        (
-            ThreadKind::Group,
-            group.trim_start_matches("group_").to_string(),
-        )
-    } else if is_zero(&id_to) && is_zero(&uid_from) {
-        (ThreadKind::User, self_uid.to_string())
-    } else if !outgoing && (is_zero(&id_to) || id_to == self_uid) {
-        (ThreadKind::User, uid_from.clone())
-    } else if !is_zero(&id_to) {
-        (ThreadKind::User, id_to.clone())
-    } else {
-        (ThreadKind::User, uid_from.clone())
-    };
-    if is_zero(&peer) {
-        return None;
-    }
+    let (kind, peer, outgoing) = route(&uid_from, &id_to, &grid, group_bucket, self_uid)?;
 
     let msg_type = field(it, &["msgType"]);
     Some(ParsedMessage {
@@ -388,6 +405,26 @@ fn publish_status(status: &RwLock<ZaloStatus>, bus: &EventBus) {
     if let Err(e) = bus.publish("status", json!(snapshot)) {
         tracing::error!(error = %e, "cannot publish status");
     }
+}
+
+/// Store a reaction; announce each stored message it changed. Returns the
+/// first of them.
+fn apply_reaction(store: &Store, bus: &EventBus, reaction: &NewReaction) -> Option<Message> {
+    let changed = match store.add_reaction(reaction) {
+        Ok(changed) => changed,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot store a reaction");
+            return None;
+        }
+    };
+    for message in &changed {
+        let thread = store.thread(&message.thread_id).ok().flatten();
+        let payload = json!({ "message": message, "thread": thread });
+        if let Err(e) = bus.publish("message_updated", payload) {
+            tracing::error!(error = %e, "cannot publish a reaction");
+        }
+    }
+    changed.into_iter().next()
 }
 
 fn publish_message(store: &Store, bus: &EventBus, message: &Message) {
@@ -602,6 +639,48 @@ impl Connector {
                     job.remove_file().await;
                 });
             }
+            ZaloCommand::React {
+                kind,
+                remote_id,
+                message_id,
+                message_client_id,
+                icon,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                let self_uid = self.self_uid.clone();
+                tokio::spawn(async move {
+                    let to = recipient(kind, &remote_id);
+                    let result = match client
+                        .send_reaction(to, &message_id, &message_client_id, &icon)
+                        .await
+                    {
+                        Ok(sent) => {
+                            let reaction = NewReaction {
+                                thread_id: thread_id(kind, &remote_id),
+                                action_id: sent
+                                    .msg_ids
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("c{}", sent.client_id)),
+                                client_id: sent.client_id.to_string(),
+                                targets: vec![(message_id, message_client_id)],
+                                user_id: self_uid,
+                                mine: true,
+                                icon,
+                                sent_at: now_ms(),
+                            };
+                            Ok(apply_reaction(&store, &bus, &reaction))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = reply.send(result);
+                });
+            }
             ZaloCommand::MarkSeen {
                 kind,
                 remote_id,
@@ -696,16 +775,58 @@ impl Connector {
                 true
             }
             RealtimeEvent::Frame(frame) => {
-                tracing::debug!(cmd = frame.cmd, sub = frame.sub_cmd, "frame");
+                // Keep-alive answers are not worth a line every 15 seconds.
+                if frame.cmd != socket::cmd::PING {
+                    let shape = socket::payload_shape(&frame.payload);
+                    tracing::debug!(cmd = frame.cmd, sub = frame.sub_cmd, %shape, "frame");
+                }
                 if frame.is_control() {
                     for (file_id, url) in upload::file_done_events(&frame.payload) {
                         tracing::debug!(%file_id, "file stored by Zalo");
                         self.uploads.complete(file_id, url);
                     }
                 }
+                // 612 pushes reactions; 610 and 611 bring the ones missed.
+                if (610..=612).contains(&frame.cmd) {
+                    self.store_reactions(&frame.payload);
+                }
                 true
             }
         }
+    }
+
+    fn store_reactions(&self, payload: &Value) {
+        let found = reaction::frame_reactions(payload);
+        if found.is_empty() {
+            return;
+        }
+        let total = found.len();
+        let mut applied = 0;
+        for r in found {
+            let Some((kind, peer, mine)) =
+                route(&r.uid_from, &r.id_to, "", r.group, &self.self_uid)
+            else {
+                continue;
+            };
+            let new = NewReaction {
+                thread_id: thread_id(kind, &peer),
+                action_id: r.action_id,
+                client_id: r.client_id,
+                targets: r.targets,
+                user_id: if mine {
+                    self.self_uid.clone()
+                } else {
+                    r.uid_from
+                },
+                mine,
+                icon: r.icon,
+                sent_at: if r.ts > 0 { r.ts } else { now_ms() },
+            };
+            if apply_reaction(&self.store, &self.bus, &new).is_some() {
+                applied += 1;
+            }
+        }
+        tracing::debug!(total, applied, "reactions");
     }
 
     /// Recent messages (`get-last-msgs`), so the conversation list is not empty

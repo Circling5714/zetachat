@@ -506,9 +506,117 @@ function messageNode(m, prev, isGroup) {
   } else {
     appendText(bubble, m.text || '');
   }
+  if (!recalled && m.reactions && m.reactions.length) bubble.appendChild(reactionSummary(m));
   bubble.appendChild(el('span', 'time', fmtClock(m.sent_at)));
+  if (canReact(m)) {
+    const button = el('button', 'react-btn', '👍');
+    button.type = 'button';
+    button.title = 'Thả cảm xúc';
+    button.setAttribute('aria-label', 'Thả cảm xúc');
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openPicker(m, button);
+    });
+    bubble.appendChild(button);
+  }
   frag.appendChild(bubble);
   return frag;
+}
+
+// ---------------------------------------------------------------- reactions
+
+/** The six reactions Zalo offers, in its order: icon code and emoji. */
+const REACTIONS = [
+  ['/-strong', '👍', 'Thích'],
+  ['/-heart', '❤️', 'Yêu thích'],
+  [':>', '😆', 'Haha'],
+  [':o', '😮', 'Ngạc nhiên'],
+  [':-((', '😭', 'Buồn'],
+  [':-h', '😡', 'Phẫn nộ'],
+];
+
+/** Messages Zalo has confirmed, and not recalled. */
+function canReact(m) {
+  return m.kind !== 'chat.undo' && !String(m.remote_id || '').startsWith('local:');
+}
+
+/** Up to three emoji and the number of reactions, under the message. */
+function reactionSummary(m) {
+  const list = m.reactions;
+  const total = list.reduce((n, r) => n + r.count, 0);
+  const row = el('div', 'reaction-row');
+  const pill = el('button', list.some((r) => r.mine) ? 'reactions mine' : 'reactions');
+  pill.type = 'button';
+  pill.title = list.map((r) => `${r.emoji} ${r.count}`).join(' · ');
+  pill.append(list.slice(0, 3).map((r) => r.emoji).join(''));
+  if (total > 1) pill.append(el('span', 'count', String(total)));
+  pill.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (canReact(m)) openPicker(m, pill);
+  });
+  row.append(pill);
+  return row;
+}
+
+let picker = null;
+
+function closePicker() {
+  if (!picker) return;
+  picker.remove();
+  picker = null;
+}
+
+function openPicker(m, anchor) {
+  closePicker();
+  const box = el('div', 'react-picker');
+  box.setAttribute('role', 'menu');
+  for (const [icon, emoji, label] of REACTIONS) {
+    const button = el('button', null, emoji);
+    button.type = 'button';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.addEventListener('click', () => {
+      closePicker();
+      react(m, icon);
+    });
+    box.append(button);
+  }
+  if ((m.reactions || []).some((r) => r.mine)) {
+    const remove = el('button', 'remove', 'Gỡ');
+    remove.type = 'button';
+    remove.title = 'Gỡ cảm xúc của bạn';
+    remove.addEventListener('click', () => {
+      closePicker();
+      react(m, '');
+    });
+    box.append(remove);
+  }
+  document.body.append(box);
+  const at = anchor.getBoundingClientRect();
+  const left = Math.min(window.innerWidth - box.offsetWidth - 8, Math.max(8, at.left + at.width / 2 - box.offsetWidth / 2));
+  let top = at.top - box.offsetHeight - 6;
+  if (top < 8) top = at.bottom + 6;
+  box.style.left = `${left}px`;
+  box.style.top = `${top}px`;
+  picker = box;
+  box.querySelector('button').focus();
+}
+
+document.addEventListener('click', (e) => {
+  if (picker && !picker.contains(e.target)) closePicker();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closePicker();
+});
+$('messages').addEventListener('scroll', closePicker, { passive: true });
+
+async function react(m, icon) {
+  try {
+    const message = await api(`/threads/${encodeURIComponent(m.thread_id)}/messages/${m.seq}/reactions`, { json: { icon } });
+    onMessageUpdated({ message });
+  } catch (err) {
+    handleError(err, 'Không thả được cảm xúc: ');
+  }
 }
 
 function currentIsGroup() {

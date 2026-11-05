@@ -31,6 +31,7 @@ Cách dùng:
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
   zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
   zeta send    <session.json> user|group <id> <nội dung>
+  zeta react   <session.json> user|group <id> <msgId> <cliMsgId> <biểu tượng, \"\" để gỡ>
   zeta listen  <session.json> [giây]             nghe sự kiện thời gian thực
   zeta import-ctdozlite <ctdozlite.json> <out.json>";
 
@@ -52,6 +53,7 @@ async fn main() -> Result<()> {
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
         Some("send") => send(rest).await,
+        Some("react") => react(rest).await,
         Some("listen") => listen(rest).await,
         Some("import-ctdozlite") => import_ctdozlite(rest),
         _ => {
@@ -213,6 +215,7 @@ async fn probe(args: &[String]) -> Result<()> {
         "file" => Service::File,
         "sticker" => Service::Sticker,
         "group_cloud_message" => Service::GroupCloudMessage,
+        "reaction" => Service::Reaction,
         other => bail!("dịch vụ không hỗ trợ: {other}"),
     };
     let mut params: serde_json::Value =
@@ -233,6 +236,15 @@ async fn limits(args: &[String]) -> Result<()> {
     let client = load_client(&session_path(args)?)?;
     let data = client.server_info().await?;
     // Zalo spells it "setttings"; zca-js falls back to "settings".
+    if args.get(1).map(String::as_str) == Some("--services") {
+        // Service names and their hosts (public Zalo endpoints).
+        if let Some(map) = data.get("zpw_service_map_v3").and_then(|m| m.as_object()) {
+            for (name, hosts) in map {
+                println!("{name}: {hosts}");
+            }
+        }
+        return Ok(());
+    }
     let settings = data.get("setttings").or_else(|| data.get("settings"));
     let Some(features) = settings.and_then(|s| s.get("features")) else {
         println!("không có settings.features; khóa: {}", shape(&data, 2));
@@ -267,6 +279,32 @@ async fn send(args: &[String]) -> Result<()> {
     };
     let sent = client.send_text(to, text).await?;
     println!("SENT msgId={} clientId={}", sent.msg_id, sent.client_id);
+    Ok(())
+}
+
+async fn react(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let (Some(kind), Some(id), Some(msg_id), Some(cli_msg_id), Some(icon)) = (
+        args.get(1),
+        args.get(2),
+        args.get(3),
+        args.get(4),
+        args.get(5),
+    ) else {
+        bail!("cần: react <session.json> user|group <id> <msgId> <cliMsgId> <biểu tượng>");
+    };
+    let to = match kind.as_str() {
+        "user" => Recipient::User(id),
+        "group" => Recipient::Group(id),
+        other => bail!("loại người nhận không hợp lệ: {other}"),
+    };
+    match client.send_reaction(to, msg_id, cli_msg_id, icon).await {
+        Ok(sent) => println!(
+            "REACTED clientId={} msgIds={:?}",
+            sent.client_id, sent.msg_ids
+        ),
+        Err(e) => println!("LỖI {e}"),
+    }
     Ok(())
 }
 

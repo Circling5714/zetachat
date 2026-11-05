@@ -105,6 +105,39 @@ pub struct Message {
     pub quote: Option<Quote>,
     /// Milliseconds since the epoch.
     pub sent_at: i64,
+    /// Reactions, most given first.
+    pub reactions: Vec<ReactionCount>,
+}
+
+/// Reactions to a message with one icon.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactionCount {
+    /// Zalo's code (`/-heart`…): send it back to react the same way.
+    pub icon: String,
+    /// How Zalo draws it; the code itself when unknown.
+    pub emoji: String,
+    /// Reactions given (a person can give several).
+    pub count: u32,
+    /// This account gave at least one of them.
+    pub mine: bool,
+}
+
+/// Input for [`crate::store::Store::add_reaction`]: one reaction, which can
+/// cover several messages.
+#[derive(Clone, Debug)]
+pub struct NewReaction {
+    pub thread_id: String,
+    /// Zalo's id of the reaction itself.
+    pub action_id: String,
+    /// The `clientId` its sender chose, so an echo is not counted twice.
+    pub client_id: String,
+    /// The messages: server id and client id of each.
+    pub targets: Vec<(String, String)>,
+    pub user_id: String,
+    pub mine: bool,
+    /// Empty: the user took back their reactions.
+    pub icon: String,
+    pub sent_at: i64,
 }
 
 /// Input for [`crate::store::Store::insert_message`].

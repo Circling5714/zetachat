@@ -108,6 +108,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/threads/{id}/attachments",
             post(send_attachment).layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/v1/threads/{id}/messages/{seq}/reactions", post(react))
         .route("/api/v1/uploads", get(list_uploads))
         .route("/api/v1/uploads/{id}", delete(cancel_upload))
         .route("/api/v1/threads/{id}/read", post(mark_read))
@@ -290,6 +291,62 @@ async fn send_message(
         .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
         .map_err(ApiError::bad_gateway)?;
     Ok(Json(message))
+}
+
+#[derive(Deserialize)]
+struct ReactBody {
+    icon: String,
+}
+
+/// React to a message with one of the six reactions Zalo offers (`/-strong`,
+/// `/-heart`, `:>`, `:o`, `:-((`, `:-h`); an empty icon takes back this
+/// account's reactions to it. Answers with the message and its reactions.
+async fn react(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, seq)): Path<(String, i64)>,
+    Json(body): Json<ReactBody>,
+) -> ApiResult<Message> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    if zeta_zalo::reaction::reaction_type(&body.icon).is_none() {
+        return Err(ApiError::bad_request("unsupported reaction"));
+    }
+    let message = st
+        .store
+        .message(seq)
+        .map_err(ApiError::internal)?
+        .filter(|m| m.thread_id == id)
+        .ok_or_else(|| ApiError::not_found("message"))?;
+    if message.remote_id.starts_with("local:") || message.kind == "chat.undo" {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "tin này chưa thả cảm xúc được",
+        ));
+    }
+    let client_id = if message.client_id.is_empty() {
+        "0".to_string()
+    } else {
+        message.client_id.clone()
+    };
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::React {
+            kind,
+            remote_id: remote_id.to_string(),
+            message_id: message.remote_id.clone(),
+            message_client_id: client_id,
+            icon: body.icon,
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let updated = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    // Nothing changed (the same reaction seen before): the message as stored.
+    Ok(Json(updated.unwrap_or(message)))
 }
 
 #[derive(Deserialize)]

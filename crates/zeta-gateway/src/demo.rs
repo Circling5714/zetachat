@@ -12,7 +12,7 @@ use crate::events::EventBus;
 use crate::media::RECALLED_TEXT;
 use crate::media_cache::{MediaCache, LOCAL_URL_PREFIX};
 use crate::model::{
-    now_ms, thread_id, Media, Message, NewMessage, Quote, ThreadKind, ThreadUpsert,
+    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Quote, ThreadKind, ThreadUpsert,
 };
 use crate::store::Store;
 use crate::uploads::UploadJob;
@@ -122,6 +122,28 @@ fn add_thread(store: &Store, kind: ThreadKind, remote: &str, name: &str, message
             quote: sample.quote,
             sent_at: now_ms() - sample.minutes_ago * 60_000,
             raw: "{}".into(),
+        });
+    }
+}
+
+/// Reactions to sample message `index` of a thread: `(user, icon)` in order.
+fn add_reactions(
+    store: &Store,
+    kind: ThreadKind,
+    remote: &str,
+    index: usize,
+    given: &[(&str, &str)],
+) {
+    for (i, (user, icon)) in given.iter().enumerate() {
+        let _ = store.add_reaction(&NewReaction {
+            thread_id: thread_id(kind, remote),
+            action_id: format!("demo-r-{remote}-{index}-{i}"),
+            client_id: String::new(),
+            targets: vec![(format!("demo-{remote}-{index}"), String::new())],
+            user_id: user.to_string(),
+            mine: *user == "me",
+            icon: icon.to_string(),
+            sent_at: now_ms() - 60_000 + i as i64,
         });
     }
 }
@@ -257,6 +279,20 @@ fn seed(store: &Store) {
         ],
     );
     add_thread(store, ThreadKind::User, "1003", "Hoàng Nam", Vec::new());
+    add_reactions(store, ThreadKind::User, "1001", 2, &[("me", "/-strong")]);
+    add_reactions(store, ThreadKind::User, "1001", 5, &[("1001", "/-heart")]);
+    add_reactions(
+        store,
+        ThreadKind::Group,
+        "2001",
+        3,
+        &[
+            ("2001-Minh", "/-heart"),
+            ("2001-Mẹ", "/-heart"),
+            ("me", "/-heart"),
+            ("2001-Minh", ":o"),
+        ],
+    );
     // Read the older threads so only some show unread badges.
     let _ = store.mark_read(&thread_id(ThreadKind::User, "1002"));
 }
@@ -461,6 +497,37 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                             .await;
                         job.remove_file().await;
                     });
+                }
+                ZaloCommand::React {
+                    kind,
+                    remote_id,
+                    message_id,
+                    message_client_id,
+                    icon,
+                    reply,
+                } => {
+                    let reaction = NewReaction {
+                        thread_id: thread_id(kind, &remote_id),
+                        action_id: format!("demo-{:016x}", rand::random::<u64>()),
+                        client_id: String::new(),
+                        targets: vec![(message_id, message_client_id)],
+                        user_id: "me".into(),
+                        mine: true,
+                        icon,
+                        sent_at: now_ms(),
+                    };
+                    let changed = store
+                        .add_reaction(&reaction)
+                        .ok()
+                        .and_then(|changed| changed.into_iter().next());
+                    if let Some(message) = &changed {
+                        let thread = store.thread(&message.thread_id).ok().flatten();
+                        let _ = bus.publish(
+                            "message_updated",
+                            json!({ "message": message, "thread": thread }),
+                        );
+                    }
+                    let _ = reply.send(Ok(changed));
                 }
                 // Nobody to tell in the demo.
                 ZaloCommand::MarkSeen { .. } => {}

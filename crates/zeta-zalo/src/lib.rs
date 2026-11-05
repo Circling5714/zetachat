@@ -17,6 +17,7 @@ pub mod error;
 pub mod login;
 pub mod media;
 pub mod param_cipher;
+pub mod reaction;
 pub mod session;
 pub mod socket;
 pub mod upload;
