@@ -26,7 +26,7 @@ use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
     now_ms, thread_id, GroupMembers, Media, Member, Mention, Message, NewMessage, NewReaction,
-    Person, Quote, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
+    Person, Quote, Thread, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
 };
 use crate::stickers::{StickerCache, StickerQuery};
 use crate::store::Store;
@@ -190,6 +190,14 @@ pub enum ZaloCommand {
         /// Who sent it: this account's uid for its own messages.
         owner_id: String,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Give a 1-1 chat's other person an alias (empty: remove it), or rename a
+    /// group for all its members; answers with the thread as stored.
+    Rename {
+        kind: ThreadKind,
+        remote_id: String,
+        name: String,
+        reply: oneshot::Sender<Result<Option<Thread>, String>>,
     },
     /// Make a group with these friends; answers with `{ thread, failed }`.
     CreateGroup {
@@ -708,7 +716,9 @@ impl Connector {
         self.self_uid = client.session().map(|s| s.uid.clone()).unwrap_or_default();
         if matches!(health, SessionHealth::Valid(_)) {
             self.sync_contacts(&client).await;
+            self.sync_aliases(&client).await;
             self.load_recent(&client).await;
+            self.name_unnamed(&client).await;
         }
         let realtime = socket::RealtimeConfig::from_client(&client)
             .ok()
@@ -737,6 +747,56 @@ impl Connector {
         };
         if let Err(e) = self.store.upsert_person(&me, None) {
             tracing::error!(error = %e, "cannot store own profile");
+        }
+    }
+
+    /// The names the account gave its contacts, as Zalo lists them.
+    async fn sync_aliases(&self, client: &ZaloClient) {
+        match client.aliases().await {
+            Ok(list) => {
+                let count = list.len();
+                match self.store.set_aliases(&list) {
+                    Ok(()) => tracing::info!(count, "aliases synced"),
+                    Err(e) => tracing::error!(error = %e, "cannot store aliases"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot load aliases"),
+        }
+    }
+
+    /// 1-1 chats without a name: the Cloud gets its own, the others the name
+    /// Zalo has for the person (strangers written to, people met in groups).
+    async fn name_unnamed(&self, client: &ZaloClient) {
+        let cloud = client
+            .session()
+            .map(|s| s.send2me_id.clone())
+            .unwrap_or_default();
+        if !cloud.is_empty() {
+            let id = thread_id(ThreadKind::User, &cloud);
+            if let Ok(Some(_)) = self.store.thread(&id) {
+                if let Err(e) = self.store.name_thread(&id, "Cloud của tôi") {
+                    tracing::error!(error = %e, "cannot name the Cloud");
+                }
+            }
+        }
+        let unnamed: Vec<String> = match self.store.unnamed_users(200) {
+            Ok(list) => list.into_iter().filter(|uid| *uid != cloud).collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "cannot list unnamed chats");
+                return;
+            }
+        };
+        for chunk in unnamed.chunks(50) {
+            if let Err(e) = lookup_people(client, &self.store, chunk).await {
+                tracing::debug!(error = %e, "unnamed chats not looked up");
+                break;
+            }
+        }
+        if !unnamed.is_empty() {
+            tracing::info!(count = unnamed.len(), "unnamed chats looked up");
+            if let Err(e) = self.bus.publish("threads_changed", json!({})) {
+                tracing::error!(error = %e, "cannot publish threads_changed");
+            }
         }
     }
 
@@ -1053,6 +1113,22 @@ impl Connector {
                         .await
                         .map_err(|e| e.to_string());
                     let _ = reply.send(result);
+                });
+            }
+            ZaloCommand::Rename {
+                kind,
+                remote_id,
+                name,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                tokio::spawn(async move {
+                    let _ =
+                        reply.send(rename(&client, &store, &bus, kind, &remote_id, &name).await);
                 });
             }
             ZaloCommand::CreateGroup {
@@ -1633,6 +1709,43 @@ async fn friend_action(
             Ok(json!({ "ok": true }))
         }
     }
+}
+
+/// An alias for a 1-1 chat's other person, or a new name for a group.
+async fn rename(
+    client: &ZaloClient,
+    store: &Store,
+    bus: &EventBus,
+    kind: ThreadKind,
+    remote_id: &str,
+    name: &str,
+) -> Result<Option<Thread>, String> {
+    let name = name.trim();
+    match kind {
+        ThreadKind::User => {
+            client
+                .set_alias(remote_id, name)
+                .await
+                .map_err(friend_error)?;
+            store
+                .set_alias(remote_id, name)
+                .map_err(|e| e.to_string())?;
+        }
+        ThreadKind::Group => {
+            client
+                .rename_group(remote_id, name)
+                .await
+                .map_err(friend_error)?;
+            let id = thread_id(ThreadKind::Group, remote_id);
+            store.name_thread(&id, name).map_err(|e| e.to_string())?;
+        }
+    }
+    if let Err(e) = bus.publish("threads_changed", json!({})) {
+        tracing::error!(error = %e, "cannot publish threads_changed");
+    }
+    store
+        .thread(&thread_id(kind, remote_id))
+        .map_err(|e| e.to_string())
 }
 
 /// Make a group, then store it with the name and picture Zalo gave it.

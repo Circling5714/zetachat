@@ -111,8 +111,24 @@ ALTER TABLE threads ADD COLUMN members INTEGER NOT NULL DEFAULT 0;
 
 const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread, \
     COALESCE((SELECT m.text FROM messages m WHERE m.thread_id = threads.id \
-              ORDER BY m.seq DESC LIMIT 1), ''), members";
-const PERSON_COLUMNS: &str = "uid, name, zalo_name, avatar, friend, updated_at";
+              ORDER BY m.seq DESC LIMIT 1), ''), members, \
+    COALESCE((SELECT p.alias FROM people p \
+              WHERE threads.kind = 'user' AND p.uid = threads.remote_id), '')";
+const PERSON_COLUMNS: &str = "uid, name, zalo_name, avatar, friend, updated_at, alias";
+
+/// Version 8: the names the account gives its contacts.
+const SCHEMA_V8: &str = "ALTER TABLE people ADD COLUMN alias TEXT NOT NULL DEFAULT '';";
+
+/// A 1-1 thread without a name or a picture takes the person's, once known.
+const FILL_USER_THREAD: &str = "
+UPDATE threads SET
+    name = CASE WHEN name = '' THEN COALESCE(
+        (SELECT p.name FROM people p WHERE p.uid = threads.remote_id AND p.name <> ''), '')
+        ELSE name END,
+    avatar = CASE WHEN avatar = '' THEN COALESCE(
+        (SELECT p.avatar FROM people p WHERE p.uid = threads.remote_id AND p.avatar <> ''), '')
+        ELSE avatar END
+WHERE id = ?1 AND kind = 'user' AND (name = '' OR avatar = '')";
 
 /// Most messages a search looks through, newest first.
 const SEARCH_SCAN: i64 = 200_000;
@@ -154,6 +170,7 @@ fn thread_from_row(row: &Row<'_>) -> Result<Thread> {
         unread: row.get(6)?,
         preview: row.get(7)?,
         members: row.get(8)?,
+        alias: row.get(9)?,
     })
 }
 
@@ -165,6 +182,7 @@ fn person_from_row(row: &Row<'_>) -> Result<Person> {
         avatar: row.get(3)?,
         friend: row.get(4)?,
         updated_at: row.get(5)?,
+        alias: row.get(6)?,
     })
 }
 
@@ -393,6 +411,15 @@ fn apply_stored_recalls(conn: &Connection) -> Result<usize> {
     Ok(applied)
 }
 
+fn set_alias_in(conn: &Connection, uid: &str, alias: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO people (uid, alias) VALUES (?1, ?2)
+         ON CONFLICT (uid) DO UPDATE SET alias = excluded.alias",
+        params![uid, alias.trim()],
+    )?;
+    Ok(())
+}
+
 fn upsert_person_in(conn: &Connection, p: &Person, friend: Option<bool>) -> Result<()> {
     conn.execute(
         "INSERT INTO people (uid, name, zalo_name, avatar, friend, updated_at)
@@ -406,6 +433,8 @@ fn upsert_person_in(conn: &Connection, p: &Person, friend: Option<bool>) -> Resu
             updated_at = excluded.updated_at",
         params![p.uid, p.name, p.zalo_name, p.avatar, friend, now_ms()],
     )?;
+    // A 1-1 chat with them that had no name yet takes theirs.
+    conn.execute(FILL_USER_THREAD, params![format!("zalo:u:{}", p.uid)])?;
     Ok(())
 }
 
@@ -504,6 +533,12 @@ impl Store {
             tx.pragma_update(None, "user_version", 7)?;
             tx.commit()?;
         }
+        if version < 8 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V8)?;
+            tx.pragma_update(None, "user_version", 8)?;
+            tx.commit()?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -516,7 +551,8 @@ impl Store {
     /// Create a thread or refresh it. Empty values never overwrite stored ones; a
     /// stored name is replaced only when `overwrite_name` is set (contact sync).
     pub fn upsert_thread(&self, t: &ThreadUpsert, overwrite_name: bool) -> Result<()> {
-        self.conn().execute(
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO threads (id, kind, remote_id, name, avatar) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (id) DO UPDATE SET
                 name = CASE WHEN excluded.name <> '' AND (?6 OR threads.name = '')
@@ -524,7 +560,44 @@ impl Store {
                 avatar = CASE WHEN excluded.avatar <> '' THEN excluded.avatar ELSE threads.avatar END",
             params![t.id(), t.kind.as_str(), t.remote_id, t.name, t.avatar, overwrite_name],
         )?;
+        conn.execute(FILL_USER_THREAD, params![t.id()])?;
         Ok(())
+    }
+
+    /// Give a 1-1 chat its name for good (the Cloud: "Cloud của tôi").
+    pub fn name_thread(&self, id: &str, name: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE threads SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Other users of 1-1 chats without a name yet, at most `limit`.
+    pub fn unnamed_users(&self, limit: i64) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT remote_id FROM threads WHERE kind = 'user' AND name = ''
+             ORDER BY last_message_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// The aliases as Zalo lists them: these and no others.
+    pub fn set_aliases(&self, aliases: &[(String, String)]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE people SET alias = '' WHERE alias <> ''", [])?;
+        for (uid, alias) in aliases {
+            set_alias_in(&tx, uid, alias)?;
+        }
+        tx.commit()
+    }
+
+    /// Give `uid` an alias (empty: none).
+    pub fn set_alias(&self, uid: &str, alias: &str) -> Result<()> {
+        set_alias_in(&self.conn(), uid, alias)
     }
 
     /// Threads by most recent activity. Without `include_idle`, threads that never
@@ -1427,7 +1500,7 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         // Version 5 added people and group sizes, version 6 message status.
         assert!(s
             .messages("zalo:u:1", None, 10)
@@ -1477,6 +1550,43 @@ mod tests {
         // Touching keeps names.
         s.touch_people(&["3".to_string()], 99).unwrap();
         assert_eq!(s.people(&["3".to_string()]).unwrap()[0].name, "Bố");
+    }
+
+    #[test]
+    fn unnamed_chats_take_the_name_of_the_person_and_aliases_show() {
+        let s = Store::open_in_memory().unwrap();
+        // A chat started with someone not known yet.
+        s.upsert_thread(&user("5", ""), false).unwrap();
+        assert_eq!(s.unnamed_users(10).unwrap(), ["5"]);
+        // Zalo tells who they are: the chat takes their name and picture.
+        s.upsert_person(&person("5", "Ngọc Hân", "https://a/5.jpg"), None)
+            .unwrap();
+        let t = s.thread("zalo:u:5").unwrap().unwrap();
+        assert_eq!(
+            (t.name.as_str(), t.avatar.as_str()),
+            ("Ngọc Hân", "https://a/5.jpg")
+        );
+        assert!(s.unnamed_users(10).unwrap().is_empty());
+        // A chat opened later with a known person is named at once.
+        s.upsert_person(&person("6", "Khoa", ""), None).unwrap();
+        s.upsert_thread(&user("6", ""), false).unwrap();
+        assert_eq!(s.thread("zalo:u:6").unwrap().unwrap().name, "Khoa");
+
+        s.set_aliases(&[
+            ("5".into(), " Hân lớp Văn ".into()),
+            ("7".into(), "Bé".into()),
+        ])
+        .unwrap();
+        assert_eq!(s.thread("zalo:u:5").unwrap().unwrap().alias, "Hân lớp Văn");
+        assert_eq!(s.people(&["7".into()]).unwrap()[0].alias, "Bé");
+        // The list is all there is: older aliases go.
+        s.set_aliases(&[("7".into(), "Bé".into())]).unwrap();
+        assert_eq!(s.thread("zalo:u:5").unwrap().unwrap().alias, "");
+        s.set_alias("5", "Hân").unwrap();
+        assert_eq!(s.thread("zalo:u:5").unwrap().unwrap().alias, "Hân");
+        // Named for good, whatever came before.
+        s.name_thread("zalo:u:6", "Cloud của tôi").unwrap();
+        assert_eq!(s.thread("zalo:u:6").unwrap().unwrap().name, "Cloud của tôi");
     }
 
     #[test]

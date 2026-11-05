@@ -229,6 +229,19 @@ fn fake_connector(
                         .unwrap();
                     let _ = reply.send(Ok(message));
                 }
+                ZaloCommand::Rename {
+                    kind,
+                    remote_id,
+                    name,
+                    reply,
+                } => {
+                    let id = thread_id(kind, &remote_id);
+                    match kind {
+                        ThreadKind::User => store.set_alias(&remote_id, &name).unwrap(),
+                        ThreadKind::Group => store.name_thread(&id, &name).unwrap(),
+                    }
+                    let _ = reply.send(store.thread(&id).map_err(|e| e.to_string()));
+                }
                 ZaloCommand::CreateGroup {
                     name,
                     members,
@@ -1391,4 +1404,62 @@ async fn groups_need_two_friends_or_more() {
     assert_eq!(made["thread"]["id"], "zalo:g:777");
     assert_eq!(made["thread"]["name"], "Đi phượt");
     assert_eq!(made["thread"]["members"], 3);
+}
+
+#[tokio::test]
+async fn chats_are_renamed_by_alias_or_group_name() {
+    let f = fixture();
+    for (kind, remote, name) in [
+        (ThreadKind::User, "80", "Hân"),
+        (ThreadKind::Group, "81", "Nhà"),
+    ] {
+        f.store
+            .upsert_thread(
+                &ThreadUpsert {
+                    kind,
+                    remote_id: remote.into(),
+                    name: name.into(),
+                    avatar: String::new(),
+                },
+                true,
+            )
+            .unwrap();
+    }
+    let user = thread_id(ThreadKind::User, "80");
+    let rename = |id: &str| format!("/api/v1/threads/{id}/name");
+    let (status, t) = call(
+        &f,
+        "PUT",
+        &rename(&user),
+        Some(json!({ "name": " Hân lớp Văn " })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{t}");
+    assert_eq!(
+        (t["name"].as_str(), t["alias"].as_str()),
+        (Some("Hân"), Some("Hân lớp Văn"))
+    );
+    // Empty: the alias goes, the name stays.
+    let (_, t) = call(&f, "PUT", &rename(&user), Some(json!({ "name": "" })), true).await;
+    assert_eq!(t["alias"], "");
+    let group = thread_id(ThreadKind::Group, "81");
+    let (status, _) = call(
+        &f,
+        "PUT",
+        &rename(&group),
+        Some(json!({ "name": "  " })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, t) = call(
+        &f,
+        "PUT",
+        &rename(&group),
+        Some(json!({ "name": "Nhà mình" })),
+        true,
+    )
+    .await;
+    assert_eq!(t["name"], "Nhà mình");
 }

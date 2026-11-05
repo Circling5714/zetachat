@@ -159,6 +159,14 @@ Nhận: tin có trường `mentions: [{ uid, pos, len, type }]` (kiểu `TMessag
 
 `POST {group}/api/group/create/v2`, tham số đã mã hóa nằm trên URL (`params`), thân để trống, như zca-js `createGroup`: `clientId`, `gname` (tên, hoặc thời điểm tạo khi để Zalo tự đặt), `gdesc: null`, `members`, `membersTypes` (-1 cho mỗi người), `nameChanged` (1 khi có tên), `createLink: 1`, `clientLang`, `imei`, `zsource: 601`. Kết quả gồm `groupId`, `sucessMembers` (Zalo viết sai chính tả như vậy) và `errorMembers`. Gateway hỏi lại `getmg-v2` để lấy tên và ảnh Zalo đặt. Chưa thử, vì tạo nhóm sẽ thêm người thật vào.
 
+## 8m. Tên gợi nhớ, tên của người lạ, đổi tên nhóm
+
+Tên gợi nhớ nằm ở dịch vụ `alias` (`tt-alias-wpa.api.zaloapp.com` trong bảng dịch vụ), theo zca-js: `GET /api/alias/list` với `{ page, count, imei }` trả về `{ items: [{ userId, alias }], updateTime }`; `GET /api/alias/update` với `{ friendId, alias, imei }`; `GET /api/alias/remove` với `{ friendId }`. Đã kiểm chứng: danh sách đọc được 2 tên đặt từ điện thoại; đặt rồi bỏ một tên đều thành công, số tên quay về như cũ. Gateway đọc lại danh sách mỗi khi phiên khởi động.
+
+Chat 1-1 với người chưa kết bạn không có tên trong danh sách bạn bè. Gateway lấy tên và ảnh của họ qua `social/group/members` (mục 8e), và đặt tên "Cloud của tôi" cho hội thoại `send2me_id`. Đã kiểm chứng: cả 7 chat 1-1 của tài khoản thử đều có tên.
+
+Đổi tên nhóm: `POST {group}/api/group/updateinfo` với `{ grid, gname, imei }` (zca-js `changeGroupName`). Chưa thử, vì mọi thành viên sẽ thấy tên mới.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

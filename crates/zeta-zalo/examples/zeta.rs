@@ -30,6 +30,7 @@ Cách dùng:
   zeta people  <session.json>                    hỏi tên, ảnh của thành viên nhóm không phải bạn bè (chỉ in số đếm)
   zeta stickers <session.json> [packs | pack <id> | search <từ khóa>]   kho nhãn dán của Zalo
   zeta friend  <session.json> [requests | status [uid] | find <số>]     lời mời kết bạn, quan hệ, tìm theo số (chỉ đọc)
+  zeta aliases <session.json>                    đếm tên gợi nhớ tài khoản đã đặt
   zeta forward <session.json> user|group <id> <msgType> <msgInfo JSON | @tệp>   chuyển tiếp qua mforward
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
@@ -58,6 +59,7 @@ async fn main() -> Result<()> {
         Some("friend") => friend(rest).await,
         Some("forward") => forward(rest).await,
         Some("presence") => presence(rest).await,
+        Some("aliases") => aliases(rest).await,
         Some("recent") => recent(rest).await,
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
@@ -168,6 +170,16 @@ async fn groups(args: &[String]) -> Result<()> {
             println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
         }
     }
+    Ok(())
+}
+
+/// How many contacts have a name given by the account ("tên gợi nhớ").
+async fn aliases(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let list = client.aliases().await?;
+    let friends: Vec<String> = client.friends().await?.into_iter().map(|f| f.uid).collect();
+    let of_friends = list.iter().filter(|(uid, _)| friends.contains(uid)).count();
+    println!("{} tên gợi nhớ ({of_friends} cho bạn bè)", list.len());
     Ok(())
 }
 
@@ -391,6 +403,7 @@ async fn probe(args: &[String]) -> Result<()> {
         "sticker" => Service::Sticker,
         "group_cloud_message" => Service::GroupCloudMessage,
         "reaction" => Service::Reaction,
+        "alias" => Service::Alias,
         other => bail!("dịch vụ không hỗ trợ: {other}"),
     };
     let mut params: serde_json::Value =

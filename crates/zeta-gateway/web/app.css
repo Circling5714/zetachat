@@ -286,6 +286,22 @@ a.btn { display: inline-block; text-decoration: none; }
 }
 .info-avatar { width: 72px; height: 72px; font-size: 26px; }
 .info-name { font-weight: 700; font-size: 17px; overflow-wrap: anywhere; }
+.info-name-row { display: flex; align-items: center; gap: 6px; }
+.icon-mini {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--hover);
+  color: var(--muted);
+}
+.icon-mini:hover { color: var(--primary); }
+.rename-card { width: min(380px, 100%); display: grid; gap: 10px; }
+.rename-card h2 { margin: 0; text-align: center; }
+.rename-card p { margin: 0; }
 .info-section { padding: 12px 12px 14px; border-bottom: 6px solid var(--bg); }
 .info-section-title { margin: 0 4px 8px; font-size: 15px; }
 .member-list, .shared-list { list-style: none; margin: 0; padding: 0; }

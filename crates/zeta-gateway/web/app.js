@@ -56,6 +56,7 @@ function hue(id) {
 }
 
 function threadName(t) {
+  if (t.alias) return t.alias;
   if (t.name) return t.name;
   return t.kind === 'group' ? `Nhóm ${t.remote_id}` : `Người dùng ${t.remote_id}`;
 }
@@ -105,7 +106,13 @@ function avatar(t) {
 }
 
 function personName(p) {
-  return (p && (p.name || p.zalo_name)) || '';
+  return (p && (p.alias || p.name || p.zalo_name)) || '';
+}
+
+/** Who sent a group message: the account's name for them first. */
+function senderLabel(m) {
+  const p = state.people.get(m.sender_id);
+  return (p && p.alias) || m.sender_name || personName(p);
 }
 
 function sameDay(a, b) {
@@ -365,7 +372,7 @@ function hitRow(m) {
   const body = el('div', 'body');
   let who = '';
   if (m.outgoing) who = 'Bạn';
-  else if (t.kind === 'group') who = m.sender_name || personName(state.people.get(m.sender_id));
+  else if (t.kind === 'group') who = senderLabel(m);
   body.append(el('div', 'name', threadName(t)), el('div', 'preview', who ? `${who}: ${m.text}` : m.text));
   const meta = el('div', 'meta');
   meta.append(el('span', null, fmtListTime(m.sent_at)));
@@ -443,6 +450,75 @@ async function answerRequest(uid, accept) {
   renderThreads();
   return true;
 }
+
+// ------------------------------------------------------------ renaming
+//
+// A 1-1 chat gets a "tên gợi nhớ" (kept by Zalo, on all the account's
+// devices, seen only by this account); a group gets a new name for everyone.
+
+let renaming = null;
+
+function openRename(id) {
+  const t = state.threads.get(id);
+  if (!t) return;
+  renaming = id;
+  const group = t.kind === 'group';
+  $('rename-title').textContent = group ? 'Đổi tên nhóm' : 'Đặt tên gợi nhớ';
+  $('rename-note').textContent = group
+    ? 'Mọi thành viên trong nhóm sẽ thấy tên mới.'
+    : `Chỉ bạn thấy tên này, trên mọi thiết bị của tài khoản. Để trống để dùng lại tên ${t.name || 'Zalo của họ'}.`;
+  const input = $('rename-input');
+  input.value = group ? threadName(t) : t.alias || '';
+  input.placeholder = group ? 'Tên nhóm' : t.name || 'Tên gợi nhớ';
+  $('rename').hidden = false;
+  input.focus();
+  input.select();
+}
+
+function closeRename() {
+  $('rename').hidden = true;
+  renaming = null;
+}
+
+/** The open conversation's name at the top, after it changed. */
+function renderChatHead() {
+  const t = state.threads.get(state.current);
+  if (t) $('chat-name').textContent = threadName(t);
+}
+
+$('rename-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const id = renaming;
+  const t = state.threads.get(id);
+  if (!t) return;
+  const name = $('rename-input').value.trim();
+  if (t.kind === 'group' && !name) {
+    toast('Tên nhóm không được để trống');
+    return;
+  }
+  $('rename-save').disabled = true;
+  try {
+    const updated = await api(`/threads/${encodeURIComponent(id)}/name`, { method: 'PUT', json: { name } });
+    state.threads.set(id, Object.assign(t, updated));
+    if (t.kind === 'user') {
+      const p = state.people.get(t.remote_id);
+      if (p) p.alias = updated.alias || '';
+    }
+    closeRename();
+    renderThreads();
+    renderChatHead();
+    if (info.thread === id) renderInfo();
+    toast(t.kind === 'group' ? 'Đã đổi tên nhóm' : name ? 'Đã đặt tên gợi nhớ' : 'Đã bỏ tên gợi nhớ');
+  } catch (err) {
+    handleError(err, 'Không đổi được tên: ');
+  } finally {
+    $('rename-save').disabled = false;
+  }
+});
+$('rename-cancel').addEventListener('click', closeRename);
+$('rename').addEventListener('click', (e) => {
+  if (e.target === $('rename')) closeRename();
+});
 
 // ------------------------------------------------------------ new groups
 
@@ -676,6 +752,7 @@ async function loadThreads() {
   const list = await api('/threads?all=true&limit=1000');
   state.threads = new Map(list.map((t) => [t.id, t]));
   renderThreads();
+  renderChatHead();
 }
 
 for (const tab of document.querySelectorAll('.tab')) {
@@ -1002,7 +1079,7 @@ function appendText(parent, text) {
 function senderAvatar(m, t) {
   if (t && t.kind === 'user') return avatar(t);
   const p = state.people.get(m.sender_id);
-  const name = m.sender_name || personName(p);
+  const name = senderLabel(m);
   const box = avatarBox(`zalo:u:${m.sender_id}`, name, p && p.avatar);
   box.dataset.uid = m.sender_id;
   box.title = name;
@@ -1025,7 +1102,7 @@ function messageNode(m, prev, t) {
   bubble.dataset.seq = String(m.seq);
   const newSender = !prev || prev.outgoing || prev.sender_id !== m.sender_id || !sameDay(prev.sent_at, m.sent_at);
   if (isGroup && !m.outgoing && newSender) {
-    bubble.appendChild(el('div', 'sender', m.sender_name || personName(state.people.get(m.sender_id)) || 'Thành viên'));
+    bubble.appendChild(el('div', 'sender', senderLabel(m) || 'Thành viên'));
   }
   if (m.quote && !recalled) {
     const quote = el('div', 'quote');
@@ -1168,7 +1245,8 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  if (!$('forward').hidden) closeForward();
+  if (!$('rename').hidden) closeRename();
+  else if (!$('forward').hidden) closeForward();
   else if (!$('new-group').hidden) closeNewGroup();
   else if (!$('add-friend').hidden) closeAddFriend();
   else if (picker) closePicker();
@@ -1615,8 +1693,17 @@ function renderInfo() {
   const profile = el('div', 'info-profile');
   const picture = avatar(t);
   picture.classList.add('info-avatar');
-  profile.append(picture, el('div', 'info-name', threadName(t)));
+  const nameRow = el('div', 'info-name-row');
+  const edit = el('button', 'icon-mini');
+  edit.type = 'button';
+  edit.title = t.kind === 'group' ? 'Đổi tên nhóm' : 'Đặt tên gợi nhớ';
+  edit.setAttribute('aria-label', edit.title);
+  edit.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 20h4l10.5-10.5a2.1 2.1 0 0 0-3-3L5 17v3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>';
+  edit.addEventListener('click', () => openRename(t.id));
+  nameRow.append(el('div', 'info-name', threadName(t)), edit);
+  profile.append(picture, nameRow);
   if (t.kind === 'group') profile.append(el('div', 'muted small', membersText(t)));
+  else if (t.alias && t.name && t.alias !== t.name) profile.append(el('div', 'muted small', `Tên Zalo: ${t.name}`));
   box.append(head, profile);
   if (t.kind === 'group') box.append(membersSection());
   box.append(sharedMediaSection(), sharedListSection('file', 'Tệp', 'Chưa có tệp nào.'), sharedListSection('link', 'Liên kết', 'Chưa có liên kết nào.'));

@@ -30,10 +30,12 @@ pub enum Service {
     GroupCloudMessage,
     /// Reactions to messages.
     Reaction,
+    /// Names the account gives its contacts ("tên gợi nhớ").
+    Alias,
 }
 
 /// Services that `zpw_service_map_v3` can list.
-const MAPPED_SERVICES: [Service; 9] = [
+const MAPPED_SERVICES: [Service; 10] = [
     Service::Chat,
     Service::Conversation,
     Service::Friend,
@@ -43,6 +45,7 @@ const MAPPED_SERVICES: [Service; 9] = [
     Service::Sticker,
     Service::GroupCloudMessage,
     Service::Reaction,
+    Service::Alias,
 ];
 
 impl Service {
@@ -60,6 +63,7 @@ impl Service {
             Self::Sticker => "sticker",
             Self::GroupCloudMessage => "group_cloud_message",
             Self::Reaction => "reaction",
+            Self::Alias => "alias",
         }
     }
 }
@@ -80,6 +84,9 @@ pub struct Domains {
     /// Sessions saved before reactions existed lack it.
     #[serde(default = "default_reaction_host")]
     pub reaction: String,
+    /// Sessions saved before aliases existed lack it.
+    #[serde(default = "default_alias_host")]
+    pub alias: String,
     /// `zpw_chts_new[0]`: HTTP long-polling for messages.
     pub lp_chat: String,
     /// `zpw_ctrs_new[0]`: HTTP long-polling for control events.
@@ -105,6 +112,7 @@ impl Default for Domains {
             sticker: "https://tt-sticker-wpa.chat.zalo.me".into(),
             group_cloud_message: "https://tt-group-cm.api.zaloapp.com".into(),
             reaction: default_reaction_host(),
+            alias: default_alias_host(),
             lp_chat: "https://p4-msg-chat.zaloapp.com".into(),
             lp_control: "https://p4-ctl-chat.zaloapp.com".into(),
             ws: (1..=8)
@@ -117,6 +125,11 @@ impl Default for Domains {
 
 fn default_reaction_host() -> String {
     "https://reaction.api.zaloapp.com".into()
+}
+
+/// Seen live in `zpw_service_map_v3` (November 2026).
+fn default_alias_host() -> String {
+    "https://tt-alias-wpa.api.zaloapp.com".into()
 }
 
 /// URLs of a service-map entry, which can be a string or an array of strings.
@@ -154,6 +167,7 @@ impl Domains {
             Service::Sticker => &self.sticker,
             Service::GroupCloudMessage => &self.group_cloud_message,
             Service::Reaction => &self.reaction,
+            Service::Alias => &self.alias,
         }
     }
 

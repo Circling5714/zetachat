@@ -70,6 +70,9 @@ pub struct Thread {
     pub preview: String,
     /// Members of a group, 0 when unknown (and for 1-1 chats).
     pub members: i64,
+    /// For a 1-1 chat, the name the account gave the other person ("tên gợi
+    /// nhớ"); clients show it instead of `name` when set.
+    pub alias: String,
 }
 
 /// How long what Zalo said about a user is trusted before asking again (ms).
@@ -107,6 +110,9 @@ pub struct Person {
     pub friend: bool,
     /// When Zalo last told about them (ms); 0 for never.
     pub updated_at: i64,
+    /// The name the account gave them ("tên gợi nhớ"), shown instead of
+    /// theirs when set.
+    pub alias: String,
 }
 
 /// Create-or-update input for a thread.

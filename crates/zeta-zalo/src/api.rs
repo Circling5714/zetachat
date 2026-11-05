@@ -441,6 +441,25 @@ impl ZaloClient {
         created_group_of(&data)
     }
 
+    /// Rename a group, for all its members (zca-js `changeGroupName`:
+    /// `POST {group}/api/group/updateinfo` with `{ grid, gname, imei }`).
+    pub async fn rename_group(&self, grid: &str, name: &str) -> Result<()> {
+        let key = self.session_key()?;
+        let params = self.encrypt_params(&json!({
+            "grid": grid,
+            "gname": name.trim(),
+            "imei": self.device().imei,
+        }))?;
+        let url = format!(
+            "{}/api/group/updateinfo?{}",
+            self.domains().primary(Service::Group),
+            Self::common_params()
+        );
+        self.post_form(&url, format!("params={params}"), Some(key))
+            .await?;
+        Ok(())
+    }
+
     /// Details of the groups `ids` (`getmg-v2`, 50 at a time): name, avatar,
     /// size, members, creator, admins. A version of 0 makes Zalo answer for
     /// every group asked.

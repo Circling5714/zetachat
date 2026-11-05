@@ -294,6 +294,8 @@ fn seed_people(store: &Store) {
         }
     }
     let _ = store.set_friends(&friends);
+    // A name the account gave a friend.
+    let _ = store.set_aliases(&[("1003".into(), "Nam (đồng nghiệp)".into())]);
 }
 
 /// One sample message.
@@ -925,6 +927,20 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 // Nothing to delete elsewhere in the demo.
                 ZaloCommand::DeleteForMe { reply, .. } => {
                     let _ = reply.send(Ok(()));
+                }
+                ZaloCommand::Rename {
+                    kind,
+                    remote_id,
+                    name,
+                    reply,
+                } => {
+                    let id = thread_id(kind, &remote_id);
+                    let _ = match kind {
+                        ThreadKind::User => store.set_alias(&remote_id, &name),
+                        ThreadKind::Group => store.name_thread(&id, name.trim()),
+                    };
+                    let _ = bus.publish("threads_changed", json!({}));
+                    let _ = reply.send(store.thread(&id).map_err(|e| e.to_string()));
                 }
                 ZaloCommand::CreateGroup {
                     name,

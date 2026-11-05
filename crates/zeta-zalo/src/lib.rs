@@ -9,6 +9,7 @@
 //! Behaviour that differs on purpose is documented where it happens and in
 //! `docs/GIAO_THUC.md`.
 
+pub mod alias;
 pub mod api;
 pub mod client;
 pub mod crypto;

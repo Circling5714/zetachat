@@ -16,7 +16,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
@@ -142,6 +142,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/threads/{id}/presence", get(presence))
         .route("/api/v1/users/find", get(find_user))
         .route("/api/v1/groups", post(create_group))
+        .route("/api/v1/threads/{id}/name", put(rename_thread))
         .route(
             "/api/v1/friends/requests",
             get(friend_requests).post(send_friend_request),
@@ -417,6 +418,46 @@ fn valid_uid(uid: &str) -> Result<String, ApiError> {
         return Err(ApiError::bad_request("invalid user id"));
     }
     Ok(uid.to_string())
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    #[serde(default)]
+    name: String,
+}
+
+/// Rename a conversation: for a 1-1 chat, the name the account gives the other
+/// person ("tên gợi nhớ", kept by Zalo and shown on the account's devices;
+/// empty removes it); for a group, its name for every member (not empty).
+/// Answers with the thread as stored.
+async fn rename_thread(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> ApiResult<Thread> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let name: String = body.name.trim().chars().take(100).collect();
+    if kind == ThreadKind::Group && name.is_empty() {
+        return Err(ApiError::bad_request("tên nhóm không được để trống"));
+    }
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Rename {
+            kind,
+            remote_id: remote_id.to_string(),
+            name,
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("thread"))
 }
 
 #[derive(Deserialize)]
