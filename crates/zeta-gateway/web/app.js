@@ -1324,6 +1324,7 @@ async function openThread(id, focusSeq) {
   head.id = 'chat-avatar';
   $('chat-avatar').replaceWith(head);
   $('chat-name').textContent = threadName(t);
+  if (presence.thread !== t.id) watchPresence(t);
   renderChatSub();
   $('messages').replaceChildren();
   renderThreads();
@@ -1393,6 +1394,7 @@ async function markRead(id) {
 
 $('back').addEventListener('click', () => {
   closeInfo();
+  stopPresence();
   $('app').classList.remove('show-chat');
   state.current = null;
   renderThreads();
@@ -1648,14 +1650,61 @@ function typingText(t, typing) {
   return 'Đang soạn tin…';
 }
 
+// When the other side of a 1-1 chat was last on Zalo, asked again every minute.
+const presence = { thread: null, seen: null, timer: 0 };
+
+/** "Vừa truy cập", "Truy cập 5 phút trước"… as Zalo words it; empty if hidden. */
+function presenceText(seen) {
+  if (!seen || !seen.visible || !seen.at) return '';
+  const secs = Math.max(0, Date.now() - seen.at) / 1000;
+  if (secs <= 300) return 'Vừa truy cập';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `Truy cập ${mins} phút trước`;
+  const hours = Math.floor(secs / 3600);
+  if (hours < 24) return `Truy cập ${hours} giờ trước`;
+  const days = Math.floor(secs / 86400);
+  return days <= 7 ? `Truy cập ${days} ngày trước` : 'Truy cập hơn một tuần trước';
+}
+
+function stopPresence() {
+  clearInterval(presence.timer);
+  presence.thread = null;
+  presence.seen = null;
+}
+
+function watchPresence(t) {
+  stopPresence();
+  if (t.kind !== 'user') return;
+  const id = t.id;
+  presence.thread = id;
+  const ask = async () => {
+    try {
+      const seen = await api(`/threads/${encodeURIComponent(id)}/presence`);
+      if (presence.thread !== id) return;
+      presence.seen = seen;
+    } catch {
+      // A nicety: without it the line stays empty.
+    }
+    if (presence.thread === id) renderChatSub();
+  };
+  ask();
+  presence.timer = setInterval(() => {
+    if (document.visibilityState === 'visible') ask();
+  }, 60000);
+}
+
 /** The line under the open conversation's name. */
 function renderChatSub() {
   const t = state.threads.get(state.current);
   const sub = $('chat-sub');
   if (!t) return;
   const typing = state.typing.get(t.id);
+  const seen = presence.thread === t.id ? presence.seen : null;
+  const text = presenceText(seen);
   sub.classList.toggle('typing', Boolean(typing));
-  sub.textContent = typing ? typingText(t, typing) : t.kind === 'group' ? membersText(t) : '';
+  sub.classList.toggle('online', !typing && text === 'Vừa truy cập');
+  if (typing) sub.textContent = typingText(t, typing);
+  else sub.textContent = t.kind === 'group' ? membersText(t) : text;
 }
 
 function stopTyping(threadId) {

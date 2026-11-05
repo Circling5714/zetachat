@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
+use zeta_zalo::api::LastOnline;
 use zeta_zalo::sticker::Sticker;
 
 use crate::auth::AuthDevice;
@@ -138,6 +139,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stickers/search", get(search_stickers))
         .route("/api/v1/threads/{id}/stickers", post(send_sticker))
         .route("/api/v1/threads/{id}/members", get(group_members))
+        .route("/api/v1/threads/{id}/presence", get(presence))
         .route("/api/v1/users/find", get(find_user))
         .route(
             "/api/v1/friends/requests",
@@ -476,6 +478,32 @@ async fn reject_friend_request(
     Path(uid): Path<String>,
 ) -> ApiResult<Value> {
     friends_side(&st, FriendAction::Reject(valid_uid(&uid)?)).await
+}
+
+/// When the other side of a 1-1 chat was last on Zalo: `{ visible, at }`,
+/// `at` in milliseconds and 0 when they hide it. `404` for groups.
+async fn presence(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+) -> ApiResult<LastOnline> {
+    let Some((ThreadKind::User, uid)) = split_thread_id(&id) else {
+        return Err(ApiError::not_found("user"));
+    };
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::LastOnline {
+            uid: uid.to_string(),
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let seen = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(seen))
 }
 
 #[derive(Deserialize)]

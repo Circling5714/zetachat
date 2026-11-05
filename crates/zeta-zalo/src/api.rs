@@ -25,6 +25,44 @@ pub struct Friend {
     pub avatar: String,
 }
 
+/// When a user was last on Zalo, as far as they let others see.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastOnline {
+    /// They show when they are online (a privacy setting).
+    pub visible: bool,
+    /// Milliseconds since the epoch; 0 when unknown or hidden.
+    pub at: i64,
+}
+
+/// `lastOnline` answers: `{ settings: { show_online_status }, lastOnline }`,
+/// the time in seconds or milliseconds.
+fn last_online_of(data: &Value) -> LastOnline {
+    let visible = data
+        .pointer("/settings/show_online_status")
+        .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
+        .unwrap_or(true);
+    let raw = match data.get("lastOnline") {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    };
+    tracing::debug!(
+        visible,
+        sign = raw.signum(),
+        digits = raw.unsigned_abs().to_string().len(),
+        "last online answer"
+    );
+    let at = match raw {
+        r if r <= 0 || !visible => 0,
+        r if r < 10_000_000_000 => r * 1000,
+        r => r,
+    };
+    LastOnline { visible, at }
+}
+
 /// Verdict of [`ZaloClient::check_session`].
 #[derive(Clone, Debug)]
 pub enum SessionHealth {
@@ -281,6 +319,23 @@ impl ZaloClient {
         Ok(profiles_of(&data))
     }
 
+    /// When `uid` was last on Zalo (`profile/lastOnline`, as zca-js), unless
+    /// they hide it.
+    pub async fn last_online(&self, uid: &str) -> Result<LastOnline> {
+        let key = self.session_key()?;
+        let params = self.encrypt_params(&json!({
+            "uid": uid,
+            "conv_type": 1,
+            "imei": self.device().imei,
+        }))?;
+        let path = format!(
+            "/api/social/profile/lastOnline?{}&params={params}",
+            Self::common_params()
+        );
+        let data = unwrap_json_string(self.get_service(Service::Profile, &path, Some(key)).await?);
+        Ok(last_online_of(inner_data(&data)))
+    }
+
     /// Ids of the groups the account belongs to (`getlg/v4`).
     pub async fn group_ids(&self) -> Result<Vec<String>> {
         let key = self.session_key()?;
@@ -511,6 +566,39 @@ mod tests {
             ("9", "Z", "u")
         );
         assert!(Friend::from_value(&json!({ "displayName": "nobody" })).is_none());
+    }
+
+    #[test]
+    fn last_online_in_seconds_or_milliseconds() {
+        let seen = |v: Value| last_online_of(&v);
+        assert_eq!(
+            seen(
+                json!({ "settings": { "show_online_status": true }, "lastOnline": 1_700_000_000 })
+            ),
+            LastOnline {
+                visible: true,
+                at: 1_700_000_000_000
+            }
+        );
+        assert_eq!(
+            seen(json!({ "lastOnline": "1700000000123" })).at,
+            1_700_000_000_123
+        );
+        // Hidden: no time, even if one came.
+        assert_eq!(
+            seen(json!({ "settings": { "show_online_status": false }, "lastOnline": 5 })),
+            LastOnline {
+                visible: false,
+                at: 0
+            }
+        );
+        assert_eq!(
+            seen(json!({})),
+            LastOnline {
+                visible: true,
+                at: 0
+            }
+        );
     }
 
     #[test]

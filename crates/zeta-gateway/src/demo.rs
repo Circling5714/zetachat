@@ -899,6 +899,27 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 ZaloCommand::DeleteForMe { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
+                // Lan Anh is around, Minh Tuấn was a while ago, Hoàng Nam hides it.
+                ZaloCommand::LastOnline { uid, reply } => {
+                    let minutes = match uid.as_str() {
+                        "1001" => 2,
+                        "1002" => 180,
+                        "1003" => -1,
+                        _ => 26 * 60,
+                    };
+                    let seen = if minutes < 0 {
+                        zeta_zalo::api::LastOnline {
+                            visible: false,
+                            at: 0,
+                        }
+                    } else {
+                        zeta_zalo::api::LastOnline {
+                            visible: true,
+                            at: now_ms() - minutes * 60_000,
+                        }
+                    };
+                    let _ = reply.send(Ok(seen));
+                }
                 ZaloCommand::Friends { action, reply } => {
                     let _ = reply.send(Ok(demo_friends(&store, &bus, action, &mut answered)));
                 }

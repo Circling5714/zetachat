@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Semaphore};
-use zeta_zalo::api::{Recipient, SessionHealth};
+use zeta_zalo::api::{LastOnline, Recipient, SessionHealth};
 use zeta_zalo::message::QuotedMessage;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::sticker::Sticker;
@@ -189,6 +189,11 @@ pub enum ZaloCommand {
         owner_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// When a user was last on Zalo (asked at most once a minute per user).
+    LastOnline {
+        uid: String,
+        reply: oneshot::Sender<Result<LastOnline, String>>,
+    },
     /// Who is in a group, asked of Zalo now.
     GroupMembers {
         group_id: String,
@@ -363,6 +368,13 @@ pub struct ZaloConfig {
     pub typing: bool,
 }
 
+/// How long a user's last-seen time is kept before asking Zalo again.
+const PRESENCE_FRESH: Duration = Duration::from_secs(60);
+
+/// Last-seen times asked lately, per user.
+type PresenceCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, LastOnline)>>>;
+
 /// Typing is told to Zalo at most this often per thread; Zalo shows it for a
 /// few seconds each time.
 const TYPING_EVERY: Duration = Duration::from_secs(4);
@@ -385,6 +397,7 @@ pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
         attachment_turns: Arc::new(Semaphore::new(1)),
         typing_sent: std::collections::HashMap::new(),
         stickers: Arc::default(),
+        presence: Arc::default(),
     };
     tokio::spawn(connector.run(rx));
     handle
@@ -525,6 +538,7 @@ struct Connector {
     /// When typing was last told to Zalo, per thread.
     typing_sent: std::collections::HashMap<String, std::time::Instant>,
     stickers: Arc<StickerCache>,
+    presence: PresenceCache,
 }
 
 async fn next_realtime(
@@ -1020,6 +1034,36 @@ impl Connector {
                         )
                         .await
                         .map_err(|e| e.to_string());
+                    let _ = reply.send(result);
+                });
+            }
+            ZaloCommand::LastOnline { uid, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let presence = self.presence.clone();
+                tokio::spawn(async move {
+                    let kept = presence
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&uid)
+                        .filter(|(at, _)| at.elapsed() < PRESENCE_FRESH)
+                        .map(|(_, seen)| *seen);
+                    let result = match kept {
+                        Some(seen) => Ok(seen),
+                        None => match client.last_online(&uid).await {
+                            Ok(seen) => {
+                                let mut map = presence.lock().unwrap_or_else(|e| e.into_inner());
+                                if map.len() > 500 {
+                                    map.clear();
+                                }
+                                map.insert(uid, (std::time::Instant::now(), seen));
+                                Ok(seen)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        },
+                    };
                     let _ = reply.send(result);
                 });
             }

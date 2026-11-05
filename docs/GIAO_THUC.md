@@ -139,6 +139,10 @@ Chuyển tiếp: `POST {file}/api/message/mforward` (nhóm: `{file}/api/group/mf
 
 Xóa ở phía mình: `POST {chat}/api/message/delete` (nhóm: `{group}/api/group/deletemsg`) với `toid` hoặc `grid`, `cliMsgId` mới, `msgs: [{ cliMsgId, globalMsgId, ownerId, destId }]`, `onlyMe: 1`; chat 1-1 thêm `imei`. Đã thử trong Cloud: Zalo nhận, tin không quay lại.
 
+## 8i. Lần truy cập cuối (gọi được, chưa thấy thời gian thật)
+
+`GET {profile}/api/social/profile/lastOnline` với `{ uid, conv_type: 1, imei }`, như zca-js, trả về `{ lastOnline, settings: { show_online_status } }`. `lastOnline` có thể là giây hoặc mili giây (ctdozlite xử lý cả hai). Đã gọi cho cả 5 người bạn của tài khoản thử: đúng cấu trúc trên, 2 người cho hiện trạng thái, nhưng `lastOnline` của mọi người đều bằng 0. Có lẽ vì chính tài khoản thử đang tắt "Hiện trạng thái truy cập": Zalo thường không cho người đã tắt xem trạng thái của người khác.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

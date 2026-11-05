@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         Some("stickers") => stickers(rest).await,
         Some("friend") => friend(rest).await,
         Some("forward") => forward(rest).await,
+        Some("presence") => presence(rest).await,
         Some("recent") => recent(rest).await,
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
@@ -166,6 +167,26 @@ async fn groups(args: &[String]) -> Result<()> {
         for g in &list {
             println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
         }
+    }
+    Ok(())
+}
+
+/// When each friend was last on Zalo, described coarsely (hidden or not, how
+/// old), never the time itself.
+async fn presence(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    for f in client.friends().await? {
+        let seen = client.last_online(&f.uid).await?;
+        let age = match seen.at {
+            0 => "không có".to_string(),
+            at if now - at < 3_600_000 => "trong giờ qua".into(),
+            at if now - at < 86_400_000 => "trong ngày".into(),
+            _ => "lâu hơn một ngày".into(),
+        };
+        println!("hiện trạng thái: {}, lần cuối: {age}", seen.visible);
     }
     Ok(())
 }

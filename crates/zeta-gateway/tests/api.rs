@@ -228,6 +228,10 @@ fn fake_connector(
                         .unwrap();
                     let _ = reply.send(Ok(message));
                 }
+                ZaloCommand::LastOnline { uid, reply } => {
+                    let at = uid.parse::<i64>().unwrap_or(0);
+                    let _ = reply.send(Ok(zeta_zalo::api::LastOnline { visible: true, at }));
+                }
                 ZaloCommand::DeleteForMe {
                     message_id,
                     owner_id,
@@ -1264,4 +1268,30 @@ async fn messages_are_forwarded_and_deleted_for_me() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(f.deleted.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn presence_of_1_1_chats_only() {
+    let f = fixture();
+    let user = thread_id(ThreadKind::User, "1234");
+    let (status, body) = call(
+        &f,
+        "GET",
+        &format!("/api/v1/threads/{user}/presence"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "visible": true, "at": 1234 }));
+    let group = thread_id(ThreadKind::Group, "1234");
+    let (status, _) = call(
+        &f,
+        "GET",
+        &format!("/api/v1/threads/{group}/presence"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
