@@ -25,16 +25,20 @@
   <div id="app" class="layout" hidden>
     <aside class="sidebar">
       <header class="side-head">
-        <span class="brand">zetachat</span>
+        <div class="who">
+          <div id="me-avatar" class="avatar me-avatar"></div>
+          <span class="brand">zetachat</span>
+        </div>
         <button id="zalo-status" class="status-pill" type="button"></button>
       </header>
       <div class="search-wrap">
-        <input id="search" class="field" type="search" placeholder="Tìm hội thoại" autocomplete="off">
+        <input id="search" class="field" type="search" placeholder="Tìm bạn bè, nhóm, tin nhắn" autocomplete="off">
       </div>
       <div class="tabs" role="tablist">
         <button class="tab active" data-filter="all" type="button">Tất cả</button>
         <button class="tab" data-filter="unread" type="button">Chưa đọc</button>
-        <button class="tab" data-filter="contacts" type="button">Danh bạ</button>
+        <button class="tab" data-filter="friends" type="button">Bạn bè</button>
+        <button class="tab" data-filter="groups" type="button">Nhóm</button>
       </div>
       <ul id="threads" class="threads"></ul>
     </aside>

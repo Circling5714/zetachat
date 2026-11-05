@@ -15,7 +15,7 @@ use zeta_zalo::reaction::reaction_emoji;
 use crate::auth;
 use crate::media;
 use crate::model::{
-    now_ms, Device, Message, NewMessage, NewReaction, ReactionCount, StoredEvent, Thread,
+    now_ms, Device, Message, NewMessage, NewReaction, Person, ReactionCount, StoredEvent, Thread,
     ThreadKind, ThreadUpsert,
 };
 
@@ -93,9 +93,27 @@ CREATE UNIQUE INDEX reactions_client ON reactions (thread_id, user_id, client_id
     WHERE client_id <> '';
 ";
 
+/// Version 5: people (friends, group members, this account) with their names
+/// and avatars, and the size of groups.
+const SCHEMA_V5: &str = "
+CREATE TABLE people (
+    uid        TEXT PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    zalo_name  TEXT NOT NULL DEFAULT '',
+    avatar     TEXT NOT NULL DEFAULT '',
+    friend     INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+ALTER TABLE threads ADD COLUMN members INTEGER NOT NULL DEFAULT 0;
+";
+
 const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at, unread, \
     COALESCE((SELECT m.text FROM messages m WHERE m.thread_id = threads.id \
-              ORDER BY m.seq DESC LIMIT 1), '')";
+              ORDER BY m.seq DESC LIMIT 1), ''), members";
+const PERSON_COLUMNS: &str = "uid, name, zalo_name, avatar, friend, updated_at";
+
+/// Most messages a search looks through, newest first.
+const SEARCH_SCAN: i64 = 200_000;
 const MESSAGE_COLUMNS: &str = "seq, thread_id, remote_id, client_id, sender_id, sender_name, \
     outgoing, kind, text, sent_at, media, quote";
 
@@ -110,7 +128,43 @@ fn thread_from_row(row: &Row<'_>) -> Result<Thread> {
         last_message_at: row.get(5)?,
         unread: row.get(6)?,
         preview: row.get(7)?,
+        members: row.get(8)?,
     })
+}
+
+fn person_from_row(row: &Row<'_>) -> Result<Person> {
+    Ok(Person {
+        uid: row.get(0)?,
+        name: row.get(1)?,
+        zalo_name: row.get(2)?,
+        avatar: row.get(3)?,
+        friend: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+/// Lower case without Vietnamese marks, so "dang" finds "Đặng" (the web
+/// client folds the same way).
+pub fn fold(s: &str) -> String {
+    s.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ' | 'ắ'
+            | 'ặ' | 'ẳ' | 'ẵ' => 'a',
+            'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
+                'e'
+            }
+            'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
+            'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ' | 'ớ'
+            | 'ợ' | 'ở' | 'ỡ' => 'o',
+            'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
+                'u'
+            }
+            'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
+            'đ' => 'd',
+            other => other,
+        })
+        .collect()
 }
 
 fn message_from_row(row: &Row<'_>) -> Result<Message> {
@@ -315,6 +369,35 @@ fn apply_stored_recalls(conn: &Connection) -> Result<usize> {
     Ok(applied)
 }
 
+fn upsert_person_in(conn: &Connection, p: &Person, friend: Option<bool>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO people (uid, name, zalo_name, avatar, friend, updated_at)
+         VALUES (?1, ?2, ?3, ?4, COALESCE(?5, 0), ?6)
+         ON CONFLICT (uid) DO UPDATE SET
+            name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE people.name END,
+            zalo_name = CASE WHEN excluded.zalo_name <> '' THEN excluded.zalo_name
+                             ELSE people.zalo_name END,
+            avatar = CASE WHEN excluded.avatar <> '' THEN excluded.avatar ELSE people.avatar END,
+            friend = COALESCE(?5, people.friend),
+            updated_at = excluded.updated_at",
+        params![p.uid, p.name, p.zalo_name, p.avatar, friend, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// The part of a message's text worth searching: all of a text message, but
+/// not the label the summary of an attachment starts with (`[Hình ảnh] `,
+/// `[Tập tin] `…).
+fn searchable<'a>(kind: &str, text: &'a str) -> &'a str {
+    if kind == "webchat" {
+        return text;
+    }
+    match text.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+        Some((label, rest)) if !label.contains('\n') && label.chars().count() <= 24 => rest,
+        _ => text,
+    }
+}
+
 fn device_from_row(row: &Row<'_>) -> Result<Device> {
     Ok(Device {
         id: row.get(0)?,
@@ -367,6 +450,12 @@ impl Store {
             tx.pragma_update(None, "user_version", 4)?;
             tx.commit()?;
         }
+        if version < 5 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V5)?;
+            tx.pragma_update(None, "user_version", 5)?;
+            tx.commit()?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -411,6 +500,109 @@ impl Store {
                 thread_from_row,
             )
             .optional()
+    }
+
+    /// Record the size of a group; 0 (unknown) keeps the stored size.
+    pub fn set_members(&self, thread_id: &str, members: u64) -> Result<()> {
+        if members > 0 {
+            self.conn().execute(
+                "UPDATE threads SET members = ?2 WHERE id = ?1",
+                params![thread_id, i64::try_from(members).unwrap_or(i64::MAX)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Create or refresh a person: empty values keep what is stored, `friend`
+    /// changes only when given. `updated_at` becomes now.
+    pub fn upsert_person(&self, p: &Person, friend: Option<bool>) -> Result<()> {
+        upsert_person_in(&self.conn(), p, friend)
+    }
+
+    /// The friend list as Zalo gave it: these people are friends, nobody else.
+    pub fn set_friends(&self, friends: &[Person]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE people SET friend = 0 WHERE friend <> 0", [])?;
+        for p in friends {
+            upsert_person_in(&tx, p, Some(true))?;
+        }
+        tx.commit()
+    }
+
+    /// The friend list.
+    pub fn friends(&self) -> Result<Vec<Person>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PERSON_COLUMNS} FROM people WHERE friend <> 0 ORDER BY name"
+        ))?;
+        let rows = stmt.query_map([], person_from_row)?;
+        rows.collect()
+    }
+
+    /// The people among `uids` the store knows, in the order asked.
+    pub fn people(&self, uids: &[String]) -> Result<Vec<Person>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PERSON_COLUMNS} FROM people WHERE uid = ?1"
+        ))?;
+        let mut out = Vec::new();
+        for uid in uids {
+            if let Some(p) = stmt.query_row(params![uid], person_from_row).optional()? {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Note that Zalo was asked about these users at `at`, whether it answered
+    /// for them or not, so they are not asked about again too soon.
+    pub fn touch_people(&self, uids: &[String], at: i64) -> Result<()> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "INSERT INTO people (uid, updated_at) VALUES (?1, ?2)
+             ON CONFLICT (uid) DO UPDATE SET updated_at = excluded.updated_at",
+        )?;
+        for uid in uids {
+            stmt.execute(params![uid, at])?;
+        }
+        Ok(())
+    }
+
+    /// Messages whose text contains `query`, ignoring case and Vietnamese marks,
+    /// newest first. Recalled messages and the labels of attachments
+    /// (`[Hình ảnh]`…) are left out; a file name or a caption still counts.
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<Message>> {
+        let needle = fold(query.trim());
+        if needle.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let mut found = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT seq, kind, text FROM messages WHERE kind <> 'chat.undo' AND text <> ''
+                 ORDER BY seq DESC LIMIT ?1",
+            )?;
+            let mut rows = stmt.query(params![SEARCH_SCAN])?;
+            while let Some(row) = rows.next()? {
+                let kind: String = row.get(1)?;
+                let text: String = row.get(2)?;
+                if fold(searchable(&kind, &text)).contains(&needle) {
+                    found.push(row.get::<_, i64>(0)?);
+                    if found.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq = ?1"
+        ))?;
+        found
+            .iter()
+            .map(|seq| stmt.query_row(params![seq], message_from_row))
+            .collect()
     }
 
     /// The name `user_id` last went by in a thread (empty when unknown).
@@ -1029,7 +1221,95 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+        // Version 5 added people and group sizes.
+        assert!(s.friends().unwrap().is_empty());
+        assert_eq!(s.thread("zalo:u:1").unwrap().unwrap().members, 0);
+    }
+
+    fn person(uid: &str, name: &str, avatar: &str) -> Person {
+        Person {
+            uid: uid.into(),
+            name: name.into(),
+            avatar: avatar.into(),
+            ..Person::default()
+        }
+    }
+
+    #[test]
+    fn friends_follow_the_latest_list_and_details_fill_in() {
+        let s = Store::open_in_memory().unwrap();
+        s.set_friends(&[person("1", "Lan", "https://a/1"), person("2", "Nam", "")])
+            .unwrap();
+        // A group member, who is no friend.
+        s.upsert_person(&person("3", "Bố", ""), None).unwrap();
+        let names = |list: Vec<Person>| list.into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(s.friends().unwrap()), ["Lan", "Nam"]);
+
+        // Nam is no longer a friend; what was known of him stays.
+        s.set_friends(&[person("1", "", "")]).unwrap();
+        assert_eq!(names(s.friends().unwrap()), ["Lan"]);
+        let asked = ["2".to_string(), "1".to_string(), "9".to_string()];
+        let found = s.people(&asked).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|p| (p.uid.as_str(), p.name.as_str(), p.avatar.as_str(), p.friend))
+                .collect::<Vec<_>>(),
+            [("2", "Nam", "", false), ("1", "Lan", "https://a/1", true)]
+        );
+
+        // Asked about but unknown to Zalo: remembered as asked, still nameless.
+        s.touch_people(&["9".to_string()], 1234).unwrap();
+        let nobody = s.people(&["9".to_string()]).unwrap();
+        assert_eq!((nobody[0].name.as_str(), nobody[0].updated_at), ("", 1234));
+        // Touching keeps names.
+        s.touch_people(&["3".to_string()], 99).unwrap();
+        assert_eq!(s.people(&["3".to_string()]).unwrap()[0].name, "Bố");
+    }
+
+    #[test]
+    fn group_sizes_are_kept_unless_known_again() {
+        let s = Store::open_in_memory().unwrap();
+        let group = ThreadUpsert {
+            kind: ThreadKind::Group,
+            remote_id: "50".into(),
+            name: "Nhà".into(),
+            avatar: String::new(),
+        };
+        s.upsert_thread(&group, true).unwrap();
+        s.set_members("zalo:g:50", 12).unwrap();
+        s.set_members("zalo:g:50", 0).unwrap();
+        assert_eq!(s.thread("zalo:g:50").unwrap().unwrap().members, 12);
+    }
+
+    #[test]
+    fn search_ignores_case_marks_and_attachment_labels() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "Lan"), true).unwrap();
+        let add = |remote: &str, kind: &str, text: &str, at: i64| {
+            let mut m = msg("zalo:u:1", remote, "", false, at);
+            m.kind = kind.into();
+            m.text = text.into();
+            s.insert_message(&m).unwrap();
+        };
+        add("a", "webchat", "Đi ăn phở không?", 1);
+        add("b", "chat.photo", "[Hình ảnh]", 2);
+        add("c", "share.file", "[Tập tin] Hình nền.png", 3);
+        add("d", "webchat", "[Hình ảnh] là chữ người gõ", 4);
+        add("e", "webchat", "PHỞ bò nhé", 5);
+        let texts = |q: &str| {
+            s.search_messages(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.remote_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts("pho"), ["e", "a"]);
+        assert_eq!(texts("hinh"), ["d", "c"]);
+        assert_eq!(texts("  "), Vec::<String>::new());
+        assert_eq!(s.search_messages("pho", 1).unwrap().len(), 1);
+        assert_eq!(fold("Đặng Thị Ánh"), "dang thi anh");
     }
 
     #[test]

@@ -86,11 +86,53 @@ pub struct Group {
     pub name: String,
     pub avatar: String,
     pub member_count: u64,
+    /// Members as far as Zalo lists them (`memVerList`): the creator first,
+    /// then the admins, then the others.
+    #[serde(default)]
+    pub member_ids: Vec<String>,
+    #[serde(default)]
+    pub admin_ids: Vec<String>,
+    #[serde(default)]
+    pub creator_id: String,
+}
+
+/// User ids in a list of `"<uid>"`, `<uid>` or `"<uid>_<version>"`.
+fn id_list(v: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in v.and_then(Value::as_array).into_iter().flatten() {
+        let id = match item {
+            Value::String(s) => s.split('_').next().unwrap_or_default().trim().to_string(),
+            Value::Number(n) => n.to_string(),
+            _ => continue,
+        };
+        if !id.is_empty() && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 impl Group {
     pub(crate) fn from_info(id: &str, info: &Value) -> Self {
         let avatar = first_str(info, &["fullAvt", "avt", "avatar"]);
+        let creator_id = first_str(info, &["creatorId"]);
+        let admin_ids = id_list(info.get("adminIds"));
+        let listed = match id_list(info.get("memVerList")) {
+            ids if ids.is_empty() => id_list(info.get("memberIds")),
+            ids => ids,
+        };
+        let rank = |uid: &String| {
+            if *uid == creator_id {
+                0
+            } else if admin_ids.contains(uid) {
+                1
+            } else {
+                2
+            }
+        };
+        let mut member_ids = listed;
+        // Stable: within a rank, Zalo's order stays.
+        member_ids.sort_by_key(rank);
         Self {
             id: id.to_string(),
             name: first_str(info, &["name", "groupName", "displayName"]),
@@ -101,6 +143,9 @@ impl Group {
                 avatar
             },
             member_count: info.get("totalMember").and_then(Value::as_u64).unwrap_or(0),
+            member_ids,
+            admin_ids,
+            creator_id,
         }
     }
 }
@@ -116,6 +161,27 @@ fn unwrap_json_string(v: Value) -> Value {
 /// `data.data` when present, else the value itself.
 fn inner_data(v: &Value) -> &Value {
     v.get("data").filter(|d| d.is_object()).unwrap_or(v)
+}
+
+/// `profiles` of a `social/group/members` answer: an object keyed by user id.
+fn profiles_of(data: &Value) -> Vec<Friend> {
+    let profiles = data
+        .get("profiles")
+        .or_else(|| inner_data(data).get("profiles"))
+        .and_then(Value::as_object);
+    let Some(profiles) = profiles else {
+        return Vec::new();
+    };
+    profiles
+        .iter()
+        .filter(|(uid, p)| !uid.is_empty() && p.is_object())
+        .map(|(uid, p)| Friend {
+            uid: uid.clone(),
+            display_name: first_str(p, &["displayName", "zaloName", "dName"]),
+            zalo_name: first_str(p, &["zaloName"]),
+            avatar: first_str(p, &["avatar", "avt"]),
+        })
+        .collect()
 }
 
 impl Friend {
@@ -185,6 +251,34 @@ impl ZaloClient {
             _ => Vec::new(),
         };
         Ok(items.iter().filter_map(Friend::from_value).collect())
+    }
+
+    /// Name and avatar of users, friends or not: `social/group/members`, the call
+    /// Zalo PC makes for group members it does not know (ctdozlite notes that
+    /// `getminiprofiles` answers 114 for plain ids). At most 50 ids are asked;
+    /// users Zalo does not answer for are left out.
+    pub async fn user_profiles(&self, uids: &[String]) -> Result<Vec<Friend>> {
+        let asked: Vec<String> = uids
+            .iter()
+            .filter(|uid| !uid.is_empty())
+            .take(50)
+            .map(|uid| format!("{uid}_0"))
+            .collect();
+        if asked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = self.session_key()?;
+        let params = self.encrypt_params(&json!({ "friend_pversion_map": asked }))?;
+        let url = format!(
+            "{}/api/social/group/members?{}",
+            self.domains().primary(Service::Profile),
+            Self::common_params()
+        );
+        let data = unwrap_json_string(
+            self.post_form(&url, format!("params={params}"), Some(key))
+                .await?,
+        );
+        Ok(profiles_of(&data))
     }
 
     /// Ids of the groups the account belongs to (`getlg/v4`).
@@ -360,6 +454,24 @@ mod group_tests {
         );
         let unknown = Group::from_info("8", &Value::Null);
         assert_eq!((unknown.id.as_str(), unknown.name.as_str()), ("8", ""));
+        assert!(unknown.member_ids.is_empty());
+    }
+
+    #[test]
+    fn group_members_put_the_creator_and_admins_first() {
+        let g = Group::from_info(
+            "7",
+            &json!({
+                "creatorId": "30",
+                "adminIds": ["20", 40],
+                "memVerList": ["10_0", "20_3", "30_1", "40_0", "10_2", "", 5],
+            }),
+        );
+        assert_eq!(g.member_ids, ["30", "20", "40", "10", "5"]);
+        assert_eq!((g.creator_id.as_str(), g.admin_ids.len()), ("30", 2));
+        // Without versions, `memberIds` is used.
+        let plain = Group::from_info("8", &json!({ "memberIds": ["1", "2"] }));
+        assert_eq!(plain.member_ids, ["1", "2"]);
     }
 
     #[test]
@@ -392,5 +504,27 @@ mod tests {
             ("9", "Z", "u")
         );
         assert!(Friend::from_value(&json!({ "displayName": "nobody" })).is_none());
+    }
+
+    #[test]
+    fn member_profiles_are_keyed_by_user_id() {
+        let data = json!({
+            "profiles": {
+                "11": { "displayName": "Mẹ", "zaloName": "Me Lan", "avatar": "https://a/1.jpg" },
+                "12": { "zaloName": "Minh" },
+                "13": "?"
+            },
+            "unchangeds_profile": []
+        });
+        let mut found = profiles_of(&data);
+        found.sort_by(|a, b| a.uid.cmp(&b.uid));
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| (f.uid.as_str(), f.display_name.as_str(), f.avatar.as_str()))
+            .collect();
+        assert_eq!(names, [("11", "Mẹ", "https://a/1.jpg"), ("12", "Minh", "")]);
+        // Some answers wrap everything in one more `data`.
+        assert_eq!(profiles_of(&json!({ "data": data })).len(), 2);
+        assert!(profiles_of(&json!({})).is_empty());
     }
 }

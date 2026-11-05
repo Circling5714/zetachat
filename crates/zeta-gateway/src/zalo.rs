@@ -24,7 +24,8 @@ use crate::events::EventBus;
 use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
-    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Quote, ThreadKind, ThreadUpsert,
+    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Person, Quote, ThreadKind,
+    ThreadUpsert,
 };
 use crate::store::Store;
 use crate::uploads::UploadJob;
@@ -68,6 +69,9 @@ pub struct ZaloStatus {
     pub session: SessionState,
     pub realtime: bool,
     pub display_name: String,
+    /// This account's user id and avatar, once Zalo told them.
+    pub uid: String,
+    pub avatar: String,
     pub login: LoginState,
     /// Human-readable detail for `unknown` / `rejected`.
     pub detail: String,
@@ -145,6 +149,12 @@ pub enum ZaloCommand {
     Typing {
         kind: ThreadKind,
         remote_id: String,
+    },
+    /// Ask Zalo for the name and avatar of these users (at most 50) and store
+    /// them; answers with what the store then knows of them.
+    LookupPeople {
+        uids: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<Person>, String>>,
     },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
@@ -597,11 +607,7 @@ impl Connector {
                 self.set_session(SessionState::Rejected, "Zalo từ chối phiên đã lưu".into());
                 return None;
             }
-            SessionHealth::Valid(profile) => update_status(&self.status, |s| {
-                s.session = SessionState::Valid;
-                s.display_name = profile.display_name.clone();
-                s.detail.clear();
-            }),
+            SessionHealth::Valid(profile) => self.note_profile(profile),
             SessionHealth::Unknown(reason) => update_status(&self.status, |s| {
                 s.session = SessionState::Unknown;
                 s.detail = reason.clone();
@@ -620,13 +626,44 @@ impl Connector {
         realtime
     }
 
-    /// Friends become threads, so incoming messages have a name. Zalo rate-limits
-    /// this call, so it only runs when a session comes up.
+    /// The account's own profile, as `me-v2` gave it: status and people.
+    fn note_profile(&self, profile: &zeta_zalo::api::Profile) {
+        update_status(&self.status, |s| {
+            s.session = SessionState::Valid;
+            s.display_name = profile.display_name.clone();
+            s.uid = profile.uid.clone();
+            if !profile.avatar.is_empty() {
+                s.avatar = profile.avatar.clone();
+            }
+            s.detail.clear();
+        });
+        let me = Person {
+            uid: profile.uid.clone(),
+            name: profile.display_name.clone(),
+            avatar: profile.avatar.clone(),
+            ..Person::default()
+        };
+        if let Err(e) = self.store.upsert_person(&me, None) {
+            tracing::error!(error = %e, "cannot store own profile");
+        }
+    }
+
+    /// Friends become threads, so incoming messages have a name, and people, so
+    /// they can be listed. Zalo rate-limits this call, so it only runs when a
+    /// session comes up.
     async fn sync_contacts(&self, client: &ZaloClient) {
         match client.friends().await {
             Ok(friends) => {
                 let count = friends.len();
+                let mut people = Vec::with_capacity(count);
                 for f in friends {
+                    people.push(Person {
+                        uid: f.uid.clone(),
+                        name: f.display_name.clone(),
+                        zalo_name: f.zalo_name,
+                        avatar: f.avatar.clone(),
+                        ..Person::default()
+                    });
                     let thread = ThreadUpsert {
                         kind: ThreadKind::User,
                         remote_id: f.uid,
@@ -635,6 +672,12 @@ impl Connector {
                     };
                     if let Err(e) = self.store.upsert_thread(&thread, true) {
                         tracing::error!(error = %e, "cannot store contact");
+                    }
+                }
+                // An empty answer is more likely a hiccup than a lost friend list.
+                if !people.is_empty() {
+                    if let Err(e) = self.store.set_friends(&people) {
+                        tracing::error!(error = %e, "cannot store the friend list");
                     }
                 }
                 tracing::info!(count, "contacts synced");
@@ -651,7 +694,11 @@ impl Connector {
                         name: g.name,
                         avatar: g.avatar,
                     };
-                    if let Err(e) = self.store.upsert_thread(&thread, true) {
+                    let stored = self
+                        .store
+                        .upsert_thread(&thread, true)
+                        .and_then(|()| self.store.set_members(&thread.id(), g.member_count));
+                    if let Err(e) = stored {
                         tracing::error!(error = %e, "cannot store group");
                     }
                 }
@@ -841,6 +888,16 @@ impl Connector {
                     if let Err(e) = client.send_typing(recipient(kind, &remote_id)).await {
                         tracing::debug!(error = %e, "typing not sent");
                     }
+                });
+            }
+            ZaloCommand::LookupPeople { uids, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let store = self.store.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(lookup_people(&client, &store, &uids).await);
                 });
             }
             ZaloCommand::StartLogin { reply } => {
@@ -1122,11 +1179,7 @@ impl Connector {
             .session;
         match client.check_session().await {
             SessionHealth::Valid(profile) => {
-                update_status(&self.status, |s| {
-                    s.session = SessionState::Valid;
-                    s.display_name = profile.display_name;
-                    s.detail.clear();
-                });
+                self.note_profile(&profile);
                 if before != SessionState::Valid {
                     publish_status(&self.status, &self.bus);
                 }
@@ -1148,6 +1201,37 @@ impl Connector {
             }
         }
     }
+}
+
+/// Ask Zalo about users and store what it says; users it does not answer for
+/// are noted as asked, so they are not asked again at once.
+async fn lookup_people(
+    client: &ZaloClient,
+    store: &Store,
+    uids: &[String],
+) -> Result<Vec<Person>, String> {
+    let asked: Vec<String> = uids.iter().take(50).cloned().collect();
+    let found = client
+        .user_profiles(&asked)
+        .await
+        .map_err(|e| e.to_string())?;
+    tracing::debug!(asked = asked.len(), found = found.len(), "people looked up");
+    for f in found {
+        let person = Person {
+            uid: f.uid,
+            name: f.display_name,
+            zalo_name: f.zalo_name,
+            avatar: f.avatar,
+            ..Person::default()
+        };
+        store
+            .upsert_person(&person, None)
+            .map_err(|e| e.to_string())?;
+    }
+    store
+        .touch_people(&asked, now_ms())
+        .and_then(|()| store.people(&asked))
+        .map_err(|e| e.to_string())
 }
 
 fn recipient(kind: ThreadKind, remote_id: &str) -> Recipient<'_> {

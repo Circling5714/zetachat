@@ -108,6 +108,12 @@ Trả lời một tin: `POST {chat}/api/message/quote` (nhóm: `{group}/api/grou
 
 Thu hồi tin của mình: `POST {chat}/api/message/undo` (nhóm: `{group}/api/group/undomsg` thêm `visibility: 0`, `imei`) với `msgId`, `clientId` mới và `cliMsgIdUndo` (client id của tin bị thu hồi). Sau đó Zalo đẩy một tin `chat.undo` như khi thu hồi từ điện thoại; gateway đã áp dụng thu hồi nên bỏ qua nó.
 
+## 8e. Thành viên nhóm và hồ sơ người dùng (đã kiểm chứng)
+
+`getmg-v2` (thông tin nhóm) có `memVerList`: danh sách `"<uid>_<phiên bản>"` của mọi thành viên, kèm `creatorId` và `adminIds`. Thử trên 4 nhóm 10 đến 28 người: Zalo liệt kê đủ id của tất cả thành viên.
+
+Tên và ảnh của người không phải bạn bè: `POST {profile}/api/social/group/members` với `friend_pversion_map: ["<uid>_0", …]`, đúng như Zalo PC làm với thành viên nhóm nó chưa biết. Kết quả nằm trong `profiles`, là object theo uid: `{ displayName, zaloName, avatar, … }`. Đã thử hỏi 45 người một lần: Zalo trả đủ 45 hồ sơ, người nào cũng có tên và ảnh. Theo ctdozlite, `getminiprofiles` trả mã 114 nếu đưa uid trần. Gateway hỏi mỗi người tối đa 3 ngày một lần.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

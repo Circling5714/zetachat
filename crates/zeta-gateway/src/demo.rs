@@ -12,7 +12,8 @@ use crate::events::EventBus;
 use crate::media::RECALLED_TEXT;
 use crate::media_cache::{MediaCache, LOCAL_URL_PREFIX};
 use crate::model::{
-    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Quote, ThreadKind, ThreadUpsert,
+    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Person, Quote, ThreadKind,
+    ThreadUpsert,
 };
 use crate::store::Store;
 use crate::uploads::UploadJob;
@@ -27,8 +28,69 @@ const STICKER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="240
 
 const LINK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="320" viewBox="0 0 640 320"><rect width="640" height="320" fill="#1e293b"/><circle cx="320" cy="160" r="96" fill="none" stroke="#f97316" stroke-width="22"/><circle cx="320" cy="160" r="36" fill="#f97316"/></svg>"##;
 
+const HOUSE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><rect width="160" height="160" fill="#0ea5e9"/><path d="M34 82 L80 42 L126 82" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/><path d="M46 76 V122 H114 V76" fill="#fff"/><rect x="70" y="94" width="20" height="28" fill="#0ea5e9"/></svg>"##;
+
 fn svg_data(svg: &str) -> String {
     format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg))
+}
+
+/// A drawn portrait for a sample person: a coloured square and a silhouette.
+fn portrait(hue: u32) -> String {
+    let deep = (hue + 30) % 360;
+    svg_data(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><defs><linearGradient id="p" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl({hue},70%,74%)"/><stop offset="1" stop-color="hsl({deep},62%,50%)"/></linearGradient></defs><rect width="160" height="160" fill="url(#p)"/><circle cx="80" cy="66" r="30" fill="#fff" opacity="0.92"/><path d="M24 160 C28 118 52 104 80 104 C108 104 132 118 136 160 Z" fill="#fff" opacity="0.92"/></svg>"##
+    ))
+}
+
+/// This account in the demo.
+const ME: &str = "1000";
+
+/// Sample people: user id, name, hue of their portrait (none: no picture),
+/// friend of this account.
+const PEOPLE: &[(&str, &str, Option<u32>, bool)] = &[
+    (ME, "Demo", Some(210), false),
+    ("1001", "Lan Anh", Some(330), true),
+    ("1002", "Minh Tuấn", Some(25), true),
+    ("1003", "Hoàng Nam", None, true),
+    ("1004", "Thu Trang", Some(280), true),
+    ("1005", "Bảo Ngọc", Some(160), true),
+    ("1006", "Đức Anh", None, true),
+    ("1007", "Quốc Huy", Some(195), true),
+    ("3001", "Mẹ", Some(15), false),
+    ("3002", "Minh", Some(120), false),
+    ("3003", "Bố", None, false),
+];
+
+fn picture_of(uid: &str) -> String {
+    PEOPLE
+        .iter()
+        .find(|p| p.0 == uid)
+        .and_then(|p| p.2)
+        .map(portrait)
+        .unwrap_or_default()
+}
+
+/// User id of a sample sender, by name.
+fn uid_of(name: &str) -> &'static str {
+    PEOPLE.iter().find(|p| p.1 == name).map_or("", |p| p.0)
+}
+
+fn seed_people(store: &Store) {
+    let mut friends = Vec::new();
+    for (uid, name, _, friend) in PEOPLE {
+        let person = Person {
+            uid: (*uid).into(),
+            name: (*name).into(),
+            avatar: picture_of(uid),
+            ..Person::default()
+        };
+        if *friend {
+            friends.push(person);
+        } else {
+            let _ = store.upsert_person(&person, None);
+        }
+    }
+    let _ = store.set_friends(&friends);
 }
 
 /// One sample message.
@@ -98,7 +160,11 @@ fn add_thread(store: &Store, kind: ThreadKind, remote: &str, name: &str, message
         kind,
         remote_id: remote.into(),
         name: name.into(),
-        avatar: String::new(),
+        avatar: match (kind, remote) {
+            (ThreadKind::User, _) => picture_of(remote),
+            (ThreadKind::Group, "2001") => svg_data(HOUSE_SVG),
+            (ThreadKind::Group, _) => String::new(),
+        },
     };
     if store.upsert_thread(&thread, true).is_err() {
         return;
@@ -108,11 +174,12 @@ fn add_thread(store: &Store, kind: ThreadKind, remote: &str, name: &str, message
             thread_id: thread.id(),
             remote_id: format!("demo-{remote}-{i}"),
             client_id: String::new(),
-            // In groups each sample sender needs its own id so names show per sender.
             sender_id: if sample.outgoing {
-                "me".into()
+                ME.into()
+            } else if kind == ThreadKind::User {
+                remote.into()
             } else {
-                format!("{remote}-{}", sample.sender)
+                uid_of(sample.sender).into()
             },
             sender_name: sample.sender.to_string(),
             outgoing: sample.outgoing,
@@ -141,7 +208,7 @@ fn add_reactions(
             client_id: String::new(),
             targets: vec![(format!("demo-{remote}-{index}"), String::new())],
             user_id: user.to_string(),
-            mine: *user == "me",
+            mine: *user == ME,
             icon: icon.to_string(),
             sent_at: now_ms() - 60_000 + i as i64,
         });
@@ -150,6 +217,7 @@ fn add_reactions(
 
 /// Fill an empty store with a few conversations.
 fn seed(store: &Store) {
+    seed_people(store);
     if store
         .threads(true, 1, 0)
         .map(|t| !t.is_empty())
@@ -278,8 +346,26 @@ fn seed(store: &Store) {
             ),
         ],
     );
-    add_thread(store, ThreadKind::User, "1003", "Hoàng Nam", Vec::new());
-    add_reactions(store, ThreadKind::User, "1001", 2, &[("me", "/-strong")]);
+    add_thread(
+        store,
+        ThreadKind::Group,
+        "2003",
+        "Team dự án",
+        vec![
+            say(false, "Đức Anh", "Mai họp lúc 9 giờ nhé mọi người", 2900),
+            say(false, "Thu Trang", "Ok anh, em chuẩn bị slide", 2890),
+            say(true, "", "Mình sẽ gửi bản demo trước buổi họp", 2880),
+        ],
+    );
+    add_thread(store, ThreadKind::Group, "2002", "Lớp 12A1", Vec::new());
+    for remote in ["1003", "1004", "1005", "1006", "1007"] {
+        let name = PEOPLE.iter().find(|p| p.0 == remote).map_or("", |p| p.1);
+        add_thread(store, ThreadKind::User, remote, name, Vec::new());
+    }
+    for (group, members) in [("2001", 5), ("2002", 38), ("2003", 7)] {
+        let _ = store.set_members(&thread_id(ThreadKind::Group, group), members);
+    }
+    add_reactions(store, ThreadKind::User, "1001", 2, &[(ME, "/-strong")]);
     add_reactions(store, ThreadKind::User, "1001", 5, &[("1001", "/-heart")]);
     add_reactions(
         store,
@@ -287,12 +373,13 @@ fn seed(store: &Store) {
         "2001",
         3,
         &[
-            ("2001-Minh", "/-heart"),
-            ("2001-Mẹ", "/-heart"),
-            ("me", "/-heart"),
-            ("2001-Minh", ":o"),
+            ("3002", "/-heart"),
+            ("3001", "/-heart"),
+            (ME, "/-heart"),
+            ("3002", ":o"),
         ],
     );
+    let _ = store.mark_read(&thread_id(ThreadKind::Group, "2003"));
     // Read the older threads so only some show unread badges.
     let _ = store.mark_read(&thread_id(ThreadKind::User, "1002"));
 }
@@ -328,7 +415,7 @@ fn store_and_publish(
             remote_id: format!("demo-{now}-{}", if outgoing { "out" } else { "in" }),
             client_id: String::new(),
             sender_id: if outgoing {
-                "me".into()
+                ME.into()
             } else {
                 remote_id.into()
             },
@@ -442,6 +529,8 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
         session: SessionState::Valid,
         realtime: true,
         display_name: "Demo".into(),
+        uid: ME.into(),
+        avatar: picture_of(ME),
         ..ZaloStatus::default()
     };
     let shared = handle.status.clone();
@@ -554,7 +643,7 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                         action_id: format!("demo-{:016x}", rand::random::<u64>()),
                         client_id: String::new(),
                         targets: vec![(message_id, message_client_id)],
-                        user_id: "me".into(),
+                        user_id: ME.into(),
                         mine: true,
                         icon,
                         sent_at: now_ms(),
@@ -574,6 +663,10 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 }
                 // Nobody to tell in the demo.
                 ZaloCommand::MarkSeen { .. } | ZaloCommand::Typing { .. } => {}
+                // Everyone in the demo is known from the start.
+                ZaloCommand::LookupPeople { uids, reply } => {
+                    let _ = reply.send(store.people(&uids).map_err(|e| e.to_string()));
+                }
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {
                         qr: "https://zetachat.invalid/demo-login".into(),

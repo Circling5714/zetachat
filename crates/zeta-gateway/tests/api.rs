@@ -12,14 +12,18 @@ use tower::ServiceExt;
 use zeta_gateway::api::{self, AppState};
 use zeta_gateway::events::EventBus;
 use zeta_gateway::media_cache::MediaCache;
-use zeta_gateway::model::{thread_id, Media, NewMessage, NewReaction, ThreadKind, ThreadUpsert};
+use zeta_gateway::model::{
+    thread_id, Media, NewMessage, NewReaction, Person, ThreadKind, ThreadUpsert,
+};
 use zeta_gateway::store::Store;
 use zeta_gateway::uploads::Uploads;
-use zeta_gateway::zalo::{LoginState, ZaloCommand, ZaloHandle};
+use zeta_gateway::zalo::{LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus};
 use zeta_zalo::upload::FileLimits;
 
 /// Read receipts the connector was asked for: (remote id, message ids).
 type SeenLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+/// Users the connector was asked to look up, per request.
+type AskedLog = Arc<Mutex<Vec<Vec<String>>>>;
 
 struct Fixture {
     app: Router,
@@ -27,10 +31,13 @@ struct Fixture {
     token: String,
     /// Read receipts the connector was asked for: (remote id, message ids).
     seen: SeenLog,
+    /// Users the connector was asked to look up.
+    asked: AskedLog,
+    status: Arc<std::sync::RwLock<ZaloStatus>>,
 }
 
 /// A connector that "sends" by storing the message, like the real one does.
-fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle {
+fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog, asked: AskedLog) -> ZaloHandle {
     let (commands, mut rx) = mpsc::channel(8);
     let handle = ZaloHandle::new(commands);
     // Small limits, so the tests can go over them.
@@ -178,6 +185,23 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                     seen.lock().unwrap().push((remote_id, ids));
                 }
                 ZaloCommand::Typing { .. } => {}
+                // Zalo knows everyone but the users whose id starts with 9.
+                ZaloCommand::LookupPeople { uids, reply } => {
+                    asked.lock().unwrap().push(uids.clone());
+                    for uid in uids.iter().filter(|u| !u.starts_with('9')) {
+                        let person = Person {
+                            uid: uid.clone(),
+                            name: format!("Người {uid}"),
+                            avatar: format!("https://s120-ava-talk.zadn.vn/{uid}.jpg"),
+                            ..Person::default()
+                        };
+                        store.upsert_person(&person, None).unwrap();
+                    }
+                    store
+                        .touch_people(&uids, zeta_gateway::model::now_ms())
+                        .unwrap();
+                    let _ = reply.send(store.people(&uids).map_err(|e| e.to_string()));
+                }
                 ZaloCommand::Recall {
                     kind,
                     remote_id,
@@ -210,7 +234,9 @@ fn fixture() -> Fixture {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let bus = EventBus::new(store.clone());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let zalo = fake_connector(store.clone(), bus.clone(), seen.clone());
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let zalo = fake_connector(store.clone(), bus.clone(), seen.clone(), asked.clone());
+    let status = zalo.status.clone();
     let (_, token) = store.add_device("test").unwrap();
     let dir = std::env::temp_dir().join(format!("zetachat-api-{:016x}", rand::random::<u64>()));
     let uploads = Arc::new(Uploads::new(dir.join("uploads"), bus.clone()).unwrap());
@@ -226,6 +252,8 @@ fn fixture() -> Fixture {
         store,
         token,
         seen,
+        asked,
+        status,
     }
 }
 
@@ -696,4 +724,92 @@ async fn read_marker_and_login_endpoints() {
 
     let (_, body) = call(&f, "GET", "/api/v1/zalo/login", None, true).await;
     assert_eq!(body["state"], "idle");
+}
+
+#[tokio::test]
+async fn people_are_looked_up_once_friends_listed_and_messages_searched() {
+    let f = fixture();
+    // Before a session, only what the store knows.
+    let (status, body) = call(&f, "GET", "/api/v1/people?ids=11", None, true).await;
+    assert_eq!((status, body), (StatusCode::OK, json!([])));
+    assert!(f.asked.lock().unwrap().is_empty());
+
+    f.status.write().unwrap().session = SessionState::Valid;
+    let (status, body) = call(
+        &f,
+        "GET",
+        "/api/v1/people?ids=11,%20abc,12,9,11,",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<_> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["uid"].as_str().unwrap(), p["name"].as_str().unwrap()))
+        .collect();
+    assert_eq!(names, [("11", "Người 11"), ("12", "Người 12"), ("9", "")]);
+    assert_eq!(body[0]["avatar"], "https://s120-ava-talk.zadn.vn/11.jpg");
+    assert_eq!(*f.asked.lock().unwrap(), [vec!["11", "12", "9"]]);
+    // Asked about a moment ago, the unknown one included: not again.
+    let (_, again) = call(&f, "GET", "/api/v1/people?ids=12,9", None, true).await;
+    assert_eq!(again.as_array().unwrap().len(), 2);
+    assert_eq!(f.asked.lock().unwrap().len(), 1);
+
+    let friend = |uid: &str, name: &str| Person {
+        uid: uid.into(),
+        name: name.into(),
+        ..Person::default()
+    };
+    f.store
+        .set_friends(&[friend("21", "Lan"), friend("22", "An")])
+        .unwrap();
+    let (_, friends) = call(&f, "GET", "/api/v1/friends", None, true).await;
+    let listed: Vec<_> = friends
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["name"].as_str().unwrap(), p["friend"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(listed, [("An", true), ("Lan", true)]);
+
+    let lan = ThreadUpsert {
+        kind: ThreadKind::User,
+        remote_id: "21".into(),
+        name: "Lan".into(),
+        avatar: String::new(),
+    };
+    f.store.upsert_thread(&lan, true).unwrap();
+    let id = lan.id();
+    for (i, text) in ["Ăn phở không?", "không", "Phở Hà Nội"].iter().enumerate() {
+        f.store
+            .insert_message(&NewMessage {
+                thread_id: id.clone(),
+                remote_id: format!("m{i}"),
+                client_id: String::new(),
+                sender_id: "21".into(),
+                sender_name: "Lan".into(),
+                outgoing: false,
+                kind: "webchat".into(),
+                text: (*text).into(),
+                media: None,
+                quote: None,
+                sent_at: i as i64,
+                raw: "{}".into(),
+            })
+            .unwrap();
+    }
+    let (status, found) = call(&f, "GET", "/api/v1/search?q=PHO", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<_> = found["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(hits, ["Phở Hà Nội", "Ăn phở không?"]);
+    let (_, none) = call(&f, "GET", "/api/v1/search?q=", None, true).await;
+    assert_eq!(none["messages"], json!([]));
 }

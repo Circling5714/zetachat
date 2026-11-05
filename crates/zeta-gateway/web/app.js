@@ -23,6 +23,10 @@ const state = {
   typing: new Map(), // thread id -> { name, timer }: someone is typing there
   replyTo: null, // the message the next one answers
   typingSent: new Map(), // thread id -> when typing was last told to the gateway
+  people: new Map(), // user id -> { uid, name, avatar, friend }: friends, group members
+  friends: [], // user ids of the friend list
+  hits: null, // messages the search box found; null while searching
+  meKey: '', // what the account's picture shows, to redraw it only on change
 };
 
 // ------------------------------------------------------------------ helpers
@@ -73,17 +77,33 @@ function mediaSrc(url) {
   return `${API}/media?u=${encodeURIComponent(url)}`;
 }
 
-function avatar(t) {
-  const box = el('div', 'avatar', initials(threadName(t)));
-  box.style.background = `hsl(${hue(t.id)} 55% 48%)`;
-  if (isWebUrl(t.avatar)) {
+/**
+ * A round picture over initials on a colour picked from `key`. The picture is
+ * in the page from the start: a lazy image outside the page never loads.
+ */
+function avatarBox(key, name, url) {
+  const box = el('div', 'avatar', initials(name || '?'));
+  box.style.background = `hsl(${hue(key || name || '?')} 55% 48%)`;
+  if (isWebUrl(url) || String(url || '').startsWith('data:image/')) {
     const img = new Image();
     img.alt = '';
     img.loading = 'lazy';
-    img.onload = () => box.replaceChildren(img);
-    img.src = mediaSrc(t.avatar);
+    img.decoding = 'async';
+    img.addEventListener('load', () => box.classList.add('pictured'));
+    img.addEventListener('error', () => img.remove());
+    img.src = mediaSrc(url);
+    box.append(img);
+    box.dataset.src = url;
   }
   return box;
+}
+
+function avatar(t) {
+  return avatarBox(t.id, threadName(t), t.avatar);
+}
+
+function personName(p) {
+  return (p && (p.name || p.zalo_name)) || '';
 }
 
 function sameDay(a, b) {
@@ -180,52 +200,228 @@ $('pair-form').addEventListener('submit', async (e) => {
 
 // ------------------------------------------------------------------ threads
 
-function visibleThreads() {
-  const q = fold(state.search);
-  let list = [...state.threads.values()];
-  if (state.filter === 'contacts') {
-    list.sort((a, b) => threadName(a).localeCompare(threadName(b), 'vi'));
-  } else {
-    list = list.filter((t) => t.last_message_at > 0);
-    if (state.filter === 'unread') list = list.filter((t) => t.unread > 0);
-    list.sort((a, b) => b.last_message_at - a.last_message_at);
-  }
-  if (q) list = list.filter((t) => fold(threadName(t)).includes(q));
-  return list;
+function membersText(t) {
+  return t.members > 0 ? `${t.members} thành viên` : 'Nhóm';
 }
 
-function emptyListText() {
-  if (state.search) return 'Không tìm thấy hội thoại';
-  if (state.filter === 'unread') return 'Không có tin chưa đọc';
-  return 'Chưa có hội thoại';
+/** A conversation in a list; `sub` replaces the last message under its name. */
+function threadRow(t, sub) {
+  let cls = 'thread';
+  if (t.id === state.current) cls += ' active';
+  if (t.unread > 0) cls += ' unread';
+  const li = el('li', cls);
+  const body = el('div', 'body');
+  const typing = state.typing.get(t.id);
+  body.append(
+    el('div', 'name', threadName(t)),
+    typing
+      ? el('div', 'preview typing', typingText(t, typing))
+      : el('div', 'preview', sub || t.preview || (t.kind === 'group' ? membersText(t) : '')),
+  );
+  const meta = el('div', 'meta');
+  meta.append(el('span', null, fmtListTime(t.last_message_at)));
+  if (t.unread > 0) meta.append(el('span', 'badge', t.unread > 99 ? '99+' : String(t.unread)));
+  li.append(avatar(t), body, meta);
+  li.addEventListener('click', () => openThread(t.id));
+  return li;
+}
+
+/** A user in a list (friend, search result); opens the chat with them. */
+function personRow(p) {
+  const id = `zalo:u:${p.uid}`;
+  const li = el('li', id === state.current ? 'thread active' : 'thread');
+  const body = el('div', 'body');
+  body.append(el('div', 'name', personName(p) || `Người dùng ${p.uid}`));
+  li.append(avatarBox(id, personName(p), p.avatar), body, el('div', 'meta'));
+  li.addEventListener('click', () => openPerson(p));
+  return li;
+}
+
+function friendList() {
+  return state.friends
+    .map((uid) => state.people.get(uid))
+    .filter(Boolean)
+    .sort((a, b) => personName(a).localeCompare(personName(b), 'vi'));
+}
+
+function groupList() {
+  return [...state.threads.values()]
+    .filter((t) => t.kind === 'group')
+    .sort((a, b) => b.last_message_at - a.last_message_at || threadName(a).localeCompare(threadName(b), 'vi'));
+}
+
+function renderConversations(ul) {
+  let list = [...state.threads.values()].filter((t) => t.last_message_at > 0);
+  if (state.filter === 'unread') list = list.filter((t) => t.unread > 0);
+  list.sort((a, b) => b.last_message_at - a.last_message_at);
+  if (!list.length) {
+    ul.appendChild(el('li', 'list-empty', state.filter === 'unread' ? 'Không có tin chưa đọc' : 'Chưa có hội thoại'));
+  }
+  for (const t of list) ul.appendChild(threadRow(t));
+}
+
+/** The friend list by name, under the first letter of each name. */
+function renderFriends(ul) {
+  const list = friendList();
+  if (!list.length) {
+    ul.appendChild(el('li', 'list-empty', 'Chưa có bạn bè'));
+    return;
+  }
+  ul.appendChild(el('li', 'list-section', `${list.length} bạn bè`));
+  let letter = '';
+  for (const p of list) {
+    const first = fold(personName(p)).charAt(0).toUpperCase();
+    const l = /[A-Z]/.test(first) ? first : '#';
+    if (l !== letter) {
+      letter = l;
+      ul.appendChild(el('li', 'list-letter', l));
+    }
+    ul.appendChild(personRow(p));
+  }
+}
+
+function renderGroups(ul) {
+  const list = groupList();
+  if (!list.length) {
+    ul.appendChild(el('li', 'list-empty', 'Chưa tham gia nhóm nào'));
+    return;
+  }
+  ul.appendChild(el('li', 'list-section', `${list.length} nhóm`));
+  for (const t of list) ul.appendChild(threadRow(t, membersText(t)));
+}
+
+/** What the search box found: people, groups, then messages (from the gateway). */
+function renderSearch(ul) {
+  const q = fold(state.search.trim());
+  const people = [];
+  const shown = new Set();
+  for (const p of friendList()) {
+    if (fold(personName(p)).includes(q)) {
+      people.push(personRow(p));
+      shown.add(`zalo:u:${p.uid}`);
+    }
+  }
+  for (const t of state.threads.values()) {
+    if (t.kind === 'user' && !shown.has(t.id) && fold(threadName(t)).includes(q)) people.push(threadRow(t));
+  }
+  const groups = groupList()
+    .filter((t) => fold(threadName(t)).includes(q))
+    .map((t) => threadRow(t, membersText(t)));
+  const LIMIT = 20;
+  if (people.length) {
+    ul.appendChild(el('li', 'list-section', 'Liên hệ'));
+    ul.append(...people.slice(0, LIMIT));
+  }
+  if (groups.length) {
+    ul.appendChild(el('li', 'list-section', 'Nhóm'));
+    ul.append(...groups.slice(0, LIMIT));
+  }
+  if (q.length < 2) {
+    if (!people.length && !groups.length) ul.appendChild(el('li', 'list-empty', 'Không tìm thấy kết quả'));
+    return;
+  }
+  ul.appendChild(el('li', 'list-section', 'Tin nhắn'));
+  if (state.hits === null) ul.appendChild(el('li', 'list-note', 'Đang tìm…'));
+  else if (!state.hits.length) ul.appendChild(el('li', 'list-note', 'Không có tin nhắn nào khớp'));
+  else for (const m of state.hits) ul.appendChild(hitRow(m));
+}
+
+/** A message the search found; opens its conversation at it. */
+function hitRow(m) {
+  const t = state.threads.get(m.thread_id) || threadFromMessage(m);
+  const li = el('li', 'thread hit');
+  const body = el('div', 'body');
+  let who = '';
+  if (m.outgoing) who = 'Bạn';
+  else if (t.kind === 'group') who = m.sender_name || personName(state.people.get(m.sender_id));
+  body.append(el('div', 'name', threadName(t)), el('div', 'preview', who ? `${who}: ${m.text}` : m.text));
+  const meta = el('div', 'meta');
+  meta.append(el('span', null, fmtListTime(m.sent_at)));
+  li.append(avatar(t), body, meta);
+  li.addEventListener('click', () => {
+    if (!state.threads.has(t.id)) state.threads.set(t.id, t);
+    openThread(t.id, m.seq);
+  });
+  return li;
 }
 
 function renderThreads() {
   const ul = $('threads');
-  const list = visibleThreads();
   ul.replaceChildren();
-  if (!list.length) ul.appendChild(el('li', 'list-empty', emptyListText()));
-  for (const t of list) {
-    let cls = 'thread';
-    if (t.id === state.current) cls += ' active';
-    if (t.unread > 0) cls += ' unread';
-    const li = el('li', cls);
-    const body = el('div', 'body');
-    const typing = state.typing.get(t.id);
-    body.append(
-      el('div', 'name', threadName(t)),
-      typing
-        ? el('div', 'preview typing', typingText(t, typing))
-        : el('div', 'preview', t.preview || (t.kind === 'group' ? 'Nhóm' : '')),
-    );
-    const meta = el('div', 'meta');
-    meta.append(el('span', null, fmtListTime(t.last_message_at)));
-    if (t.unread > 0) meta.append(el('span', 'badge', t.unread > 99 ? '99+' : String(t.unread)));
-    li.append(avatar(t), body, meta);
-    li.addEventListener('click', () => openThread(t.id));
-    ul.appendChild(li);
-  }
+  if (state.search.trim()) renderSearch(ul);
+  else if (state.filter === 'friends') renderFriends(ul);
+  else if (state.filter === 'groups') renderGroups(ul);
+  else renderConversations(ul);
   updateTitle();
+}
+
+/** Open the chat with a user, even one without messages yet. */
+function openPerson(p) {
+  const id = `zalo:u:${p.uid}`;
+  if (!state.threads.has(id)) {
+    state.threads.set(id, {
+      id, kind: 'user', remote_id: p.uid, name: personName(p), avatar: p.avatar || '',
+      last_message_at: 0, unread: 0, preview: '', members: 0,
+    });
+  }
+  openThread(id);
+}
+
+async function loadFriends() {
+  try {
+    const list = await api('/friends');
+    for (const p of list) state.people.set(p.uid, { ...(state.people.get(p.uid) || {}), ...p });
+    state.friends = list.map((p) => p.uid);
+    renderThreads();
+  } catch (err) {
+    if (err instanceof Unauthorized) handleError(err);
+  }
+}
+
+// Names and pictures of people who are not friends (group members), asked for
+// as their messages show up, once per page load.
+const peopleAsked = new Set();
+const peopleWanted = new Set();
+let peopleTimer = 0;
+
+function wantPeople(uids) {
+  for (const uid of uids) {
+    if (!/^\d+$/.test(uid || '') || peopleAsked.has(uid)) continue;
+    const known = state.people.get(uid);
+    if (known && known.avatar) continue;
+    peopleWanted.add(uid);
+  }
+  if (peopleWanted.size && !peopleTimer) peopleTimer = setTimeout(fetchPeople, 30);
+}
+
+async function fetchPeople() {
+  const uids = [...peopleWanted].slice(0, 100);
+  for (const uid of uids) {
+    peopleWanted.delete(uid);
+    peopleAsked.add(uid);
+  }
+  try {
+    const list = await api(`/people?ids=${uids.join(',')}`);
+    for (const p of list) state.people.set(p.uid, { ...(state.people.get(p.uid) || {}), ...p });
+    refreshAvatars();
+  } catch (err) {
+    if (err instanceof Unauthorized) handleError(err);
+  } finally {
+    peopleTimer = peopleWanted.size ? setTimeout(fetchPeople, 30) : 0;
+  }
+}
+
+/** Put pictures that just became known on the messages shown. */
+function refreshAvatars() {
+  for (const node of document.querySelectorAll('#messages .msg-avatar[data-uid]')) {
+    const p = state.people.get(node.dataset.uid);
+    if (!p || !p.avatar || node.dataset.src === p.avatar) continue;
+    const fresh = avatarBox(`zalo:u:${p.uid}`, node.title || personName(p), p.avatar);
+    fresh.classList.add('msg-avatar');
+    fresh.dataset.uid = p.uid;
+    fresh.title = node.title;
+    node.replaceWith(fresh);
+  }
 }
 
 function updateTitle() {
@@ -248,10 +444,31 @@ for (const tab of document.querySelectorAll('.tab')) {
   });
 }
 
+let searchTimer = 0;
+let searchTicket = 0;
+
 $('search').addEventListener('input', (e) => {
   state.search = e.target.value;
+  state.hits = null;
+  clearTimeout(searchTimer);
+  const q = state.search.trim();
+  if (q.length >= 2) searchTimer = setTimeout(() => searchMessages(q), 250);
   renderThreads();
 });
+
+async function searchMessages(q) {
+  const ticket = ++searchTicket;
+  try {
+    const data = await api(`/search?q=${encodeURIComponent(q)}&limit=40`);
+    if (ticket !== searchTicket || state.search.trim() !== q) return;
+    state.hits = data.messages || [];
+  } catch (err) {
+    if (ticket !== searchTicket) return;
+    state.hits = [];
+    handleError(err, 'Không tìm được: ');
+  }
+  renderThreads();
+}
 
 // -------------------------------------------------------------------- media
 
@@ -481,7 +698,19 @@ function appendText(parent, text) {
   if (last < text.length) parent.append(text.slice(last));
 }
 
-function messageNode(m, prev, isGroup) {
+/** The picture next to an incoming message: the chat's, or the group member's. */
+function senderAvatar(m, t) {
+  if (t && t.kind === 'user') return avatar(t);
+  const p = state.people.get(m.sender_id);
+  const name = m.sender_name || personName(p);
+  const box = avatarBox(`zalo:u:${m.sender_id}`, name, p && p.avatar);
+  box.dataset.uid = m.sender_id;
+  box.title = name;
+  return box;
+}
+
+function messageNode(m, prev, t) {
+  const isGroup = Boolean(t && t.kind === 'group');
   const frag = document.createDocumentFragment();
   if (!prev || !sameDay(prev.sent_at, m.sent_at)) frag.appendChild(el('div', 'day', fmtDay(m.sent_at)));
   const recalled = m.kind === 'chat.undo';
@@ -493,7 +722,9 @@ function messageNode(m, prev, isGroup) {
   const bubble = el('div', cls);
   bubble.dataset.seq = String(m.seq);
   const newSender = !prev || prev.outgoing || prev.sender_id !== m.sender_id || !sameDay(prev.sent_at, m.sent_at);
-  if (isGroup && !m.outgoing && newSender) bubble.appendChild(el('div', 'sender', m.sender_name || 'Thành viên'));
+  if (isGroup && !m.outgoing && newSender) {
+    bubble.appendChild(el('div', 'sender', m.sender_name || personName(state.people.get(m.sender_id)) || 'Thành viên'));
+  }
   if (m.quote && !recalled) {
     const quote = el('div', 'quote');
     if (m.quote.sender_name) quote.appendChild(el('div', 'quote-name', m.quote.sender_name));
@@ -525,7 +756,16 @@ function messageNode(m, prev, isGroup) {
     });
     bubble.appendChild(button);
   }
-  frag.appendChild(bubble);
+  if (m.outgoing) {
+    frag.appendChild(bubble);
+  } else {
+    // Zalo shows the sender's picture once per run of their messages.
+    const face = newSender ? senderAvatar(m, t) : el('div', 'avatar spacer');
+    face.classList.add('msg-avatar');
+    const line = el('div', 'msg-line');
+    line.append(face, bubble);
+    frag.appendChild(line);
+  }
   return frag;
 }
 
@@ -683,9 +923,19 @@ async function react(m, icon) {
   }
 }
 
-function currentIsGroup() {
+/** Ask for the names and pictures of the senders shown in a group. */
+function wantSenders(messages) {
   const t = state.threads.get(state.current);
-  return Boolean(t && t.kind === 'group');
+  if (t && t.kind === 'group') wantPeople(messages.filter((m) => !m.outgoing).map((m) => m.sender_id));
+}
+
+/** Bring a message into view and make it blink once. */
+function showMessage(seq) {
+  const node = document.querySelector(`#messages .msg[data-seq="${seq}"]`);
+  if (!node) return;
+  node.scrollIntoView({ block: 'center' });
+  node.classList.add('flash');
+  setTimeout(() => node.classList.remove('flash'), 1800);
 }
 
 function renderMessages(scrollToEnd) {
@@ -699,12 +949,14 @@ function renderMessages(scrollToEnd) {
     box.appendChild(more);
   }
   if (!state.messages.length) box.appendChild(el('div', 'empty', 'Chưa có tin nhắn nào trong hội thoại này.'));
+  const t = state.threads.get(state.current);
   let prev = null;
   for (const m of state.messages) {
-    box.appendChild(messageNode(m, prev, currentIsGroup()));
+    box.appendChild(messageNode(m, prev, t));
     prev = m;
   }
   box.scrollTop = scrollToEnd ? box.scrollHeight : box.scrollHeight - fromBottom;
+  wantSenders(state.messages);
 }
 
 async function fetchMessages(id, before) {
@@ -712,7 +964,7 @@ async function fetchMessages(id, before) {
   return api(`/threads/${encodeURIComponent(id)}/messages?limit=50${query}`);
 }
 
-async function openThread(id) {
+async function openThread(id, focusSeq) {
   const t = state.threads.get(id);
   if (!t) return;
   askNotificationPermission();
@@ -733,11 +985,20 @@ async function openThread(id) {
   if (state.replyTo && state.replyTo.thread_id !== id) state.replyTo = null;
   renderReply();
   try {
-    const list = await fetchMessages(id);
+    let list = await fetchMessages(id);
+    let full = list.length === 50;
+    // A search result further back: older pages until it is there.
+    while (focusSeq && full && list.length < 1000 && list[0].seq > focusSeq) {
+      if (state.current !== id) return;
+      const older = await fetchMessages(id, list[0].seq);
+      full = older.length === 50;
+      list = older.concat(list);
+    }
     if (state.current !== id) return;
     state.messages = list;
-    state.hasOlder = list.length === 50;
-    renderMessages(true);
+    state.hasOlder = full;
+    renderMessages(!focusSeq);
+    if (focusSeq) showMessage(focusSeq);
   } catch (err) {
     handleError(err);
   }
@@ -765,8 +1026,9 @@ function appendMessage(m) {
     renderMessages(true);
     return;
   }
-  box.appendChild(messageNode(m, prev, currentIsGroup()));
+  box.appendChild(messageNode(m, prev, state.threads.get(state.current)));
   if (nearBottom || m.outgoing) box.scrollTop = box.scrollHeight;
+  wantSenders([m]);
 }
 
 async function markRead(id) {
@@ -806,7 +1068,7 @@ function renderChatSub() {
   if (!t) return;
   const typing = state.typing.get(t.id);
   sub.classList.toggle('typing', Boolean(typing));
-  sub.textContent = typing ? typingText(t, typing) : t.kind === 'group' ? 'Nhóm' : '';
+  sub.textContent = typing ? typingText(t, typing) : t.kind === 'group' ? membersText(t) : '';
 }
 
 function stopTyping(threadId) {
@@ -1278,6 +1540,7 @@ function threadFromMessage(m) {
     last_message_at: 0,
     unread: 0,
     preview: '',
+    members: 0,
   };
 }
 
@@ -1321,7 +1584,10 @@ function onMessageUpdated(payload) {
 function onStatus(s) {
   const wasValid = state.status && state.status.session === 'valid';
   renderStatus(s);
-  if (!wasValid && s.session === 'valid') loadThreads().catch(handleError);
+  if (!wasValid && s.session === 'valid') {
+    loadThreads().catch(handleError);
+    loadFriends();
+  }
   if ((s.session === 'logged_out' || s.session === 'rejected') && !state.loginPrompted) {
     state.loginPrompted = true;
     openLogin();
@@ -1337,6 +1603,7 @@ async function resync() {
   loadUploads();
   try {
     await loadThreads();
+    loadFriends();
     const id = state.current;
     if (!id) return;
     const list = await fetchMessages(id);
@@ -1395,8 +1662,21 @@ const SESSION_TEXT = {
   unknown: 'Zalo: chưa rõ trạng thái',
 };
 
+/** The account's picture at the top of the list. */
+function renderMe(s) {
+  const key = `${s.uid}|${s.avatar}|${s.display_name}`;
+  if (key === state.meKey) return;
+  state.meKey = key;
+  const box = avatarBox(`zalo:u:${s.uid || 'me'}`, s.display_name || 'Tôi', s.avatar);
+  box.id = 'me-avatar';
+  box.classList.add('me-avatar');
+  box.title = s.display_name ? `Tài khoản Zalo: ${s.display_name}` : 'Tài khoản Zalo';
+  $('me-avatar').replaceWith(box);
+}
+
 function renderStatus(s) {
   state.status = s;
+  renderMe(s);
   const pill = $('zalo-status');
   let cls = 'bad';
   let text = SESSION_TEXT[s.session] || `Zalo: ${s.session}`;
@@ -1486,6 +1766,7 @@ async function start() {
   state.statusLimits = st.limits || null;
   renderStatus(st.zalo);
   await loadThreads();
+  loadFriends();
   openStream();
   loadUploads();
   if (st.zalo.session === 'logged_out' || st.zalo.session === 'rejected') {

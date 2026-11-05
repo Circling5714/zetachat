@@ -67,6 +67,22 @@ pub struct Thread {
     pub unread: i64,
     /// Text of the newest message, empty without messages.
     pub preview: String,
+    /// Members of a group, 0 when unknown (and for 1-1 chats).
+    pub members: i64,
+}
+
+/// A Zalo user: a friend, a group member, this account.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Person {
+    pub uid: String,
+    /// The name Zalo shows for them; empty when unknown.
+    pub name: String,
+    pub zalo_name: String,
+    pub avatar: String,
+    /// In this account's friend list.
+    pub friend: bool,
+    /// When Zalo last told about them (ms); 0 for never.
+    pub updated_at: i64,
 }
 
 /// Create-or-update input for a thread.

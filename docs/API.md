@@ -11,8 +11,11 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/health` | `{ ok, version }`, không cần token |
 | POST | `/session` | Đổi token `{ "token": "zc_…" }` lấy cookie `zetachat_token` (HttpOnly, SameSite=Strict, thêm Secure khi đi qua HTTPS). Giao diện web dùng cách này |
 | DELETE | `/session` | Xóa cookie |
-| GET | `/status` | `zalo`: trạng thái phiên (`session` là `starting`, `logged_out`, `valid`, `rejected` hoặc `unknown`; `realtime`, `display_name`, `login`, `detail`). `last_event_seq`: số thứ tự sự kiện mới nhất, dùng làm `since` khi mở luồng sự kiện. `limits`: giới hạn gửi tệp Zalo đang áp dụng (`max_file_bytes`, `max_photo_bytes`, `blocked_extensions`) |
-| GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè chưa từng nhắn tin |
+| GET | `/status` | `zalo`: trạng thái phiên (`session` là `starting`, `logged_out`, `valid`, `rejected` hoặc `unknown`; `realtime`, `display_name`, `uid` và `avatar` của tài khoản, `login`, `detail`). `last_event_seq`: số thứ tự sự kiện mới nhất, dùng làm `since` khi mở luồng sự kiện. `limits`: giới hạn gửi tệp Zalo đang áp dụng (`max_file_bytes`, `max_photo_bytes`, `blocked_extensions`) |
+| GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè và nhóm chưa từng nhắn tin. Mỗi hội thoại có `members`: số thành viên của nhóm (0 khi chưa biết, và với chat 1-1) |
+| GET | `/friends` | Danh sách bạn bè: `[{ "uid", "name", "zalo_name", "avatar", "friend": true, "updated_at" }]`, đồng bộ mỗi khi phiên Zalo khởi động |
+| GET | `/people?ids=<uid>,<uid>…` | Tên và ảnh đại diện của người dùng (người gửi tin trong nhóm, thành viên nhóm), tối đa 100 id. Người gateway chưa biết, hoặc đã hơn 3 ngày chưa hỏi lại, được hỏi Zalo trước (50 người mỗi lần). Trả về những người gateway biết, theo thứ tự đã hỏi; người Zalo không trả lời có `name` rỗng |
+| GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu. Thêm `"reply_to": <seq>` để trả lời một tin: tin mới mang `quote` của tin đó |
 | POST | `/threads/{id}/messages/{seq}/recall` | Thu hồi một tin mình đã gửi, với mọi người trong cuộc trò chuyện; trả về tin đã thành `chat.undo`. `409` với tin của người khác, tin chưa được Zalo xác nhận hoặc đã thu hồi |

@@ -27,6 +27,7 @@ Cách dùng:
   zeta check   <session.json>                    hỏi Zalo phiên còn dùng được không
   zeta friends <session.json> [--names]          đếm (hoặc liệt kê) bạn bè
   zeta groups  <session.json> [--names]          đếm (hoặc liệt kê) nhóm
+  zeta people  <session.json>                    hỏi tên, ảnh của thành viên nhóm không phải bạn bè (chỉ in số đếm)
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
   zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
         Some("check") => check(rest).await,
         Some("friends") => friends(rest).await,
         Some("groups") => groups(rest).await,
+        Some("people") => people(rest).await,
         Some("recent") => recent(rest).await,
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
@@ -146,11 +148,44 @@ async fn groups(args: &[String]) -> Result<()> {
     let list = client.groups().await?;
     let named = list.iter().filter(|g| !g.name.is_empty()).count();
     println!("{} nhóm ({named} có tên)", list.len());
+    for g in &list {
+        println!(
+            "  nhóm: {} thành viên, Zalo liệt kê {} id, {} quản trị",
+            g.member_count,
+            g.member_ids.len(),
+            g.admin_ids.len()
+        );
+    }
     if args.iter().any(|a| a == "--names") {
         for g in &list {
             println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
         }
     }
+    Ok(())
+}
+
+/// Look up the group members who are not friends (`social/group/members`);
+/// prints counts only.
+async fn people(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let friends: Vec<String> = client.friends().await?.into_iter().map(|f| f.uid).collect();
+    let mut others: Vec<String> = Vec::new();
+    for g in client.groups().await? {
+        for uid in g.member_ids {
+            if !friends.contains(&uid) && !others.contains(&uid) {
+                others.push(uid);
+            }
+        }
+    }
+    let asked: Vec<String> = others.into_iter().take(50).collect();
+    let found = client.user_profiles(&asked).await?;
+    let named = found.iter().filter(|p| !p.display_name.is_empty()).count();
+    let pictured = found.iter().filter(|p| !p.avatar.is_empty()).count();
+    println!(
+        "hỏi {} người (không phải bạn bè): Zalo trả {} hồ sơ, {named} có tên, {pictured} có ảnh",
+        asked.len(),
+        found.len()
+    );
     Ok(())
 }
 

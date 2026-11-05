@@ -28,10 +28,12 @@ use tower_http::services::ServeFile;
 use crate::auth::AuthDevice;
 use crate::events::EventBus;
 use crate::media_cache::{self, FetchError, MediaCache};
-use crate::model::{split_thread_id, Message, StoredEvent, Thread};
+use crate::model::{now_ms, split_thread_id, Message, Person, StoredEvent, Thread};
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
-use crate::zalo::{photo_type, Attachment, LoginState, ReplyTo, ZaloCommand, ZaloHandle};
+use crate::zalo::{
+    photo_type, Attachment, LoginState, ReplyTo, SessionState, ZaloCommand, ZaloHandle,
+};
 
 /// Shared state of the HTTP handlers.
 #[derive(Clone)]
@@ -114,6 +116,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/uploads/{id}", delete(cancel_upload))
         .route("/api/v1/threads/{id}/read", post(mark_read))
         .route("/api/v1/threads/{id}/typing", post(typing))
+        .route("/api/v1/people", get(people))
+        .route("/api/v1/friends", get(friends))
+        .route("/api/v1/search", get(search))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
         .route("/api/v1/media", get(media))
@@ -237,6 +242,97 @@ async fn list_threads(
         )
         .map_err(ApiError::internal)?;
     Ok(Json(threads))
+}
+
+/// How long what Zalo said about a user is trusted before asking again.
+const PEOPLE_FRESH_MS: i64 = 3 * 24 * 3600 * 1000;
+
+#[derive(Deserialize)]
+struct PeopleQuery {
+    /// User ids, separated by commas; at most 100 are read.
+    #[serde(default)]
+    ids: String,
+}
+
+/// User ids of a query: digits only, no repeats, at most 100.
+fn user_ids(list: &str) -> Vec<String> {
+    let mut uids: Vec<String> = Vec::new();
+    for uid in list.split(',').map(str::trim) {
+        let valid = !uid.is_empty() && uid.len() <= 32 && uid.bytes().all(|b| b.is_ascii_digit());
+        if valid && !uids.iter().any(|u| u == uid) {
+            uids.push(uid.to_string());
+            if uids.len() == 100 {
+                break;
+            }
+        }
+    }
+    uids
+}
+
+/// Name and avatar of users: message senders, group members. Users the gateway
+/// does not know, or has not heard about for days, are asked about first (at
+/// most 50 at a time); the answer has the users the gateway knows, in the order
+/// asked. A user Zalo says nothing about comes back with an empty name.
+async fn people(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Query(q): Query<PeopleQuery>,
+) -> ApiResult<Vec<Person>> {
+    let uids = user_ids(&q.ids);
+    let known = st.store.people(&uids).map_err(ApiError::internal)?;
+    let now = now_ms();
+    let stale: Vec<String> = uids
+        .iter()
+        .filter(|uid| {
+            !known
+                .iter()
+                .any(|p| &p.uid == *uid && now - p.updated_at < PEOPLE_FRESH_MS)
+        })
+        .take(50)
+        .cloned()
+        .collect();
+    if stale.is_empty() || st.zalo.status().session != SessionState::Valid {
+        return Ok(Json(known));
+    }
+    let (reply, answer) = oneshot::channel();
+    let command = ZaloCommand::LookupPeople { uids: stale, reply };
+    if st.zalo.commands.send(command).await.is_ok() {
+        if let Ok(Err(e)) = answer.await {
+            tracing::debug!(error = %e, "people lookup failed");
+        }
+    }
+    let people = st.store.people(&uids).map_err(ApiError::internal)?;
+    Ok(Json(people))
+}
+
+/// The friend list, with names and avatars.
+async fn friends(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Vec<Person>> {
+    Ok(Json(st.store.friends().map_err(ApiError::internal)?))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+    limit: Option<i64>,
+}
+
+/// Messages containing the text searched for, ignoring case and Vietnamese
+/// marks, newest first: `{ "messages": [...] }`.
+async fn search(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Value> {
+    let limit = usize::try_from(clamp(q.limit, 30)).unwrap_or(30);
+    let query: String = q.q.chars().take(100).collect();
+    let store = st.store.clone();
+    // A search may read the whole history: not on the async workers.
+    let messages = tokio::task::spawn_blocking(move || store.search_messages(&query, limit))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "messages": messages })))
 }
 
 #[derive(Deserialize)]
