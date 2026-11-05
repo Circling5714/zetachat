@@ -28,6 +28,7 @@ use zeta_zalo::api::LastOnline;
 use zeta_zalo::sticker::Sticker;
 
 use crate::auth::AuthDevice;
+use crate::autoreply;
 use crate::events::EventBus;
 use crate::media_cache::{self, CachedFile, FetchError, MediaCache};
 use crate::model::{
@@ -156,6 +157,14 @@ pub fn router(state: AppState) -> Router {
             delete(remove_bank_account),
         )
         .route("/api/v1/vietqr.svg", get(vietqr_svg))
+        .route("/api/v1/auto-replies", get(list_scripts).post(add_script))
+        .route("/api/v1/auto-replies/paused", put(pause_scripts))
+        .route("/api/v1/auto-replies/try", post(try_scripts))
+        .route("/api/v1/auto-replies/log", get(script_log))
+        .route(
+            "/api/v1/auto-replies/{script}",
+            put(update_script).delete(remove_script),
+        )
         .route("/api/v1/threads/{id}/board", get(group_board))
         .route("/api/v1/threads/{id}/board/{topic}", delete(remove_topic))
         .route("/api/v1/threads/{id}/polls", post(create_poll))
@@ -913,6 +922,192 @@ async fn remove_bank_account(
     ))
 }
 
+#[derive(Deserialize)]
+struct ScriptBody {
+    name: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(flatten)]
+    rule: autoreply::Rule,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn scripts_json(st: &AppState) -> Result<Value, ApiError> {
+    let paused = st
+        .store
+        .setting("auto_reply_paused")
+        .map_err(ApiError::internal)?
+        .as_deref()
+        == Some("1");
+    Ok(json!({
+        "paused": paused,
+        "scripts": st.store.scripts().map_err(ApiError::internal)?,
+        "utc_offset_minutes": autoreply::utc_offset_minutes(),
+    }))
+}
+
+/// Auto-reply scripts: `{ paused, scripts, utc_offset_minutes }`.
+async fn list_scripts(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Value> {
+    Ok(Json(scripts_json(&st)?))
+}
+
+async fn add_script(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Json(body): Json<ScriptBody>,
+) -> ApiResult<Value> {
+    let (name, rule) = autoreply::checked(&body.name, body.rule).map_err(ApiError::bad_request)?;
+    if st.store.scripts().map_err(ApiError::internal)?.len() >= autoreply::MAX_RULES {
+        return Err(ApiError::bad_request("đã có quá nhiều kịch bản"));
+    }
+    st.store
+        .add_script(&name, body.enabled, &rule)
+        .map_err(ApiError::internal)?;
+    Ok(Json(scripts_json(&st)?))
+}
+
+async fn update_script(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(script): Path<i64>,
+    Json(body): Json<ScriptBody>,
+) -> ApiResult<Value> {
+    let (name, rule) = autoreply::checked(&body.name, body.rule).map_err(ApiError::bad_request)?;
+    if !st
+        .store
+        .update_script(script, &name, body.enabled, &rule)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found("script"));
+    }
+    Ok(Json(scripts_json(&st)?))
+}
+
+async fn remove_script(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(script): Path<i64>,
+) -> ApiResult<Value> {
+    st.store.remove_script(script).map_err(ApiError::internal)?;
+    Ok(Json(scripts_json(&st)?))
+}
+
+#[derive(Deserialize)]
+struct PausedBody {
+    paused: bool,
+}
+
+async fn pause_scripts(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Json(body): Json<PausedBody>,
+) -> ApiResult<Value> {
+    st.store
+        .set_setting("auto_reply_paused", if body.paused { "1" } else { "0" })
+        .map_err(ApiError::internal)?;
+    Ok(Json(scripts_json(&st)?))
+}
+
+#[derive(Deserialize)]
+struct TryBody {
+    /// A script not saved yet; without it, the saved ones are tried in order.
+    #[serde(default)]
+    script: Option<ScriptBody>,
+    text: String,
+    /// The chat the message comes from; a stranger's 1-1 chat when absent.
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// For groups: the message names the account.
+    #[serde(default)]
+    mentioned: bool,
+}
+
+/// Try scripts on a message without sending anything: `{ answered,
+/// script_id, name, reply, reasons: [{ script_id, name, reason }] }`.
+async fn try_scripts(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Json(body): Json<TryBody>,
+) -> ApiResult<Value> {
+    let thread = body.thread_id.unwrap_or_else(|| "zalo:u:0".into());
+    let (kind, remote) = split_thread_id(&thread).ok_or_else(|| ApiError::not_found("thread"))?;
+    let friend = kind == ThreadKind::User
+        && st
+            .store
+            .people(&[remote.to_string()])
+            .map_err(ApiError::internal)?
+            .first()
+            .is_some_and(|p| p.friend);
+    let name = st
+        .store
+        .thread(&thread)
+        .map_err(ApiError::internal)?
+        .filter(|_| kind == ThreadKind::User)
+        .map(|t| if t.alias.is_empty() { t.name } else { t.alias })
+        .unwrap_or_default();
+    let incoming = autoreply::Incoming {
+        thread_id: thread.clone(),
+        group: kind == ThreadKind::Group,
+        friend,
+        mentioned: body.mentioned,
+        text: body.text,
+        sender_name: name,
+        last_own_at: st
+            .store
+            .last_own_message_at(&thread)
+            .map_err(ApiError::internal)?,
+        now: now_ms(),
+        utc_offset_minutes: autoreply::utc_offset_minutes(),
+    };
+    let scripts: Vec<(i64, String, bool, autoreply::Rule)> = match body.script {
+        Some(s) => vec![(0, s.name, s.enabled, s.rule)],
+        None => st
+            .store
+            .scripts()
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(|s| (s.id, s.name, s.enabled, s.rule))
+            .collect(),
+    };
+    let mut reasons = Vec::new();
+    for (id, name, enabled, rule) in scripts {
+        match autoreply::check(enabled, &rule, &incoming) {
+            Ok(()) => {
+                return Ok(Json(json!({
+                    "answered": true,
+                    "script_id": id,
+                    "name": name,
+                    "reply": autoreply::render(&rule.reply, &incoming),
+                    "reasons": reasons,
+                })))
+            }
+            Err(miss) => {
+                reasons.push(json!({ "script_id": id, "name": name, "reason": miss.text() }));
+            }
+        }
+    }
+    Ok(Json(json!({ "answered": false, "reasons": reasons })))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    limit: Option<i64>,
+}
+
+async fn script_log(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Query(q): Query<LogQuery>,
+) -> ApiResult<Vec<autoreply::LogEntry>> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(
+        st.store.auto_reply_log(limit).map_err(ApiError::internal)?,
+    ))
+}
+
 /// Ask the connector about polls, notes and reminders.
 async fn ask_boards(st: &AppState, action: BoardAction) -> Result<Value, ApiError> {
     let (reply, answer) = oneshot::channel();
@@ -949,7 +1144,9 @@ async fn group_board(
     Path(id): Path<String>,
 ) -> ApiResult<Value> {
     let group_id = group_of(&id)?;
-    Ok(Json(ask_boards(&st, BoardAction::Board { group_id }).await?))
+    Ok(Json(
+        ask_boards(&st, BoardAction::Board { group_id }).await?,
+    ))
 }
 
 async fn remove_topic(
@@ -1180,7 +1377,9 @@ async fn create_reminder(
     let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
     let title = body.title.trim();
     if title.is_empty() || title.chars().count() > POLL_TEXT_MAX {
-        return Err(ApiError::bad_request("nhắc hẹn cần tiêu đề (tối đa 200 ký tự)"));
+        return Err(ApiError::bad_request(
+            "nhắc hẹn cần tiêu đề (tối đa 200 ký tự)",
+        ));
     }
     if body.repeat > 3 {
         return Err(ApiError::bad_request("kiểu lặp không hợp lệ"));

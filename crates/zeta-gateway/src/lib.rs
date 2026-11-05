@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod autoreply;
 pub mod demo;
 pub mod events;
 pub mod media;

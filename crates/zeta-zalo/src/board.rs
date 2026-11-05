@@ -511,10 +511,7 @@ impl ZaloClient {
                 }),
             ),
         };
-        match self
-            .get_encrypted(Service::GroupBoard, path, &params)
-            .await
-        {
+        match self.get_encrypted(Service::GroupBoard, path, &params).await {
             Ok(data) => Ok(reminders_of(data)),
             // How Zalo says "none" (seen live on chats without reminders).
             Err(Error::Server { code: -1, .. }) => Ok(Vec::new()),

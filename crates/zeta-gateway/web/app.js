@@ -1934,6 +1934,7 @@ $('forward').addEventListener('click', (e) => {
 // the group's board as Zalo keeps it. One dialog (the sheet) shows each.
 
 function openSheet(title, body, actions) {
+  $('sheet').querySelector('.sheet-card').classList.remove('wide');
   $('sheet-title').textContent = title;
   $('sheet-body').replaceChildren(...body);
   const row = $('sheet-actions');
@@ -2320,6 +2321,290 @@ async function openBoard() {
   actions.push(['Tạo nhắc hẹn', newReminder]);
   openSheet(title, body, actions);
 }
+
+// ----------------------------------------------------------- auto replies
+//
+// Scripts the gateway answers new messages with: which chats, which words,
+// when, and what to say. The first script that fits answers; each pauses
+// between answers in a chat, and a chat gets at most 6 an hour.
+
+const auto = { data: null, log: [] };
+const SCOPE_TEXT = {
+  users: 'Mọi tin nhắn 1-1',
+  strangers: 'Tin 1-1 từ người lạ (chưa kết bạn)',
+  friends: 'Tin 1-1 từ bạn bè',
+  mentions: 'Tin trong nhóm có nhắc tên bạn (@)',
+  threads: 'Chỉ các cuộc trò chuyện chọn dưới đây',
+};
+const MATCH_TEXT = {
+  any: 'Mọi nội dung',
+  contains: 'Có chứa một trong các từ khóa',
+  exact: 'Đúng nguyên văn một từ khóa',
+  starts: 'Bắt đầu bằng một từ khóa',
+};
+const DAY_TEXT = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'];
+const AUTO_PRESETS = [
+  {
+    name: 'Ngoài giờ làm việc',
+    scope: 'users', match: 'any', keywords: [],
+    schedule: { days: [], from: '18:00', to: '08:00' },
+    reply: 'Chào {ten}, hiện mình đang ngoài giờ làm việc. Mình sẽ trả lời bạn sớm nhất vào sáng mai nhé!',
+    cooldown_minutes: 240, delay_seconds: 5, away_minutes: 0,
+  },
+  {
+    name: 'Chào người lạ',
+    scope: 'strangers', match: 'any', keywords: [], schedule: null,
+    reply: 'Xin chào {ten}! Cảm ơn bạn đã nhắn tin, mình sẽ phản hồi trong ít phút.',
+    cooldown_minutes: 1440, delay_seconds: 3, away_minutes: 0,
+  },
+  {
+    name: 'Hỏi giá',
+    scope: 'users', match: 'contains', keywords: ['giá', 'bao nhiêu', 'báo giá'], schedule: null,
+    reply: 'Chào {ten}, bạn đang quan tâm sản phẩm nào để mình gửi bảng giá chi tiết nhé!',
+    cooldown_minutes: 60, delay_seconds: 3, away_minutes: 0,
+  },
+  {
+    name: 'Đang bận',
+    scope: 'users', match: 'any', keywords: [], schedule: null,
+    reply: 'Mình đang bận một chút, lát nữa mình nhắn lại nha.',
+    cooldown_minutes: 30, delay_seconds: 10, away_minutes: 15,
+  },
+];
+
+function scriptSummary(s) {
+  const parts = [s.scope === 'threads' ? `${s.threads.length} cuộc trò chuyện` : SCOPE_TEXT[s.scope]];
+  if (s.match !== 'any') parts.push(`${MATCH_TEXT[s.match].toLowerCase()}: ${s.keywords.map((k) => `"${k}"`).join(', ')}`);
+  if (s.schedule) {
+    const days = s.schedule.days.length ? s.schedule.days.map((d) => DAY_TEXT[d]).join(', ') : 'mọi ngày';
+    parts.push(`${days}, ${s.schedule.from}–${s.schedule.to}`);
+  }
+  if (s.away_minutes) parts.push(`khi bạn im lặng ${s.away_minutes} phút`);
+  parts.push(`nghỉ ${s.cooldown_minutes} phút giữa hai lần`);
+  return parts.join(' · ');
+}
+
+async function openAuto() {
+  openSheet('Trả lời tự động', [el('p', 'muted', 'Đang tải…')], [['Đóng', closeSheet, 'btn secondary']]);
+  try {
+    [auto.data, auto.log] = await Promise.all([api('/auto-replies'), api('/auto-replies/log?limit=20')]);
+  } catch (err) {
+    closeSheet();
+    handleError(err, 'Không tải được trả lời tự động: ');
+    return;
+  }
+  renderAuto();
+}
+
+function renderAuto() {
+  const d = auto.data;
+  const body = [];
+  body.push(el('div', 'sheet-meta', 'Gateway tự trả lời tin nhắn mới bằng kịch bản đầu tiên phù hợp (theo thứ tự dưới đây). Mỗi kịch bản nghỉ một lúc giữa hai lần trả lời cùng một người, và mỗi cuộc trò chuyện nhận tối đa 6 tin tự động mỗi giờ. Tin của "Cloud của tôi" và tin cũ không được trả lời.'));
+  const [pauseRow, pause] = checkRow('Tạm dừng tất cả', d.paused);
+  pause.addEventListener('change', async () => {
+    try {
+      auto.data = await api('/auto-replies/paused', { method: 'PUT', json: { paused: pause.checked } });
+      toast(pause.checked ? 'Đã tạm dừng trả lời tự động' : 'Trả lời tự động đang chạy');
+    } catch (err) {
+      pause.checked = !pause.checked;
+      handleError(err);
+    }
+  });
+  body.push(pauseRow);
+  body.push(el('h3', null, `Kịch bản (${d.scripts.length})`));
+  if (!d.scripts.length) body.push(el('div', 'sheet-meta', 'Chưa có kịch bản nào. Thêm mới, hoặc bắt đầu từ một mẫu dưới đây.'));
+  for (const s of d.scripts) {
+    const item = el('div', s.enabled ? 'board-item' : 'board-item script-off');
+    const head = el('div', 'script-head');
+    const on = el('input');
+    on.type = 'checkbox';
+    on.checked = s.enabled;
+    on.title = 'Bật / tắt kịch bản';
+    on.addEventListener('change', async () => {
+      try {
+        auto.data = await api(`/auto-replies/${s.id}`, { method: 'PUT', json: { ...s, enabled: on.checked } });
+        renderAuto();
+      } catch (err) {
+        on.checked = !on.checked;
+        handleError(err);
+      }
+    });
+    head.append(on, el('div', 'board-title', s.name));
+    item.append(head, el('div', 'sheet-meta', scriptSummary(s)), el('div', 'quick-text', s.reply));
+    const row = el('div', 'row');
+    row.append(boardButton('Sửa', () => editScript(s)), boardButton('Xóa', async () => {
+      if (!window.confirm(`Xóa kịch bản "${s.name}"?`)) return;
+      try {
+        auto.data = await api(`/auto-replies/${s.id}`, { method: 'DELETE' });
+        renderAuto();
+      } catch (err) {
+        handleError(err, 'Không xóa được: ');
+      }
+    }));
+    item.append(row);
+    body.push(item);
+  }
+  body.push(el('h3', null, 'Mẫu có sẵn'));
+  const presets = el('div', 'preset-row');
+  for (const p of AUTO_PRESETS) presets.append(boardButton(p.name, () => editScript(null, p)));
+  body.push(presets);
+  body.push(el('h3', null, 'Đã trả lời gần đây'));
+  if (!auto.log.length) body.push(el('div', 'sheet-meta', 'Chưa trả lời tự động lần nào.'));
+  for (const e of auto.log) {
+    const item = el('div', 'board-item log-item');
+    item.append(
+      el('div', 'board-title', `${e.thread_name || 'Cuộc trò chuyện'} · ${fmtWhen(e.at)}`),
+      el('div', 'sheet-meta', `Tin đến: ${e.message_text}`),
+      el('div', 'sheet-meta', e.error ? `Không gửi được: ${e.error}` : e.reply_text ? `Đã trả lời (${e.script_name}): ${e.reply_text}` : 'Đang chờ gửi…'),
+    );
+    body.push(item);
+  }
+  openSheet('Trả lời tự động', body, [['Đóng', closeSheet, 'btn secondary'], ['+ Thêm kịch bản', () => editScript(null)]]);
+  $('sheet').querySelector('.sheet-card').classList.add('wide');
+}
+
+/** Write a new script (from `preset`) or change `s`. */
+function editScript(s, preset) {
+  const base = s || preset || { name: '', scope: 'users', match: 'contains', keywords: [], schedule: null, reply: '', cooldown_minutes: 60, delay_seconds: 3, away_minutes: 0, threads: [], except_threads: [] };
+  const name = field('input', { placeholder: 'Tên kịch bản', maxLength: 80, value: base.name || '' });
+  const scope = field('select');
+  for (const [k, label] of Object.entries(SCOPE_TEXT)) {
+    const o = el('option', null, label);
+    o.value = k;
+    scope.append(o);
+  }
+  scope.value = base.scope || 'users';
+  // Chats for the "threads" scope: the recent ones, searchable.
+  const chosen = new Set(base.threads || []);
+  const pickSearch = field('input', { type: 'search', placeholder: 'Tìm cuộc trò chuyện' });
+  const pick = el('div', 'thread-pick');
+  const renderPick = () => {
+    pick.replaceChildren();
+    const q = fold(pickSearch.value.trim());
+    const list = [...state.threads.values()]
+      .filter((t) => !q || fold(threadName(t)).includes(q))
+      .sort((a, b) => (b.last_message_at || 0) - (a.last_message_at || 0))
+      .slice(0, 80);
+    for (const t of list) {
+      const row = el('label');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = chosen.has(t.id);
+      box.addEventListener('change', () => (box.checked ? chosen.add(t.id) : chosen.delete(t.id)));
+      row.append(box, document.createTextNode(threadName(t) + (t.kind === 'group' ? ' (nhóm)' : '')));
+      pick.append(row);
+    }
+  };
+  pickSearch.addEventListener('input', renderPick);
+  const pickBox = el('div', 'sheet-body');
+  pickBox.append(pickSearch, pick);
+  const showPick = () => { pickBox.hidden = scope.value !== 'threads'; };
+  scope.addEventListener('change', showPick);
+  renderPick();
+  showPick();
+  const match = field('select');
+  for (const [k, label] of Object.entries(MATCH_TEXT)) {
+    const o = el('option', null, label);
+    o.value = k;
+    match.append(o);
+  }
+  match.value = base.match || 'any';
+  const keywords = field('textarea', { rows: 2, placeholder: 'Từ khóa, mỗi dòng một từ (không phân biệt hoa thường, có dấu hay không)', value: (base.keywords || []).join('\n') });
+  const showKeywords = () => { keywords.hidden = match.value === 'any'; };
+  match.addEventListener('change', showKeywords);
+  showKeywords();
+  const [timedRow, timed] = checkRow('Chỉ trong khung giờ', Boolean(base.schedule));
+  const sched = base.schedule || { days: [1, 2, 3, 4, 5], from: '18:00', to: '08:00' };
+  const days = el('div', 'day-row');
+  const dayBoxes = DAY_TEXT.map((label, i) => {
+    const l = el('label');
+    const box = el('input');
+    box.type = 'checkbox';
+    box.checked = !sched.days.length || sched.days.includes(i);
+    l.append(box, document.createTextNode(label));
+    days.append(l);
+    return box;
+  });
+  const from = field('input', { type: 'time', value: sched.from });
+  const to = field('input', { type: 'time', value: sched.to });
+  const hours = el('div', 'sheet-row');
+  hours.append(el('span', 'sheet-meta', 'Từ'), from, el('span', 'sheet-meta', 'đến'), to);
+  const schedBox = el('div', 'sheet-body');
+  schedBox.append(days, hours, el('div', 'sheet-meta', 'Giờ kết thúc sớm hơn giờ bắt đầu nghĩa là qua đêm (ví dụ 18:00 đến 08:00).'));
+  const showSched = () => { schedBox.hidden = !timed.checked; };
+  timed.addEventListener('change', showSched);
+  showSched();
+  const away = field('input', { type: 'number', min: 0, max: 10080, value: base.away_minutes || 0 });
+  const awayRow = el('div', 'sheet-row');
+  awayRow.append(el('span', 'sheet-meta', 'Chỉ khi bạn chưa nhắn trong cuộc trò chuyện (phút, 0 là luôn trả lời)'), away);
+  const reply = field('textarea', { rows: 4, maxLength: 2000, placeholder: 'Nội dung trả lời. Dùng {ten} cho tên người nhắn, {gio} giờ hiện tại, {ngay} ngày.', value: base.reply || '' });
+  const delay = field('input', { type: 'number', min: 0, max: 600, value: base.delay_seconds ?? 3 });
+  const cooldown = field('input', { type: 'number', min: 1, max: 10080, value: base.cooldown_minutes || 60 });
+  const timing = el('div', 'sheet-row');
+  timing.append(el('span', 'sheet-meta', 'Chờ (giây)'), delay, el('span', 'sheet-meta', 'Nghỉ giữa hai lần (phút)'), cooldown);
+  const collect = () => ({
+    name: name.value.trim(),
+    enabled: s ? s.enabled : true,
+    scope: scope.value,
+    threads: [...chosen],
+    except_threads: base.except_threads || [],
+    match: match.value,
+    keywords: keywords.value.split('\n').map((k) => k.trim()).filter(Boolean),
+    schedule: timed.checked
+      ? { days: dayBoxes.every((b) => b.checked) ? [] : dayBoxes.map((b, i) => (b.checked ? i : -1)).filter((i) => i >= 0), from: from.value, to: to.value }
+      : null,
+    away_minutes: Number(away.value) || 0,
+    reply: reply.value.trim(),
+    delay_seconds: Number(delay.value) || 0,
+    cooldown_minutes: Number(cooldown.value) || 1,
+  });
+  // Try the script on a message, in the open chat (or a stranger's), sending nothing.
+  const sample = field('input', { placeholder: 'Thử: nhập một tin nhắn mẫu' });
+  const tryButton = boardButton('Thử', async () => {
+    const t = state.threads.get(state.current);
+    result.hidden = false;
+    try {
+      const r = await api('/auto-replies/try', {
+        json: { script: collect(), text: sample.value, thread_id: t ? t.id : null, mentioned: true },
+      });
+      result.className = r.answered ? 'try-result ok' : 'try-result no';
+      result.textContent = r.answered
+        ? `Sẽ trả lời${t ? ` trong "${threadName(t)}"` : ''}:\n${r.reply}`
+        : `Không trả lời: ${(r.reasons[0] || {}).reason || 'không khớp'}`;
+    } catch (err) {
+      result.className = 'try-result no';
+      result.textContent = err.message;
+    }
+  });
+  const tryRow = el('div', 'sheet-row');
+  tryRow.append(sample, tryButton);
+  const result = el('div', 'try-result');
+  result.hidden = true;
+  const label = (text) => el('h3', null, text);
+  openSheet(s ? 'Sửa kịch bản' : 'Kịch bản mới', [
+    name, label('Áp dụng cho'), scope, pickBox, label('Khi tin nhắn có'), match, keywords,
+    label('Thời gian'), timedRow, schedBox, awayRow, label('Trả lời'), reply, timing,
+    label('Thử kịch bản (không gửi)'), tryRow, result,
+  ], [
+    ['Quay lại', () => renderAuto(), 'btn secondary'],
+    ['Lưu kịch bản', async (e) => {
+      const body = collect();
+      e.currentTarget.disabled = true;
+      try {
+        auto.data = s
+          ? await api(`/auto-replies/${s.id}`, { method: 'PUT', json: body })
+          : await api('/auto-replies', { json: body });
+        toast('Đã lưu kịch bản');
+        renderAuto();
+      } catch (err) {
+        e.currentTarget.disabled = false;
+        handleError(err, 'Không lưu được: ');
+      }
+    }],
+  ]);
+  $('sheet').querySelector('.sheet-card').classList.add('wide');
+}
+
+$('auto-btn').addEventListener('click', openAuto);
 
 $('more-btn').addEventListener('click', (e) => {
   e.stopPropagation();
@@ -4972,6 +5257,11 @@ function openStream() {
   es.addEventListener('typing', (e) => onTyping(JSON.parse(e.data)));
   // History was loaded on the gateway: reload lists instead of replaying messages.
   es.addEventListener('threads_changed', (e) => { track(e); resync(); });
+  es.addEventListener('auto_reply', (e) => {
+    track(e);
+    // The log in the open "Trả lời tự động" sheet, if it shows.
+    if (!$('sheet').hidden && $('sheet-title').textContent === 'Trả lời tự động') openAuto();
+  });
   es.addEventListener('thread_read', (e) => {
     track(e);
     const p = JSON.parse(e.data);

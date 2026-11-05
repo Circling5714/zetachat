@@ -23,6 +23,7 @@ use zeta_zalo::upload::{self, FileLimits, FileSource, UploadedFile};
 use zeta_zalo::{reaction, receipt, typing};
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
+use crate::autoreply;
 use crate::events::EventBus;
 use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
@@ -251,15 +252,30 @@ pub enum ZaloCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoardAction {
     /// What a group's board holds: `[{ type: note | pinned | poll, … }]`.
-    Board { group_id: String },
+    Board {
+        group_id: String,
+    },
     /// A poll as it stands.
-    Poll { id: u64 },
-    CreatePoll { group_id: String, poll: NewPoll },
+    Poll {
+        id: u64,
+    },
+    CreatePoll {
+        group_id: String,
+        poll: NewPoll,
+    },
     /// Vote for these options (none: take the vote back); answers the poll.
-    Vote { id: u64, options: Vec<u64> },
+    Vote {
+        id: u64,
+        options: Vec<u64>,
+    },
     /// Add options to a poll that allows it; answers the poll.
-    AddOptions { id: u64, options: Vec<String> },
-    ClosePoll { id: u64 },
+    AddOptions {
+        id: u64,
+        options: Vec<String>,
+    },
+    ClosePoll {
+        id: u64,
+    },
     CreateNote {
         group_id: String,
         text: String,
@@ -272,8 +288,14 @@ pub enum BoardAction {
         pin: bool,
     },
     /// Delete a note or a group reminder.
-    RemoveTopic { group_id: String, id: String },
-    Reminders { kind: ThreadKind, remote_id: String },
+    RemoveTopic {
+        group_id: String,
+        id: String,
+    },
+    Reminders {
+        kind: ThreadKind,
+        remote_id: String,
+    },
     CreateReminder {
         kind: ThreadKind,
         remote_id: String,
@@ -557,6 +579,7 @@ pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
         stickers: Arc::default(),
         presence: Arc::default(),
         banks: Arc::default(),
+        answering: Arc::default(),
     };
     tokio::spawn(connector.run(rx));
     handle
@@ -699,6 +722,8 @@ struct Connector {
     stickers: Arc<StickerCache>,
     presence: PresenceCache,
     banks: BankList,
+    /// Chats an auto reply is being written for.
+    answering: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The banks Zalo can send accounts of, kept a day: `(when asked, banks)`.
@@ -1696,7 +1721,60 @@ impl Connector {
     fn store_incoming(&self, m: ParsedMessage) {
         if let Some(message) = self.store_parsed(m, true) {
             publish_message(&self.store, &self.bus, &message);
+            self.consider_auto_reply(&message);
         }
+    }
+
+    /// Answer a new incoming message with the first auto-reply script that
+    /// fits (see [`crate::autoreply`]).
+    fn consider_auto_reply(&self, message: &Message) {
+        if message.outgoing
+            || message.kind == "chat.undo"
+            || message.media.as_ref().is_some_and(|m| m.kind == "notice")
+            || now_ms() - message.sent_at > autoreply::FRESH_MS
+        {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        // "Cloud của tôi" is the account itself.
+        let cloud = client
+            .session()
+            .map(|s| s.send2me_id.clone())
+            .unwrap_or_default();
+        if !cloud.is_empty() && message.thread_id == thread_id(ThreadKind::User, &cloud) {
+            return;
+        }
+        let answering = self.answering.clone();
+        if !answering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(message.thread_id.clone())
+        {
+            // An answer to this chat is already on its way.
+            return;
+        }
+        let me = Me {
+            uid: self.self_uid.clone(),
+            name: self
+                .status
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .display_name
+                .clone(),
+        };
+        let (store, bus, message) = (self.store.clone(), self.bus.clone(), message.clone());
+        tokio::spawn(async move {
+            let thread = message.thread_id.clone();
+            if let Err(e) = auto_reply(&client, &store, &bus, &me, &message).await {
+                tracing::warn!(error = %e, "auto reply failed");
+            }
+            answering
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&thread);
+        });
     }
 
     /// A recall changes the recalled message instead of adding a message.
@@ -2309,6 +2387,101 @@ async fn quick_action(client: &ZaloClient, action: QuickAction) -> Result<Value,
     let mut items = client.quick_messages().await.map_err(err)?;
     items.sort_by(|a, b| a.keyword.cmp(&b.keyword));
     Ok(json!(items))
+}
+
+/// Decide, wait and send an auto reply to `message`, logging it.
+async fn auto_reply(
+    client: &ZaloClient,
+    store: &Store,
+    bus: &EventBus,
+    me: &Me,
+    message: &Message,
+) -> Result<(), String> {
+    let err = |e: rusqlite::Error| e.to_string();
+    if store.setting("auto_reply_paused").map_err(err)?.as_deref() == Some("1") {
+        return Ok(());
+    }
+    let scripts = store.scripts().map_err(err)?;
+    if !scripts.iter().any(|s| s.enabled) {
+        return Ok(());
+    }
+    let now = now_ms();
+    let thread = &message.thread_id;
+    if store
+        .auto_replies_since(thread, now - 3_600_000)
+        .map_err(err)?
+        >= autoreply::MAX_PER_CHAT_PER_HOUR
+    {
+        tracing::info!("auto reply skipped: this chat had enough of them this hour");
+        return Ok(());
+    }
+    let Some((kind, remote_id)) = crate::model::split_thread_id(thread) else {
+        return Ok(());
+    };
+    let sender = store
+        .people(std::slice::from_ref(&message.sender_id))
+        .map_err(err)?
+        .into_iter()
+        .next();
+    let incoming = autoreply::Incoming {
+        thread_id: thread.clone(),
+        group: kind == ThreadKind::Group,
+        friend: sender.as_ref().is_some_and(|p| p.friend),
+        mentioned: message
+            .mentions
+            .iter()
+            .any(|m| m.uid == "-1" || m.uid == me.uid),
+        text: message.text.clone(),
+        sender_name: sender
+            .as_ref()
+            .map(person_name)
+            .filter(|n| n != "Người dùng Zalo")
+            .unwrap_or_else(|| message.sender_name.clone()),
+        last_own_at: store.last_own_message_at(thread).map_err(err)?,
+        now,
+        utc_offset_minutes: autoreply::utc_offset_minutes(),
+    };
+    let chosen = autoreply::pick(&scripts, &incoming, |id| {
+        store.last_auto_reply(id, thread).unwrap_or(i64::MAX)
+    });
+    let Some(script) = chosen else {
+        return Ok(());
+    };
+    // Logged first: other messages arriving meanwhile see the pause start.
+    let log = store
+        .log_auto_reply(script.id, thread, message.seq)
+        .map_err(err)?;
+    let text = autoreply::render(&script.rule.reply, &incoming);
+    if script.rule.delay_seconds > 0 {
+        tokio::time::sleep(Duration::from_secs(u64::from(script.rule.delay_seconds))).await;
+    }
+    let outcome = send_and_store(
+        client,
+        store,
+        bus,
+        me,
+        (kind, remote_id),
+        (&text, &TextExtras::default()),
+        None,
+    )
+    .await;
+    let (reply_seq, error) = match &outcome {
+        Ok(sent) => (Some(sent.seq), String::new()),
+        Err(e) => (None, e.clone()),
+    };
+    store
+        .finish_auto_reply(log, reply_seq, &error)
+        .map_err(err)?;
+    tracing::info!(script = script.id, sent = reply_seq.is_some(), "auto reply");
+    let entry = store
+        .auto_reply_log(1)
+        .map_err(err)?
+        .into_iter()
+        .find(|e| e.id == log);
+    if let Err(e) = bus.publish("auto_reply", json!({ "entry": entry })) {
+        tracing::error!(error = %e, "cannot publish an auto reply");
+    }
+    outcome.map(|_| ())
 }
 
 /// What a card action needs besides the client.

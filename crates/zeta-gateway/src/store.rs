@@ -13,6 +13,7 @@ use serde_json::Value;
 use zeta_zalo::reaction::reaction_emoji;
 
 use crate::auth;
+use crate::autoreply::{LogEntry, Rule, Script};
 use crate::media;
 #[cfg(test)]
 use crate::model::Mention;
@@ -126,6 +127,31 @@ CREATE TABLE quick_messages (
 );
 ";
 
+/// Version 14: auto-reply scripts, what they answered, and settings.
+const SCHEMA_V14: &str = "
+CREATE TABLE auto_replies (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    rule       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE auto_reply_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    script_id   INTEGER NOT NULL,
+    thread_id   TEXT NOT NULL,
+    message_seq INTEGER NOT NULL,
+    reply_seq   INTEGER,
+    at          INTEGER NOT NULL,
+    error       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX auto_reply_log_thread ON auto_reply_log (thread_id, at);
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+";
+
 /// Version 8: the names the account gives its contacts.
 const SCHEMA_V8: &str = "ALTER TABLE people ADD COLUMN alias TEXT NOT NULL DEFAULT '';";
 
@@ -157,7 +183,7 @@ ALTER TABLE messages ADD COLUMN urgency INTEGER NOT NULL DEFAULT 0;
 const CARD_ECHO_MS: i64 = 15_000;
 
 /// The version `init` brings every database to.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Version 13: polls, cards and tasks, shown as their message type before.
 const REPARSED_IN_V13: [&str; 3] = ["group.poll", "chat.ecard", "chat.todo"];
@@ -698,6 +724,12 @@ impl Store {
             tx.pragma_update(None, "user_version", 13)?;
             tx.commit()?;
         }
+        if version < 14 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V14)?;
+            tx.pragma_update(None, "user_version", 14)?;
+            tx.commit()?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -752,6 +784,173 @@ impl Store {
             set_alias_in(&tx, uid, alias)?;
         }
         tx.commit()
+    }
+
+    /// Auto-reply scripts, in the order they are tried.
+    pub fn scripts(&self) -> Result<Vec<Script>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT id, name, enabled, rule, updated_at FROM auto_replies ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, enabled, rule, updated_at) = row?;
+            // A script this version cannot read is left out, not an error.
+            if let Ok(rule) = serde_json::from_str::<Rule>(&rule) {
+                out.push(Script {
+                    id,
+                    name,
+                    enabled,
+                    rule,
+                    updated_at,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn add_script(&self, name: &str, enabled: bool, rule: &Rule) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO auto_replies (name, enabled, rule, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                name,
+                enabled,
+                serde_json::to_string(rule).unwrap_or_default(),
+                now_ms()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// False when there is no such script.
+    pub fn update_script(&self, id: i64, name: &str, enabled: bool, rule: &Rule) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE auto_replies SET name = ?2, enabled = ?3, rule = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![
+                id,
+                name,
+                enabled,
+                serde_json::to_string(rule).unwrap_or_default(),
+                now_ms()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn remove_script(&self, id: i64) -> Result<bool> {
+        let removed = self
+            .conn()
+            .execute("DELETE FROM auto_replies WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Note that a script is answering a message; returns the log entry's id.
+    pub fn log_auto_reply(&self, script_id: i64, thread_id: &str, message_seq: i64) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO auto_reply_log (script_id, thread_id, message_seq, at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![script_id, thread_id, message_seq, now_ms()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// How an answer went: the message sent, or what went wrong.
+    pub fn finish_auto_reply(&self, id: i64, reply_seq: Option<i64>, error: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE auto_reply_log SET reply_seq = ?2, error = ?3 WHERE id = ?1",
+            params![id, reply_seq, error],
+        )?;
+        Ok(())
+    }
+
+    /// When a script last answered in a chat (ms), 0 never.
+    pub fn last_auto_reply(&self, script_id: i64, thread_id: &str) -> Result<i64> {
+        self.conn().query_row(
+            "SELECT COALESCE(MAX(at), 0) FROM auto_reply_log WHERE script_id = ?1 AND thread_id = ?2",
+            params![script_id, thread_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Answers given in a chat since `since` (ms), by any script.
+    pub fn auto_replies_since(&self, thread_id: &str, since: i64) -> Result<usize> {
+        let n: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM auto_reply_log WHERE thread_id = ?1 AND at >= ?2",
+            params![thread_id, since],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// When the account itself last wrote in a chat (ms), not counting auto
+    /// replies; 0 never.
+    pub fn last_own_message_at(&self, thread_id: &str) -> Result<i64> {
+        self.conn().query_row(
+            "SELECT COALESCE(MAX(sent_at), 0) FROM messages m
+             WHERE m.thread_id = ?1 AND m.outgoing = 1
+               AND NOT EXISTS (SELECT 1 FROM auto_reply_log l WHERE l.reply_seq = m.seq)",
+            params![thread_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// The latest answers, newest first.
+    pub fn auto_reply_log(&self, limit: i64) -> Result<Vec<LogEntry>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT l.id, l.script_id, COALESCE(a.name, ''), l.thread_id,
+                    COALESCE(t.name, ''), COALESCE(m.text, ''), COALESCE(r.text, ''), l.at, l.error
+             FROM auto_reply_log l
+             LEFT JOIN auto_replies a ON a.id = l.script_id
+             LEFT JOIN threads t ON t.id = l.thread_id
+             LEFT JOIN messages m ON m.seq = l.message_seq
+             LEFT JOIN messages r ON r.seq = l.reply_seq
+             ORDER BY l.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(LogEntry {
+                id: r.get(0)?,
+                script_id: r.get(1)?,
+                script_name: r.get(2)?,
+                thread_id: r.get(3)?,
+                thread_name: r.get(4)?,
+                message_text: r.get(5)?,
+                reply_text: r.get(6)?,
+                at: r.get(7)?,
+                error: r.get(8)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// The quick messages zetachat keeps, by keyword.
@@ -1575,6 +1774,49 @@ mod tests {
             sent_at: at,
             raw: "{}".into(),
         }
+    }
+
+    #[test]
+    fn auto_reply_scripts_and_their_log() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "Lan"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        let rule = Rule {
+            reply: "Chào {ten}".into(),
+            cooldown_minutes: 5,
+            ..Rule::default()
+        };
+        let id = s.add_script("Chào", true, &rule).unwrap();
+        assert_eq!(s.scripts().unwrap()[0].rule, rule);
+        assert!(s.update_script(id, "Chào khách", false, &rule).unwrap());
+        assert!(!s.scripts().unwrap()[0].enabled);
+        // The account wrote at 10, the gateway answered at 20 (not "own").
+        s.insert_message(&msg(&t, "m1", "", true, 10)).unwrap();
+        let incoming = s
+            .insert_message(&msg(&t, "m2", "", false, 15))
+            .unwrap()
+            .unwrap();
+        let reply = s
+            .insert_message(&msg(&t, "m3", "", true, 20))
+            .unwrap()
+            .unwrap();
+        let log = s.log_auto_reply(id, &t, incoming.seq).unwrap();
+        s.finish_auto_reply(log, Some(reply.seq), "").unwrap();
+        assert_eq!(s.last_own_message_at(&t).unwrap(), 10);
+        assert!(s.last_auto_reply(id, &t).unwrap() > 0);
+        assert_eq!(s.auto_replies_since(&t, 0).unwrap(), 1);
+        let entries = s.auto_reply_log(10).unwrap();
+        assert_eq!(entries[0].script_name, "Chào khách");
+        assert_eq!(entries[0].reply_text, "text m3");
+        assert_eq!(s.setting("auto_reply_paused").unwrap(), None);
+        s.set_setting("auto_reply_paused", "1").unwrap();
+        s.set_setting("auto_reply_paused", "0").unwrap();
+        assert_eq!(
+            s.setting("auto_reply_paused").unwrap().as_deref(),
+            Some("0")
+        );
+        assert!(s.remove_script(id).unwrap());
+        assert!(s.scripts().unwrap().is_empty());
     }
 
     #[test]

@@ -235,6 +235,10 @@ Tin bình chọn trong nhóm là `group.poll`. Theo mã Zalo Web, `content.param
 
 Chưa thử, vì phải ghi vào nhóm có người thật: tạo bình chọn, bình chọn, thêm phương án, khóa bình chọn, tạo ghi chú và nhắc hẹn nhóm.
 
+## 8s. Trả lời tự động
+
+Zalo có dịch vụ `auto_reply` riêng (`auto-rep-msg.chat.zalo.me`, zca-js `createAutoReply`…). `getServerInfo` cho tài khoản thử `autoReplies: { max_rules: 5, max_active_rules: 5 }`. Một quy tắc của Zalo chỉ có một câu trả lời, một khoảng thời gian và phạm vi (mọi người, người lạ, vài người). zetachat không dùng dịch vụ này. Gateway tự chạy kịch bản: có từ khóa, lịch theo ngày trong tuần, điều kiện "khi vắng mặt", thời gian chờ, nhắc tên trong nhóm, nhật ký và nút thử. Tin trả lời được gửi như mọi tin chữ khác.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

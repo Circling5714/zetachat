@@ -483,7 +483,11 @@ async fn probe(args: &[String]) -> Result<()> {
     if params.get("imei").is_some_and(|v| v == "auto") {
         params["imei"] = serde_json::json!(client.device().imei);
     }
-    let max = if args.get(4).map(String::as_str) == Some("--deep") { 7 } else { 3 };
+    let max = if args.get(4).map(String::as_str) == Some("--deep") {
+        7
+    } else {
+        3
+    };
     match client.get_encrypted(service, path, &params).await {
         Ok(data) => println!("OK {}", shape_to(&data, 0, max)),
         Err(e) => println!("LỖI {e}"),
@@ -754,7 +758,8 @@ async fn board(args: &[String]) -> Result<()> {
         }
         "unremind-title" => {
             // Only the reminder with exactly this title.
-            let (Some(kind), Some(id), Some(title)) = (args.get(2), args.get(3), args.get(4)) else {
+            let (Some(kind), Some(id), Some(title)) = (args.get(2), args.get(3), args.get(4))
+            else {
                 bail!("cần: board <session.json> unremind-title user|group <id> <tiêu đề>");
             };
             let chat = recipient(&client, kind, id)?;

@@ -613,6 +613,22 @@ a.btn { display: inline-block; text-decoration: none; }
 .bank-form { display: grid; gap: 8px; border-top: 1px solid var(--border); padding-top: 10px; }
 .bank-form textarea { resize: vertical; font: inherit; }
 .sheet-card { width: min(480px, 100%); }
+.sheet-card.wide { width: min(620px, 100%); }
+.script-head { display: flex; align-items: center; gap: 8px; }
+.script-head .board-title { flex: 1; min-width: 0; }
+.script-off .board-title { color: var(--muted); }
+.preset-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.preset-row .btn { padding: 5px 10px; font-size: 13px; }
+.day-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.day-row label { display: inline-flex; align-items: center; gap: 3px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 13px; cursor: pointer; }
+.thread-pick { max-height: 180px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; padding: 4px; }
+.thread-pick label { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 8px; font-size: 14px; cursor: pointer; }
+.thread-pick label:hover { background: var(--hover); }
+.try-result { padding: 8px 10px; border-radius: 10px; background: var(--hover); font-size: 13px; white-space: pre-wrap; }
+.try-result.ok { border-left: 3px solid var(--ok); }
+.try-result.no { border-left: 3px solid var(--warn); }
+.log-item { font-size: 13px; }
+.log-item .sheet-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sheet-card .row { flex-wrap: wrap; }
 #sheet-actions .btn { white-space: nowrap; }
 .sheet-body { display: grid; gap: 10px; overflow-y: auto; min-height: 0; }

@@ -44,6 +44,11 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | POST, PUT | `/threads/{id}/notes`, `/threads/{id}/notes/{note}` | Tạo hay sửa ghi chú của nhóm `{ "text", "pin" }` (`pin` ghim lên đầu cuộc trò chuyện) |
 | GET, POST | `/threads/{id}/reminders` | Nhắc hẹn của cuộc trò chuyện (cả 1-1): `[{ "id", "title", "emoji", "creator", "start_at", "repeat", "accepted", "rejected" }]`. POST `{ "title", "emoji", "start_at", "repeat" }` (`repeat`: 0 không lặp, 1 hàng ngày, 2 hàng tuần, 3 hàng tháng; thời điểm phải ở tương lai) |
 | DELETE | `/threads/{id}/reminders/{reminder}` | Xóa một nhắc hẹn |
+| GET, POST | `/auto-replies` | Kịch bản trả lời tự động: `{ "paused", "scripts": […], "utc_offset_minutes" }`. Một kịch bản: `{ "id", "name", "enabled", "scope", "threads", "except_threads", "match", "keywords", "schedule", "away_minutes", "reply", "delay_seconds", "cooldown_minutes" }`. `scope`: `users` (mọi chat 1-1), `strangers`, `friends`, `mentions` (tin nhóm nhắc tên mình), `threads` (chỉ các `threads`). `match`: `any`, `contains`, `exact`, `starts` (không phân biệt hoa thường, dấu, khoảng trắng). `schedule`: `null` hoặc `{ "days": [0–6, 0 là Chủ nhật; rỗng là mọi ngày], "from": "HH:MM", "to": "HH:MM" }`, giờ địa phương; `to` sớm hơn `from` là qua đêm. `away_minutes`: chỉ trả lời khi tài khoản chưa nhắn trong cuộc trò chuyện từng ấy phút. `reply` dùng `{ten}`, `{gio}`, `{ngay}`. POST thêm một kịch bản, trả về như GET |
+| PUT, DELETE | `/auto-replies/{id}` | Sửa (cùng dạng như POST) hay xóa một kịch bản |
+| PUT | `/auto-replies/paused` | `{ "paused": true }` tạm dừng mọi kịch bản |
+| POST | `/auto-replies/try` | Thử, không gửi gì: `{ "text", "thread_id", "mentioned", "script" }` (`script` là kịch bản chưa lưu; thiếu thì thử các kịch bản đã lưu theo thứ tự). Trả về `{ "answered", "script_id", "name", "reply", "reasons": [{ "script_id", "name", "reason" }] }` |
+| GET | `/auto-replies/log?limit=` | Những lần đã trả lời, mới nhất trước: `[{ "id", "script_id", "script_name", "thread_id", "thread_name", "message_text", "reply_text", "at", "error" }]` |
 | GET, POST | `/quick-messages` | Tin nhắn nhanh: `[{ "id", "keyword", "text", "photo", "updated_at", "zalo" }]`, theo phím tắt. `id` là `zalo:<số>` (Zalo giữ, đồng bộ với điện thoại) hoặc `local:<số>` (zetachat giữ). POST `{ "keyword", "text", "zalo" }` thêm một tin (`zalo: true` để lưu lên Zalo); phím tắt không có khoảng trắng, tối đa 20 ký tự, dấu `/` ở đầu được bỏ. Phím tắt đã có thì `409`. Trả về danh sách mới |
 | PUT, DELETE | `/quick-messages/{id}` | Sửa `{ "keyword", "text" }` hoặc xóa một tin; trả về danh sách mới. Tin của Zalo có ảnh thì sửa trên điện thoại |
 | GET | `/vietqr.svg?bin=&number=&amount=&note=` | Mã VietQR (SVG) để app ngân hàng quét và chuyển tiền tới tài khoản; `amount` (đồng) và `note` không bắt buộc. Gateway tự tạo, không hỏi Zalo |
@@ -123,6 +128,7 @@ Lượt gửi không sống qua lần khởi động lại gateway: tệp chưa 
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |
 | `upload` | `{ "upload": {…} }`: tiến độ một lượt gửi tệp, vài lần mỗi giây khi đang gửi |
+| `auto_reply` | `{ "entry": {…} }`: gateway vừa trả lời tự động một tin (dạng như `/auto-replies/log`); bản thân tin trả lời đến qua `message` |
 | `typing` | `{ "thread_id", "user_id", "name" }`: ai đó đang soạn tin; Zalo nhắc lại vài giây một lần trong lúc họ còn gõ, client tự tắt sau khoảng 6 giây |
 
 Mỗi sự kiện có `id` là số thứ tự tăng dần. Client lưu `id` cuối cùng đã nhận; khi mất mạng và nối lại, gửi nó qua `Last-Event-ID` (hoặc `?since=`) để nhận phần còn thiếu. Riêng `upload` và `typing` không vào nhật ký và không có `id`: client đang mất kết nối sẽ bỏ lỡ chúng; khi nối lại, hỏi `/uploads` để biết các lượt gửi tệp.

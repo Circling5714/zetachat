@@ -477,7 +477,11 @@ fn notice_media(content: Option<&Value>) -> Option<Media> {
     let p = params(content);
     let label = p
         .pointer("/actions/0/actionLabelv2")
-        .and_then(|l| ["vi", "en"].into_iter().find_map(|k| l.get(k).and_then(Value::as_str)))
+        .and_then(|l| {
+            ["vi", "en"]
+                .into_iter()
+                .find_map(|k| l.get(k).and_then(Value::as_str))
+        })
         .unwrap_or("")
         .to_string();
     Some(Media {
@@ -498,13 +502,10 @@ fn ecard_media(content: Option<&Value>) -> Option<Media> {
         return None;
     }
     let p = params(content);
-    let reminder = p
-        .get("actions")
-        .and_then(Value::as_array)
-        .is_some_and(|a| {
-            a.iter()
-                .any(|x| x.get("actionId").and_then(Value::as_str) == Some("action.open.reminder"))
-        });
+    let reminder = p.get("actions").and_then(Value::as_array).is_some_and(|a| {
+        a.iter()
+            .any(|x| x.get("actionId").and_then(Value::as_str) == Some("action.open.reminder"))
+    });
     Some(Media {
         kind: "ecard".into(),
         url: if reminder {
@@ -847,7 +848,10 @@ mod tests {
         let m = extract("webchat", Some(&notice)).unwrap();
         assert_eq!((m.kind.as_str(), m.description.as_str()), ("notice", "Xem"));
         assert_eq!(m.name, "Lan tạo nhắc hẹn mới Họp - 17:53.");
-        assert_eq!(summarize("webchat", Some(&notice)), "Lan tạo nhắc hẹn mới Họp - 17:53.");
+        assert_eq!(
+            summarize("webchat", Some(&notice)),
+            "Lan tạo nhắc hẹn mới Họp - 17:53."
+        );
         let card = json!({
             "action": "show.profile", "title": "⏰ Họp", "description": "Thứ Năm, 5 tháng 11 lúc 17:53",
             "href": "https://zalo.me/x", "thumb": "https://res-zalo.zadn.vn/r.png",
@@ -866,13 +870,26 @@ mod tests {
             "params": "{\"pollId\":501,\"question\":\"Đi đâu chơi?\"}"
         });
         let m = extract("group.poll", Some(&poll)).unwrap();
-        assert_eq!((m.kind.as_str(), m.poll_id, m.name.as_str()), ("poll", 501, "Đi đâu chơi?"));
-        assert_eq!(summarize("group.poll", Some(&poll)), "[Bình chọn] Đi đâu chơi?");
+        assert_eq!(
+            (m.kind.as_str(), m.poll_id, m.name.as_str()),
+            ("poll", 501, "Đi đâu chơi?")
+        );
+        assert_eq!(
+            summarize("group.poll", Some(&poll)),
+            "[Bình chọn] Đi đâu chơi?"
+        );
         assert!(extract("group.poll", Some(&json!({ "title": "x" }))).is_none());
-        let card = json!({ "title": "Sinh nhật", "params": { "previewTxt": "Chúc mừng sinh nhật!" } });
+        let card =
+            json!({ "title": "Sinh nhật", "params": { "previewTxt": "Chúc mừng sinh nhật!" } });
         assert_eq!(summarize("chat.ecard", Some(&card)), "Chúc mừng sinh nhật!");
-        assert_eq!(summarize("chat.ecard", Some(&json!({ "title": "Tết" }))), "[Thiệp] Tết");
-        assert_eq!(summarize("chat.todo", Some(&json!({ "title": "Báo cáo" }))), "[Công việc] Báo cáo");
+        assert_eq!(
+            summarize("chat.ecard", Some(&json!({ "title": "Tết" }))),
+            "[Thiệp] Tết"
+        );
+        assert_eq!(
+            summarize("chat.todo", Some(&json!({ "title": "Báo cáo" }))),
+            "[Công việc] Báo cáo"
+        );
     }
 
     #[test]

@@ -1497,18 +1497,142 @@ async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
 }
 
 #[tokio::test]
+async fn auto_reply_scripts_are_kept_and_tried() {
+    let f = fixture();
+    let (status, out) = call(&f, "GET", "/api/v1/auto-replies", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (out["paused"].clone(), out["scripts"].clone()),
+        (json!(false), json!([]))
+    );
+    let script = json!({
+        "name": "Hỏi giá", "scope": "users", "match": "contains",
+        "keywords": ["giá", "bao nhiêu"], "reply": "Chào {ten}, giá ở đây ạ", "cooldown_minutes": 30
+    });
+    let (status, out) = call(
+        &f,
+        "POST",
+        "/api/v1/auto-replies",
+        Some(script.clone()),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let saved = &out["scripts"][0];
+    assert_eq!(
+        (saved["name"].as_str(), saved["enabled"].as_bool()),
+        (Some("Hỏi giá"), Some(true))
+    );
+    assert_eq!(saved["match"], "contains");
+    // Tried without sending.
+    let (_, tried) = call(
+        &f,
+        "POST",
+        "/api/v1/auto-replies/try",
+        Some(json!({ "text": "Cái này GIA bao nhieu?" })),
+        true,
+    )
+    .await;
+    assert_eq!(tried["answered"], true, "{tried}");
+    assert_eq!(tried["reply"], "Chào bạn, giá ở đây ạ");
+    let (_, tried) = call(
+        &f,
+        "POST",
+        "/api/v1/auto-replies/try",
+        Some(json!({ "text": "Xin chào" })),
+        true,
+    )
+    .await;
+    assert_eq!(tried["answered"], false);
+    assert_eq!(tried["reasons"][0]["reason"], "tin nhắn không khớp từ khóa");
+    // A group message is out of a 1-1 script's reach.
+    let group = thread_id(ThreadKind::Group, "71");
+    let (_, tried) = call(
+        &f,
+        "POST",
+        "/api/v1/auto-replies/try",
+        Some(json!({ "text": "giá?", "thread_id": group })),
+        true,
+    )
+    .await;
+    assert_eq!(tried["answered"], false);
+    // An unsaved script can be tried too.
+    let draft = json!({ "script": { "name": "Nháp", "reply": "OK" }, "text": "x" });
+    let (_, tried) = call(&f, "POST", "/api/v1/auto-replies/try", Some(draft), true).await;
+    assert_eq!(
+        (tried["answered"].clone(), tried["reply"].clone()),
+        (json!(true), json!("OK"))
+    );
+    let id = saved["id"].as_i64().unwrap();
+    let off = json!({ "name": "Hỏi giá", "enabled": false, "reply": "x" });
+    let (status, out) = call(
+        &f,
+        "PUT",
+        &format!("/api/v1/auto-replies/{id}"),
+        Some(off),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(out["scripts"][0]["enabled"], false);
+    let (status, _) = call(
+        &f,
+        "POST",
+        "/api/v1/auto-replies",
+        Some(json!({ "name": "x", "reply": " " })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, out) = call(
+        &f,
+        "PUT",
+        "/api/v1/auto-replies/paused",
+        Some(json!({ "paused": true })),
+        true,
+    )
+    .await;
+    assert_eq!(out["paused"], true);
+    let (status, log) = call(&f, "GET", "/api/v1/auto-replies/log", None, true).await;
+    assert_eq!((status, log), (StatusCode::OK, json!([])));
+    let (_, out) = call(
+        &f,
+        "DELETE",
+        &format!("/api/v1/auto-replies/{id}"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(out["scripts"], json!([]));
+}
+
+#[tokio::test]
 async fn polls_notes_and_reminders_are_checked() {
     let f = fixture();
     let group = thread_id(ThreadKind::Group, "71");
     let user = thread_id(ThreadKind::User, "70");
     // Polls and notes live in groups only.
     let poll = json!({ "question": " Đi đâu? ", "options": [" Biển ", "Núi", "Biển", ""], "multiple": true });
-    let (status, out) = call(&f, "POST", &format!("/api/v1/threads/{group}/polls"), Some(poll.clone()), true).await;
+    let (status, out) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{group}/polls"),
+        Some(poll.clone()),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{out}");
     let asked = out["asked"].as_str().unwrap();
     assert!(asked.contains(r#"question: "Đi đâu?""#), "{asked}");
     assert!(asked.contains(r#"options: ["Biển", "Núi"]"#), "{asked}");
-    let (status, _) = call(&f, "POST", &format!("/api/v1/threads/{user}/polls"), Some(poll), true).await;
+    let (status, _) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/polls"),
+        Some(poll),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(
         &f,
@@ -1519,17 +1643,55 @@ async fn polls_notes_and_reminders_are_checked() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, out) = call(&f, "POST", "/api/v1/polls/501/vote", Some(json!({ "options": [2] })), true).await;
+    let (status, out) = call(
+        &f,
+        "POST",
+        "/api/v1/polls/501/vote",
+        Some(json!({ "options": [2] })),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(out["asked"], "Vote { id: 501, options: [2] }");
-    let (status, _) = call(&f, "POST", "/api/v1/polls/501/options", Some(json!({ "options": [" "] })), true).await;
+    let (status, _) = call(
+        &f,
+        "POST",
+        "/api/v1/polls/501/options",
+        Some(json!({ "options": [" "] })),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, out) = call(&f, "POST", &format!("/api/v1/threads/{group}/notes"), Some(json!({ "text": " Ghi chú ", "pin": true })), true).await;
+    let (status, out) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{group}/notes"),
+        Some(json!({ "text": " Ghi chú ", "pin": true })),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(out["asked"].as_str().unwrap().contains(r#"text: "Ghi chú", pin: true"#));
-    let (status, _) = call(&f, "POST", &format!("/api/v1/threads/{user}/notes"), Some(json!({ "text": "x" })), true).await;
+    assert!(out["asked"]
+        .as_str()
+        .unwrap()
+        .contains(r#"text: "Ghi chú", pin: true"#));
+    let (status, _) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/notes"),
+        Some(json!({ "text": "x" })),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _) = call(&f, "DELETE", &format!("/api/v1/threads/{group}/board/a%20b"), None, true).await;
+    let (status, _) = call(
+        &f,
+        "DELETE",
+        &format!("/api/v1/threads/{group}/board/a%20b"),
+        None,
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     // Reminders: 1-1 chats too, never in the past.
     let soon = zeta_gateway::model::now_ms() + 3_600_000;
@@ -1542,13 +1704,23 @@ async fn polls_notes_and_reminders_are_checked() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{out}");
-    assert!(out["asked"].as_str().unwrap().contains(r#"title: "Gọi mẹ""#));
+    assert!(out["asked"]
+        .as_str()
+        .unwrap()
+        .contains(r#"title: "Gọi mẹ""#));
     for bad in [
         json!({ "title": "x", "start_at": 1000 }),
         json!({ "title": " ", "start_at": soon }),
         json!({ "title": "x", "start_at": soon, "repeat": 4 }),
     ] {
-        let (status, _) = call(&f, "POST", &format!("/api/v1/threads/{user}/reminders"), Some(bad), true).await;
+        let (status, _) = call(
+            &f,
+            "POST",
+            &format!("/api/v1/threads/{user}/reminders"),
+            Some(bad),
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
