@@ -20,6 +20,7 @@ pub mod media;
 pub mod message;
 pub mod param_cipher;
 pub mod reaction;
+pub mod receipt;
 pub mod session;
 pub mod socket;
 pub mod sticker;

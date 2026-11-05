@@ -50,7 +50,7 @@ Mã hội thoại có dạng `zalo:u:<id người dùng>` hoặc `zalo:g:<id nh�
 
 ## Tin nhắn và media
 
-Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, `sender_name`, `outgoing`, `kind` (`msgType` của Zalo: `webchat`, `chat.photo`, `chat.video.msg`, `chat.sticker`, `share.file`…), `text`, `sent_at` (mili giây), `media` và `quote`.
+Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, `sender_name`, `outgoing`, `kind` (`msgType` của Zalo: `webchat`, `chat.photo`, `chat.video.msg`, `chat.sticker`, `share.file`…), `text`, `sent_at` (mili giây), `media`, `quote` và `status`: với tin của chính mình, 0 là đã gửi, 1 là đã tới máy người nhận, 2 là đã được xem.
 
 `quote` là tin được trả lời (`null` nếu không phải tin trả lời): `{ "sender_name", "text", "remote_id" }`. `reactions` là cảm xúc dưới tin, nhiều nhất trước: `[{ "icon": "/-heart", "emoji": "❤️", "count": 3, "mine": true }]`; mỗi người thả được nhiều lần, `count` đếm tất cả, `mine` cho biết tài khoản này có thả biểu tượng đó. Tin bị người gửi thu hồi có `kind` là `chat.undo`, `text` là "Tin nhắn đã được thu hồi", không còn `media` hay `quote`; gateway xóa hẳn nội dung gốc khỏi kho.
 
@@ -95,7 +95,7 @@ Lượt gửi không sống qua lần khởi động lại gateway: tệp chưa 
 | `message` | `{ "message": {…}, "thread": {…} }`: tin nhắn mới, đến hay đi |
 | `message_updated` | `{ "message": {…}, "thread": {…} }`: một tin đã lưu thay đổi (bị thu hồi, có cảm xúc mới); client thay tin có cùng `seq` |
 | `message_deleted` | `{ "thread_id", "seq", "thread" }`: một tin đã bị xóa ở phía mình; client bỏ tin có `seq` đó |
-| `thread_read` | `{ "thread_id": "…" }` |
+| `thread_read` | `{ "thread_id", "unread" }`: hội thoại đã được đọc, ở đây hoặc trên thiết bị khác của tài khoản (ví dụ điện thoại); `unread` là số tin còn chưa đọc (thường là 0) |
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |
 | `upload` | `{ "upload": {…} }`: tiến độ một lượt gửi tệp, vài lần mỗi giây khi đang gửi |

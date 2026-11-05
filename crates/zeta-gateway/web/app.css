@@ -487,6 +487,8 @@ a.btn { display: inline-block; text-decoration: none; }
 }
 .msg.media .quote { margin: 4px 6px 4px; }
 .older { align-self: center; margin-bottom: 8px; }
+.sent-status { align-self: flex-end; margin: 0 6px 2px; font-size: 11px; color: var(--muted); }
+.sent-status.seen { color: var(--primary); }
 
 /* Media in messages */
 .msg.media { padding: 3px; }

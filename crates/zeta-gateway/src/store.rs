@@ -115,7 +115,14 @@ const PERSON_COLUMNS: &str = "uid, name, zalo_name, avatar, friend, updated_at";
 /// Most messages a search looks through, newest first.
 const SEARCH_SCAN: i64 = 200_000;
 const MESSAGE_COLUMNS: &str = "seq, thread_id, remote_id, client_id, sender_id, sender_name, \
-    outgoing, kind, text, sent_at, media, quote";
+    outgoing, kind, text, sent_at, media, quote, status";
+
+/// Version 6: how far the account's messages got (delivered, seen), and an
+/// index to find a message by Zalo's id alone, as receipts give it.
+const SCHEMA_V6: &str = "
+ALTER TABLE messages ADD COLUMN status INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX messages_remote ON messages (remote_id);
+";
 
 fn thread_from_row(row: &Row<'_>) -> Result<Thread> {
     let kind: String = row.get(1)?;
@@ -182,6 +189,7 @@ fn message_from_row(row: &Row<'_>) -> Result<Message> {
         media: from_json(&row.get::<_, String>(10)?),
         quote: from_json(&row.get::<_, String>(11)?),
         reactions: Vec::new(),
+        status: row.get(12)?,
     })
 }
 
@@ -300,12 +308,14 @@ fn reparse_content(conn: &Connection) -> Result<usize> {
 }
 
 /// Turn a message into a recalled one: its content is dropped for good.
+/// Returns its `seq`, `None` when it is not stored or already recalled.
+/// (Also used while upgrading old databases: it reads no column added later.)
 fn recall_in(
     conn: &Connection,
     thread_id: &str,
     remote_id: &str,
     client_id: &str,
-) -> Result<Option<Message>> {
+) -> Result<Option<i64>> {
     let found: Option<(i64, String)> = conn
         .query_row(
             "SELECT seq, remote_id FROM messages WHERE thread_id = ?1 AND kind <> 'chat.undo'
@@ -335,12 +345,7 @@ fn recall_in(
             params![thread_id, stored_id],
         )?;
     }
-    conn.query_row(
-        &format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq = ?1"),
-        params![seq],
-        message_from_row,
-    )
-    .optional()
+    Ok(Some(seq))
 }
 
 /// Recall notices stored as messages by earlier versions: apply them to the
@@ -454,6 +459,12 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA_V5)?;
             tx.pragma_update(None, "user_version", 5)?;
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V6)?;
+            tx.pragma_update(None, "user_version", 6)?;
             tx.commit()?;
         }
         Ok(Self {
@@ -732,6 +743,7 @@ impl Store {
             quote: m.quote.clone(),
             sent_at: m.sent_at,
             reactions: Vec::new(),
+            status: 0,
         }))
     }
 
@@ -744,7 +756,11 @@ impl Store {
         remote_id: &str,
         client_id: &str,
     ) -> Result<Option<Message>> {
-        recall_in(&self.conn(), thread_id, remote_id, client_id)
+        let recalled = recall_in(&self.conn(), thread_id, remote_id, client_id)?;
+        match recalled {
+            Some(seq) => self.message(seq),
+            None => Ok(None),
+        }
     }
 
     /// The message this gateway sent with `client_id`, if stored.
@@ -782,6 +798,104 @@ impl Store {
         out.reverse();
         attach_reactions(&conn, thread_id, &mut out)?;
         Ok(out)
+    }
+
+    /// One of this account's messages (by any of Zalo's ids for it) reached the
+    /// other side, `seen` or just delivered: it and the account's earlier
+    /// messages in that conversation move up to that status. Returns the
+    /// message when it is the conversation's newest of the account's and its
+    /// status changed (clients show the status under that one).
+    pub fn mark_receipt(&self, msg_ids: &[String], seen: bool) -> Result<Option<Message>> {
+        let status: i64 = if seen { 2 } else { 1 };
+        let newest = {
+            let conn = self.conn();
+            let mut found: Option<(i64, String)> = None;
+            for id in msg_ids.iter().filter(|id| !id.is_empty()) {
+                // Zalo's id first; the client id of a message sent from here
+                // in case a receipt names that one.
+                found = conn
+                    .query_row(
+                        "SELECT seq, thread_id FROM messages
+                         WHERE outgoing = 1 AND (remote_id = ?1 OR client_id = ?1)
+                         ORDER BY remote_id = ?1 DESC, seq DESC LIMIT 1",
+                        params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if found.is_some() {
+                    break;
+                }
+            }
+            let Some((seq, thread_id)) = found else {
+                return Ok(None);
+            };
+            let newest: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT seq, status FROM messages WHERE thread_id = ?1 AND outgoing = 1
+                     ORDER BY seq DESC LIMIT 1",
+                    params![thread_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            conn.execute(
+                "UPDATE messages SET status = ?3
+                 WHERE thread_id = ?1 AND outgoing = 1 AND seq <= ?2 AND status < ?3",
+                params![thread_id, seq, status],
+            )?;
+            match newest {
+                Some((newest, before)) if newest == seq && before < status => Some(seq),
+                _ => None,
+            }
+        };
+        match newest {
+            Some(seq) => self.message(seq),
+            None => Ok(None),
+        }
+    }
+
+    /// The account read a thread up to `last_msg_id` on another device: its
+    /// unread count drops to the incoming messages after that one (to none
+    /// when that message is not stored here). Returns the new count when it
+    /// dropped.
+    pub fn read_elsewhere(&self, thread_id: &str, last_msg_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn();
+        let current: Option<i64> = conn
+            .query_row(
+                "SELECT unread FROM threads WHERE id = ?1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(current) = current.filter(|n| *n > 0) else {
+            return Ok(None);
+        };
+        let read_up_to: Option<i64> = if last_msg_id.is_empty() {
+            None
+        } else {
+            conn.query_row(
+                "SELECT seq FROM messages WHERE thread_id = ?1 AND remote_id = ?2",
+                params![thread_id, last_msg_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        let left: i64 = match read_up_to {
+            Some(seq) => conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND outgoing = 0 AND seq > ?2",
+                params![thread_id, seq],
+                |r| r.get(0),
+            )?,
+            None => 0,
+        };
+        let left = left.min(current);
+        if left == current {
+            return Ok(None);
+        }
+        conn.execute(
+            "UPDATE threads SET unread = ?2 WHERE id = ?1",
+            params![thread_id, left],
+        )?;
+        Ok(Some(left))
     }
 
     /// Remove a message (and its reactions) for good; returns what it was.
@@ -1273,8 +1387,13 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
-        // Version 5 added people and group sizes.
+        assert_eq!(version, 6);
+        // Version 5 added people and group sizes, version 6 message status.
+        assert!(s
+            .messages("zalo:u:1", None, 10)
+            .unwrap()
+            .iter()
+            .all(|m| m.status == 0));
         assert!(s.friends().unwrap().is_empty());
         assert_eq!(s.thread("zalo:u:1").unwrap().unwrap().members, 0);
     }
@@ -1318,6 +1437,57 @@ mod tests {
         // Touching keeps names.
         s.touch_people(&["3".to_string()], 99).unwrap();
         assert_eq!(s.people(&["3".to_string()]).unwrap()[0].name, "Bố");
+    }
+
+    #[test]
+    fn receipts_move_messages_up_and_report_the_newest() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "Lan"), true).unwrap();
+        for (remote, at) in [("o1", 1), ("o2", 2), ("o3", 3)] {
+            s.insert_message(&msg("zalo:u:1", remote, "", true, at))
+                .unwrap();
+        }
+        // An older message delivered: no change to show on the newest.
+        assert!(s.mark_receipt(&["o2".into()], false).unwrap().is_none());
+        // The newest seen, under one of its two ids.
+        let shown = s
+            .mark_receipt(&["9999".into(), "o3".into()], true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((shown.remote_id.as_str(), shown.status), ("o3", 2));
+        let statuses: Vec<i64> = s
+            .messages("zalo:u:1", None, 10)
+            .unwrap()
+            .iter()
+            .map(|m| m.status)
+            .collect();
+        assert_eq!(statuses, [2, 2, 2]);
+        // A late delivered receipt does not take "seen" back.
+        assert!(s.mark_receipt(&["o3".into()], false).unwrap().is_none());
+        assert!(s.mark_receipt(&["nobody".into()], true).unwrap().is_none());
+        // A receipt naming the client id of a message sent from here.
+        s.insert_message(&msg("zalo:u:1", "o4", "c4", true, 4))
+            .unwrap();
+        let shown = s.mark_receipt(&["c4".into()], false).unwrap().unwrap();
+        assert_eq!((shown.remote_id.as_str(), shown.status), ("o4", 1));
+    }
+
+    #[test]
+    fn reading_on_another_device_clears_unread_up_to_a_message() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "Lan"), true).unwrap();
+        for (remote, at) in [("i1", 1), ("i2", 2), ("i3", 3)] {
+            s.insert_message(&msg("zalo:u:1", remote, "", false, at))
+                .unwrap();
+        }
+        assert_eq!(s.thread("zalo:u:1").unwrap().unwrap().unread, 3);
+        // Read up to i2 elsewhere: i3 is still unread.
+        assert_eq!(s.read_elsewhere("zalo:u:1", "i2").unwrap(), Some(1));
+        assert_eq!(s.read_elsewhere("zalo:u:1", "i2").unwrap(), None);
+        // A message not stored here: everything was read.
+        assert_eq!(s.read_elsewhere("zalo:u:1", "x").unwrap(), Some(0));
+        assert_eq!(s.read_elsewhere("zalo:u:1", "").unwrap(), None);
+        assert_eq!(s.read_elsewhere("zalo:u:9", "i1").unwrap(), None);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use zeta_zalo::message::QuotedMessage;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::sticker::Sticker;
 use zeta_zalo::upload::{self, FileLimits, FileSource, UploadedFile};
-use zeta_zalo::{reaction, typing};
+use zeta_zalo::{reaction, receipt, typing};
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
 use crate::events::EventBus;
@@ -579,6 +579,15 @@ fn apply_reaction(store: &Store, bus: &EventBus, reaction: &NewReaction) -> Opti
         }
     }
     changed.into_iter().next()
+}
+
+/// A stored message changed: clients replace their copy.
+fn publish_updated(store: &Store, bus: &EventBus, message: &Message) {
+    let thread = store.thread(&message.thread_id).ok().flatten();
+    let payload = json!({ "message": message, "thread": thread });
+    if let Err(e) = bus.publish("message_updated", payload) {
+        tracing::error!(error = %e, "cannot publish message_updated");
+    }
 }
 
 fn publish_message(store: &Store, bus: &EventBus, message: &Message) {
@@ -1236,7 +1245,55 @@ impl Connector {
                 if frame.cmd == socket::cmd::CTRL_ACTION {
                     self.announce_typing(&frame.payload);
                 }
+                self.apply_receipts(
+                    matches!(frame.cmd, 502 | 504 | 522),
+                    frame.cmd == 522,
+                    &frame.payload,
+                );
                 true
+            }
+        }
+    }
+
+    /// Conversations read on another device of the account (`clearUnreads`),
+    /// and how far the account's messages got (`delivereds`, `seens`,
+    /// `groupSeens`, in the 502/504/522 frames).
+    fn apply_receipts(&self, receipt_frame: bool, group_frame: bool, payload: &Value) {
+        for read in receipt::read_elsewhere(payload) {
+            let kind = if read.group {
+                ThreadKind::Group
+            } else {
+                ThreadKind::User
+            };
+            let thread = thread_id(kind, &read.thread);
+            match self.store.read_elsewhere(&thread, &read.last_msg_id) {
+                Ok(Some(unread)) => {
+                    tracing::debug!(unread, "read on another device");
+                    let payload = json!({ "thread_id": thread, "unread": unread });
+                    if let Err(e) = self.bus.publish("thread_read", payload) {
+                        tracing::error!(error = %e, "cannot publish thread_read");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!(error = %e, "cannot apply a read elsewhere"),
+            }
+        }
+        if !receipt_frame {
+            return;
+        }
+        for r in receipt::receipts(payload, group_frame) {
+            match self.store.mark_receipt(&r.msg_ids, r.seen) {
+                Ok(Some(message)) => {
+                    tracing::debug!(seen = r.seen, group = r.group, "message receipt");
+                    publish_updated(&self.store, &self.bus, &message);
+                }
+                Ok(None) => tracing::debug!(
+                    seen = r.seen,
+                    group = r.group,
+                    ids = r.msg_ids.len(),
+                    "receipt changed nothing (not the newest, already there, or not stored)"
+                ),
+                Err(e) => tracing::error!(error = %e, "cannot store a receipt"),
             }
         }
     }

@@ -583,6 +583,9 @@ fn seed(store: &Store) {
         ],
     );
     let _ = store.mark_read(&thread_id(ThreadKind::Group, "2003"));
+    // Lan Anh read the last reply; Minh Tuấn got the link but has not opened it.
+    let _ = store.mark_receipt(&["demo-1001-5".into()], true);
+    let _ = store.mark_receipt(&["demo-1002-4".into()], false);
     // Read the older threads so only some show unread badges.
     let _ = store.mark_read(&thread_id(ThreadKind::User, "1002"));
 }

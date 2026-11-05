@@ -146,6 +146,9 @@ pub struct Message {
     pub sent_at: i64,
     /// Reactions, most given first.
     pub reactions: Vec<ReactionCount>,
+    /// For this account's messages: 0 sent, 1 delivered to the other side,
+    /// 2 seen there.
+    pub status: i64,
 }
 
 /// Reactions to a message with one icon.

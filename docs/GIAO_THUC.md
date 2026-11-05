@@ -143,6 +143,12 @@ Xóa ở phía mình: `POST {chat}/api/message/delete` (nhóm: `{group}/api/grou
 
 `GET {profile}/api/social/profile/lastOnline` với `{ uid, conv_type: 1, imei }`, như zca-js, trả về `{ lastOnline, settings: { show_online_status } }`. `lastOnline` có thể là giây hoặc mili giây (ctdozlite xử lý cả hai). Đã gọi cho cả 5 người bạn của tài khoản thử: đúng cấu trúc trên, 2 người cho hiện trạng thái, nhưng `lastOnline` của mọi người đều bằng 0. Có lẽ vì chính tài khoản thử đang tắt "Hiện trạng thái truy cập": Zalo thường không cho người đã tắt xem trạng thái của người khác.
 
+## 8j. Đọc trên thiết bị khác, tin đã tới và đã xem
+
+Khi tài khoản đọc một hội thoại trên thiết bị khác (điện thoại), Zalo đẩy khung **504** có `clearUnreads: [{ idTo, isGroup, lastMsgId, ts, type }]` (đôi khi thêm `lastCliMsgId`, `sct`). Đã thấy trong log thật nhiều lần, đúng lúc có hội thoại được đọc ở nơi khác. Gateway hạ số tin chưa đọc xuống còn số tin đến sau `lastMsgId`, và báo `thread_read` cho các client. zca-js không xử lý khung này.
+
+Tin của chính mình: khung **502** (chat 1-1) có `delivereds: [{ msgId, realMsgId, seen, deliveredUids, seenUids, mSTs }]` và `seens: [{ idTo, msgId, realMsgId }]`; khung **522** (nhóm) có `delivereds` kèm `groupId` và `groupSeens: [{ msgId, groupId, seenUids }]`, như zca-js đọc. Khung 502 có `delivereds` đã thấy thật, mỗi lần khoảng 2 giây sau khi gửi vào Cloud lúc điện thoại đang mở. Gateway tìm tin theo id (mã Zalo, hoặc client id), đưa nó và các tin trước nó lên "đã nhận" hay "đã xem". Việc khớp id với dữ liệu thật chưa kiểm chứng: lần thử sau cùng, Zalo không gửi khung 502 nào trong 30 giây.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

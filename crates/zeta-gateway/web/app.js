@@ -1275,6 +1275,19 @@ function wantSenders(messages) {
   if (t && t.kind === 'group') wantPeople(messages.filter((m) => !m.outgoing).map((m) => m.sender_id));
 }
 
+const SENT_STATUS = ['Đã gửi', 'Đã nhận', 'Đã xem'];
+
+/** How far the last message got, under it, when it is the account's own. */
+function renderSentStatus() {
+  const box = $('messages');
+  for (const old of box.querySelectorAll('.sent-status')) old.remove();
+  const last = state.messages[state.messages.length - 1];
+  if (!last || !last.outgoing || last.kind === 'chat.undo') return;
+  const local = String(last.remote_id || '').startsWith('local:');
+  const text = local ? 'Đang gửi…' : SENT_STATUS[last.status || 0] || SENT_STATUS[0];
+  box.appendChild(el('div', last.status === 2 ? 'sent-status seen' : 'sent-status', text));
+}
+
 /** Bring a message into view and make it blink once. */
 function showMessage(seq) {
   const node = document.querySelector(`#messages .msg[data-seq="${seq}"]`);
@@ -1301,6 +1314,7 @@ function renderMessages(scrollToEnd) {
     box.appendChild(messageNode(m, prev, t));
     prev = m;
   }
+  renderSentStatus();
   box.scrollTop = scrollToEnd ? box.scrollHeight : box.scrollHeight - fromBottom;
   wantSenders(state.messages);
 }
@@ -1376,6 +1390,7 @@ function appendMessage(m) {
     return;
   }
   box.appendChild(messageNode(m, prev, state.threads.get(state.current)));
+  renderSentStatus();
   if (nearBottom || m.outgoing) box.scrollTop = box.scrollHeight;
   wantSenders([m]);
 }
@@ -2593,9 +2608,11 @@ function openStream() {
   es.addEventListener('threads_changed', (e) => { track(e); resync(); });
   es.addEventListener('thread_read', (e) => {
     track(e);
-    const t = state.threads.get(JSON.parse(e.data).thread_id);
+    const p = JSON.parse(e.data);
+    const t = state.threads.get(p.thread_id);
     if (t) {
-      t.unread = 0;
+      // Read here or on another device; some may still be unread there.
+      t.unread = typeof p.unread === 'number' ? p.unread : 0;
       renderThreads();
     }
   });
