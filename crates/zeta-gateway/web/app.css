@@ -141,6 +141,7 @@ a.btn { display: inline-block; text-decoration: none; }
 .thread .name { font-weight: 600; }
 .thread .preview { color: var(--muted); font-size: 13px; }
 .thread.unread .preview { color: var(--text); font-weight: 600; }
+.thread .preview.typing, #chat-sub.typing { color: var(--primary); font-style: italic; }
 .thread .meta { display: grid; justify-items: end; gap: 4px; font-size: 12px; color: var(--muted); }
 .badge {
   background: var(--danger);

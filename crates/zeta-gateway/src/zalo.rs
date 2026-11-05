@@ -14,9 +14,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeta_zalo::api::{Recipient, SessionHealth};
-use zeta_zalo::reaction;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::upload::{self, FileLimits, FileSource, UploadedFile};
+use zeta_zalo::{reaction, typing};
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
 use crate::events::EventBus;
@@ -129,6 +129,11 @@ pub enum ZaloCommand {
         remote_id: String,
         messages: Vec<Value>,
     },
+    /// The account is typing in this thread: tell Zalo, if enabled.
+    Typing {
+        kind: ThreadKind,
+        remote_id: String,
+    },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
     },
@@ -230,7 +235,14 @@ pub struct ZaloConfig {
     /// Tell Zalo when messages are read here (senders see "Đã xem", the phone
     /// clears its unread marks).
     pub read_receipts: bool,
+    /// Tell Zalo when the account is typing here (the other side sees "đang
+    /// soạn tin…").
+    pub typing: bool,
 }
+
+/// Typing is told to Zalo at most this often per thread; Zalo shows it for a
+/// few seconds each time.
+const TYPING_EVERY: Duration = Duration::from_secs(4);
 
 /// Start the connector task.
 pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
@@ -248,6 +260,7 @@ pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
         uploads: Arc::new(UploadBoard::default()),
         // One attachment at a time, in the order they came.
         attachment_turns: Arc::new(Semaphore::new(1)),
+        typing_sent: std::collections::HashMap::new(),
     };
     tokio::spawn(connector.run(rx));
     handle
@@ -385,6 +398,8 @@ struct Connector {
     login_running: bool,
     uploads: Arc<UploadBoard>,
     attachment_turns: Arc<Semaphore>,
+    /// When typing was last told to Zalo, per thread.
+    typing_sent: std::collections::HashMap<String, std::time::Instant>,
 }
 
 async fn next_realtime(
@@ -700,6 +715,28 @@ impl Connector {
                     }
                 });
             }
+            ZaloCommand::Typing { kind, remote_id } => {
+                let Some(client) = self.client.clone().filter(|_| self.cfg.typing) else {
+                    return;
+                };
+                let thread = thread_id(kind, &remote_id);
+                let now = std::time::Instant::now();
+                if self
+                    .typing_sent
+                    .get(&thread)
+                    .is_some_and(|at| now.duration_since(*at) < TYPING_EVERY)
+                {
+                    return;
+                }
+                self.typing_sent
+                    .retain(|_, at| now.duration_since(*at) < TYPING_EVERY);
+                self.typing_sent.insert(thread, now);
+                tokio::spawn(async move {
+                    if let Err(e) = client.send_typing(recipient(kind, &remote_id)).await {
+                        tracing::debug!(error = %e, "typing not sent");
+                    }
+                });
+            }
             ZaloCommand::StartLogin { reply } => {
                 if self.login_running {
                     let current = self
@@ -790,8 +827,39 @@ impl Connector {
                 if (610..=612).contains(&frame.cmd) {
                     self.store_reactions(&frame.payload);
                 }
+                if frame.cmd == socket::cmd::CTRL_ACTION {
+                    self.announce_typing(&frame.payload);
+                }
                 true
             }
+        }
+    }
+
+    /// Others typing: a transient `typing` event (not logged, nothing stored).
+    fn announce_typing(&self, payload: &Value) {
+        for t in typing::typing_events(payload) {
+            if t.uid == self.self_uid {
+                continue;
+            }
+            let thread = match &t.group {
+                Some(gid) => thread_id(ThreadKind::Group, gid.trim_start_matches("group_")),
+                None => thread_id(ThreadKind::User, &t.uid),
+            };
+            let name = if t.group.is_some() {
+                self.store.sender_name(&thread, &t.uid).unwrap_or_default()
+            } else {
+                self.store
+                    .thread(&thread)
+                    .ok()
+                    .flatten()
+                    .map(|th| th.name)
+                    .unwrap_or_default()
+            };
+            tracing::debug!(group = t.group.is_some(), "someone is typing");
+            self.bus.notify(
+                "typing",
+                json!({ "thread_id": thread, "user_id": t.uid, "name": name }),
+            );
         }
     }
 

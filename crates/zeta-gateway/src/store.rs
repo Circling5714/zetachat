@@ -413,6 +413,21 @@ impl Store {
             .optional()
     }
 
+    /// The name `user_id` last went by in a thread (empty when unknown).
+    pub fn sender_name(&self, thread_id: &str, user_id: &str) -> Result<String> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT sender_name FROM messages
+                 WHERE thread_id = ?1 AND sender_id = ?2 AND sender_name <> ''
+                 ORDER BY seq DESC LIMIT 1",
+                params![thread_id, user_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
     /// Reset the unread counter. Returns false for an unknown thread.
     pub fn mark_read(&self, id: &str) -> Result<bool> {
         Ok(self

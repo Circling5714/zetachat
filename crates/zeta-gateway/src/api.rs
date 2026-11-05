@@ -112,6 +112,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/uploads", get(list_uploads))
         .route("/api/v1/uploads/{id}", delete(cancel_upload))
         .route("/api/v1/threads/{id}/read", post(mark_read))
+        .route("/api/v1/threads/{id}/typing", post(typing))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
         .route("/api/v1/media", get(media))
@@ -537,6 +538,22 @@ async fn mark_read(
             });
         }
     }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The device user is typing in this thread: the gateway tells Zalo (if
+/// enabled), at most every few seconds. Clients call it while typing goes on.
+async fn typing(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    // Best effort: a busy connector simply skips it.
+    let _ = st.zalo.commands.try_send(ZaloCommand::Typing {
+        kind,
+        remote_id: remote_id.to_string(),
+    });
     Ok(Json(json!({ "ok": true })))
 }
 

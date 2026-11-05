@@ -172,6 +172,7 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                         .collect();
                     seen.lock().unwrap().push((remote_id, ids));
                 }
+                ZaloCommand::Typing { .. } => {}
                 ZaloCommand::StartLogin { reply } => {
                     let _ = reply.send(LoginState::WaitingScan {
                         qr: "https://example/qr".into(),

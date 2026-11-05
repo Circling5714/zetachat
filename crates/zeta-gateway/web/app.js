@@ -20,6 +20,8 @@ const state = {
   lastQr: '',
   loginPrompted: false,
   statusLimits: null, // upload limits from the gateway
+  typing: new Map(), // thread id -> { name, timer }: someone is typing there
+  typingSent: new Map(), // thread id -> when typing was last told to the gateway
 };
 
 // ------------------------------------------------------------------ helpers
@@ -208,9 +210,12 @@ function renderThreads() {
     if (t.unread > 0) cls += ' unread';
     const li = el('li', cls);
     const body = el('div', 'body');
+    const typing = state.typing.get(t.id);
     body.append(
       el('div', 'name', threadName(t)),
-      el('div', 'preview', t.preview || (t.kind === 'group' ? 'Nhóm' : '')),
+      typing
+        ? el('div', 'preview typing', typingText(t, typing))
+        : el('div', 'preview', t.preview || (t.kind === 'group' ? 'Nhóm' : '')),
     );
     const meta = el('div', 'meta');
     meta.append(el('span', null, fmtListTime(t.last_message_at)));
@@ -662,7 +667,7 @@ async function openThread(id) {
   head.id = 'chat-avatar';
   $('chat-avatar').replaceWith(head);
   $('chat-name').textContent = threadName(t);
-  $('chat-sub').textContent = t.kind === 'group' ? 'Nhóm' : '';
+  renderChatSub();
   $('messages').replaceChildren();
   renderThreads();
   renderUploads();
@@ -721,6 +726,58 @@ $('back').addEventListener('click', () => {
   renderThreads();
 });
 
+// ------------------------------------------------------------------- typing
+
+/** Zalo shows "typing" for a few seconds after each announcement. */
+const TYPING_SHOWN_MS = 6000;
+/** How often to tell the gateway that we are typing. */
+const TYPING_SEND_MS = 4000;
+
+function typingText(t, typing) {
+  if (t.kind === 'group' && typing.name) return `${typing.name} đang soạn tin…`;
+  return 'Đang soạn tin…';
+}
+
+/** The line under the open conversation's name. */
+function renderChatSub() {
+  const t = state.threads.get(state.current);
+  const sub = $('chat-sub');
+  if (!t) return;
+  const typing = state.typing.get(t.id);
+  sub.classList.toggle('typing', Boolean(typing));
+  sub.textContent = typing ? typingText(t, typing) : t.kind === 'group' ? 'Nhóm' : '';
+}
+
+function stopTyping(threadId) {
+  const typing = state.typing.get(threadId);
+  if (!typing) return;
+  clearTimeout(typing.timer);
+  state.typing.delete(threadId);
+  renderThreads();
+  if (threadId === state.current) renderChatSub();
+}
+
+/** A `typing` event: show it for a few seconds. */
+function onTyping(p) {
+  if (!p || !p.thread_id) return;
+  const old = state.typing.get(p.thread_id);
+  if (old) clearTimeout(old.timer);
+  const timer = setTimeout(() => stopTyping(p.thread_id), TYPING_SHOWN_MS);
+  state.typing.set(p.thread_id, { name: p.name || '', user: p.user_id, timer });
+  renderThreads();
+  if (p.thread_id === state.current) renderChatSub();
+}
+
+/** Tell the gateway we are typing, at most every few seconds per thread. */
+function sendTyping() {
+  const id = state.current;
+  if (!id || !input.value.trim()) return;
+  const now = Date.now();
+  if (now - (state.typingSent.get(id) || 0) < TYPING_SEND_MS) return;
+  state.typingSent.set(id, now);
+  api(`/threads/${encodeURIComponent(id)}/typing`, { method: 'POST' }).catch(() => {});
+}
+
 // ----------------------------------------------------------------- composer
 
 const input = $('input');
@@ -732,7 +789,10 @@ function autosize() {
   input.style.overflowY = input.scrollHeight > 160 ? 'auto' : 'hidden';
 }
 
-input.addEventListener('input', autosize);
+input.addEventListener('input', () => {
+  autosize();
+  sendTyping();
+});
 input.addEventListener('keydown', (e) => {
   // Enter sends; Shift+Enter is a new line; never send while an IME is composing.
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
@@ -1165,6 +1225,7 @@ function onMessage(payload) {
   state.threads.set(t.id, t);
   t.last_message_at = Math.max(t.last_message_at || 0, m.sent_at);
   t.preview = m.text;
+  if (!m.outgoing) stopTyping(m.thread_id);
   const isOpen = m.thread_id === state.current;
   const seen = isOpen && document.visibilityState === 'visible';
   if (isOpen) appendMessage(m);
@@ -1230,8 +1291,9 @@ function openStream() {
   es.addEventListener('message', (e) => { track(e); onMessage(JSON.parse(e.data)); });
   es.addEventListener('message_updated', (e) => { track(e); onMessageUpdated(JSON.parse(e.data)); });
   es.addEventListener('status', (e) => { track(e); onStatus(JSON.parse(e.data)); });
-  // Upload progress: not in the event log, so no id to track.
+  // Upload progress and typing: not in the event log, so no id to track.
   es.addEventListener('upload', (e) => onUpload(JSON.parse(e.data)));
+  es.addEventListener('typing', (e) => onTyping(JSON.parse(e.data)));
   // History was loaded on the gateway: reload lists instead of replaying messages.
   es.addEventListener('threads_changed', (e) => { track(e); resync(); });
   es.addEventListener('thread_read', (e) => {

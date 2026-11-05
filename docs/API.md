@@ -20,6 +20,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/uploads` | Các lượt gửi tệp đang chạy và vừa xong (giữ 10 phút) |
 | DELETE | `/uploads/{id}` | Hủy một lượt gửi chưa tới bước gửi tin; `409` nếu đã quá muộn |
 | POST | `/threads/{id}/read` | Đánh dấu đã đọc. Nếu bật báo đã xem (mặc định), gateway báo cho Zalo về các tin đến chưa đọc: người gửi thấy "Đã xem", điện thoại hết báo chưa đọc |
+| POST | `/threads/{id}/typing` | Người dùng đang gõ trong hội thoại này: gateway báo cho Zalo (nếu bật, mặc định có), tối đa mỗi 4 giây một lần. Client gọi lại trong lúc còn gõ |
 | GET | `/events?since=&limit=` | Nhật ký sự kiện sau `seq = since` |
 | GET | `/events/stream` | Luồng sự kiện (server-sent events). Gửi lại header `Last-Event-ID` khi nối lại để không sót sự kiện |
 | GET | `/media?u=<url>` | Tệp trên CDN của Zalo (ảnh, video, sticker, tin nhắn thoại, tệp đính kèm, ảnh đại diện) qua bộ nhớ đệm của gateway. Chỉ nhận URL thuộc tên miền media của Zalo (`400` với URL khác). Hỗ trợ `Range` để tua video |
@@ -79,8 +80,9 @@ Lượt gửi không sống qua lần khởi động lại gateway: tệp chưa 
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |
 | `upload` | `{ "upload": {…} }`: tiến độ một lượt gửi tệp, vài lần mỗi giây khi đang gửi |
+| `typing` | `{ "thread_id", "user_id", "name" }`: ai đó đang soạn tin; Zalo nhắc lại vài giây một lần trong lúc họ còn gõ, client tự tắt sau khoảng 6 giây |
 
-Mỗi sự kiện có `id` là số thứ tự tăng dần. Client lưu `id` cuối cùng đã nhận; khi mất mạng và nối lại, gửi nó qua `Last-Event-ID` (hoặc `?since=`) để nhận phần còn thiếu. Riêng `upload` không vào nhật ký và không có `id`: client đang mất kết nối sẽ bỏ lỡ nó, nên khi nối lại thì hỏi `/uploads`.
+Mỗi sự kiện có `id` là số thứ tự tăng dần. Client lưu `id` cuối cùng đã nhận; khi mất mạng và nối lại, gửi nó qua `Last-Event-ID` (hoặc `?since=`) để nhận phần còn thiếu. Riêng `upload` và `typing` không vào nhật ký và không có `id`: client đang mất kết nối sẽ bỏ lỡ chúng; khi nối lại, hỏi `/uploads` để biết các lượt gửi tệp.
 
 ## Ví dụ
 

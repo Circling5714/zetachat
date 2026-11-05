@@ -465,13 +465,20 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     if ok && kind == ThreadKind::User {
                         let (store, bus) = (store.clone(), bus.clone());
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(1200)).await;
+                            let thread = thread_id(kind, &remote_id);
                             let name = store
-                                .thread(&thread_id(kind, &remote_id))
+                                .thread(&thread)
                                 .ok()
                                 .flatten()
                                 .map(|t| t.name)
                                 .unwrap_or_default();
+                            // The other side "types" before answering.
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            bus.notify(
+                                "typing",
+                                json!({ "thread_id": thread, "user_id": remote_id, "name": name }),
+                            );
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
                             let echo = format!("Đã nhận: {text}");
                             store_and_publish(
                                 &store,
@@ -530,7 +537,7 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     let _ = reply.send(Ok(changed));
                 }
                 // Nobody to tell in the demo.
-                ZaloCommand::MarkSeen { .. } => {}
+                ZaloCommand::MarkSeen { .. } | ZaloCommand::Typing { .. } => {}
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {
                         qr: "https://zetachat.invalid/demo-login".into(),

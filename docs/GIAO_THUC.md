@@ -98,6 +98,10 @@ Thả cảm xúc: `POST {reaction}/api/message/reaction` (nhóm: `/api/group/rea
 
 Nhận cảm xúc: `cmd 612` khi vừa xảy ra; `610` và `611` (sub 1) chở những cái bị lỡ, mỗi lần kết nối. Hai danh sách `reacts` (1-1) và `reactGroups` có các trường như tin nhắn (`msgId`, `actionId`, `cliMsgId`, `uidFrom`, `idTo`, `dName`, `ts`), còn `content` là chuỗi JSON chứa `rMsg`, `rIcon`, `rType`, `msgSender`. Một cảm xúc có thể áp vào nhiều tin cùng lúc (đã thấy `rMsg` có 3 phần tử). Mỗi lần thả là một hành động, nên số đếm là tổng số lần thả; `rIcon` rỗng xóa mọi lần thả trước của người đó. Zalo gửi lại cảm xúc của chính tài khoản qua WebSocket; gateway nhận ra bản sao nhờ `msgId` hoặc `cliMsgId` (bằng `clientId` đã gửi) nên không đếm hai lần.
 
+## 8c. Đang soạn tin (gửi đã kiểm chứng, nhận theo zca-js)
+
+Báo mình đang gõ: `POST {chat}/api/message/typing` với `toid`, `destType: 3`, `imei`; nhóm: `POST {group}/api/group/typing` với `grid`, `imei`. Zalo trả lời không lỗi (thử vào Cloud). Người khác gõ tới qua `cmd 602`: `data.actions[]` có `act_type: "typing"`, `act` là `typing` (1-1) hoặc `gtyping` (nhóm), và `data` chứa `uid`, `ts`, `isPC`, `gid` (nhóm). Theo zca-js `data` là chuỗi JSON bị bỏ dấu ngoặc nhọn; gateway nhận cả ba dạng (thiếu ngoặc, đủ ngoặc, object) và ghi hình dạng khung vào log debug để kiểm chứng khi có người gõ thật.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

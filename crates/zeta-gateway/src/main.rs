@@ -52,6 +52,9 @@ struct ServeArgs {
     /// điện thoại hết báo chưa đọc. Đặt false để đọc mà không báo.
     #[arg(long, env = "ZETACHAT_READ_RECEIPTS", default_value_t = true, action = ArgAction::Set)]
     read_receipts: bool,
+    /// Báo "đang soạn tin…" cho người bên kia khi gõ trên zetachat. Đặt false để tắt.
+    #[arg(long, env = "ZETACHAT_TYPING", default_value_t = true, action = ArgAction::Set)]
+    typing: bool,
 }
 
 impl ServeArgs {
@@ -151,6 +154,7 @@ async fn serve(data_dir: &Path, args: ServeArgs) -> Result<()> {
         demo,
         media_cache_mb,
         read_receipts,
+        typing,
     } = args;
     let store = Arc::new(Store::open(&db_path(data_dir))?);
     let media = Arc::new(MediaCache::new(media_dir(data_dir))?);
@@ -178,6 +182,7 @@ async fn serve(data_dir: &Path, args: ServeArgs) -> Result<()> {
                 computer_name: COMPUTER_NAME.into(),
                 media: Some(media.clone()),
                 read_receipts,
+                typing,
             },
             store.clone(),
             bus.clone(),
@@ -317,10 +322,17 @@ mod tests {
             _ => panic!("not serve"),
         };
         let defaults = serve(&["zetachat-gateway", "serve"]);
-        assert!(defaults.read_receipts && !defaults.demo);
+        assert!(defaults.read_receipts && defaults.typing && !defaults.demo);
         assert_eq!(defaults.media_cache_mb, 2048);
-        let quiet = serve(&["zetachat-gateway", "serve", "--read-receipts", "false"]);
-        assert!(!quiet.read_receipts);
+        let quiet = serve(&[
+            "zetachat-gateway",
+            "serve",
+            "--read-receipts",
+            "false",
+            "--typing",
+            "false",
+        ]);
+        assert!(!quiet.read_receipts && !quiet.typing);
         assert_eq!(
             ServeArgs::from_env().unwrap().listen,
             "127.0.0.1:8370".parse().unwrap()
