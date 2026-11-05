@@ -5,6 +5,33 @@ Hướng dẫn cho một máy chủ Linux trong LAN, ví dụ container LXC Ubun
 > [!IMPORTANT]
 > Một tài khoản Zalo chỉ có **một suất đăng nhập máy tính**. Khi gateway đang giữ phiên, đừng đăng nhập Zalo PC hay Zalo Web chính thức bằng cùng tài khoản, nếu không hai bên sẽ đá phiên của nhau.
 
+## Cài bằng một lệnh
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Circling5714/zetachat/main/install.sh | sudo bash
+```
+
+Lệnh này làm thay các mục 1 đến 3 dưới đây:
+
+- tải bản dựng sẵn (x86_64, aarch64; kiểm tra SHA-256) hoặc build từ mã nguồn;
+- tạo tài khoản `zetachat` và dịch vụ `zetachat-gateway` (`/var/lib/zetachat`, cổng 8370);
+- tạo token cho thiết bị đầu tiên và in link mở zetachat.
+
+Tùy chọn (`… | sudo bash -s -- <tùy chọn>`):
+
+| Tùy chọn | Tác dụng |
+|---|---|
+| `--port` | Đổi cổng |
+| `--listen 127.0.0.1:8370` | Chỉ cho reverse proxy chạy cùng máy truy cập |
+| `--version vX.Y.Z` | Cài đúng một bản |
+| `--from-source` | Build từ mã nguồn |
+| `--dry-run` | Chỉ tải và kiểm tra, không thay đổi gì |
+| `--uninstall`, thêm `--purge` | Gỡ; `--purge` xóa cả dữ liệu |
+
+Chạy lại là nâng cấp. Dữ liệu được giữ nguyên; cơ sở dữ liệu được sao lưu vào `/var/lib/zetachat/backups` (giữ 5 bản gần nhất). Các dòng `Environment=` bạn tự thêm vào file dịch vụ cũng được giữ. Nếu cổng đang có chương trình khác dùng, script dừng lại và không cài gì.
+
+Các mục dưới đây là cách cài thủ công.
+
 ## 1. Build
 
 ```bash

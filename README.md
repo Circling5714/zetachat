@@ -5,6 +5,30 @@ Gateway tự host để dùng **Zalo trên nhiều thiết bị của chính mì
 > [!WARNING]
 > Đây là dự án **không chính thức**, không liên quan tới VNG hay Zalo. Giao thức được tái hiện để tương thích. Dùng client không chính thức có thể vi phạm điều khoản sử dụng của Zalo và khiến tài khoản bị khóa, vì vậy hãy thử bằng tài khoản phụ.
 
+## Cài đặt nhanh
+
+Trên một máy Linux có systemd (Ubuntu, Debian, container LXC…), chạy:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Circling5714/zetachat/main/install.sh | sudo bash
+```
+
+Script làm những việc sau:
+
+- tải bản dựng sẵn mới nhất cho x86_64 hoặc aarch64 và kiểm tra SHA-256 (máy khác thì tự build từ mã nguồn);
+- tạo tài khoản hệ thống `zetachat` và dịch vụ `zetachat-gateway`, chạy ở cổng 8370, tự bật lại khi máy khởi động;
+- in ra một link có sẵn token cho thiết bị đầu tiên.
+
+Mở link đó trên máy tính, bấm đăng nhập Zalo và quét mã QR bằng app Zalo là dùng được.
+
+- Đổi cổng: `… | sudo bash -s -- --port 8380`.
+- Nâng cấp: chạy lại đúng lệnh trên (dữ liệu được giữ, cơ sở dữ liệu được sao lưu trước).
+- Gỡ: `… | sudo bash -s -- --uninstall` (thêm `--purge` để xóa cả dữ liệu).
+- Xem trước mà không thay đổi gì: `--dry-run`.
+- Muốn đọc script trước khi chạy: tải [install.sh](install.sh) về, xem, rồi `sudo bash install.sh`.
+
+Cài thủ công, HTTPS qua Nginx Proxy Manager và các tùy chọn khác: [docs/TRIEN_KHAI.md](docs/TRIEN_KHAI.md).
+
 ## Vì sao
 
 - Mỗi tài khoản Zalo chỉ có **một suất đăng nhập máy tính** bên cạnh điện thoại; đăng nhập máy thứ hai sẽ đẩy máy trước ra. Giữ một phiên trên máy chủ rồi cho nhiều client nối vào giải quyết việc này.

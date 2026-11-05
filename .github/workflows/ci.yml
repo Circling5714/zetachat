@@ -23,3 +23,41 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # install.sh on a real systemd machine: first install, upgrade, removal.
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: shellcheck install.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p zeta-gateway
+      - name: First install
+        run: |
+          sudo ./install.sh --binary target/release/zetachat-gateway --yes | tee install.log
+          systemctl is-active zetachat-gateway
+          curl -fsS http://127.0.0.1:8370/api/v1/health
+          grep -q '/#token=zc_' install.log
+          sudo test -f /var/lib/zetachat/zetachat.db
+      - name: Upgrade, moving to another port
+        run: |
+          sudo ./install.sh --binary target/release/zetachat-gateway --port 8371 --yes | tee upgrade.log
+          if grep -q '#token=' upgrade.log; then echo "a new token on upgrade"; exit 1; fi
+          sudo ls /var/lib/zetachat/backups | grep -q .
+          curl -fsS http://127.0.0.1:8371/api/v1/health
+      - name: Another program on the port is refused
+        run: |
+          sudo systemctl stop zetachat-gateway
+          python3 -m http.server 8371 --bind 127.0.0.1 &
+          sleep 1
+          if sudo ./install.sh --binary target/release/zetachat-gateway --yes; then echo "installed over a busy port"; exit 1; fi
+          kill %1
+      - name: Removal
+        run: |
+          sudo ./install.sh --uninstall --purge --yes
+          if systemctl is-active zetachat-gateway; then echo "still running"; exit 1; fi
+          test ! -e /usr/local/bin/zetachat-gateway
+          sudo test ! -e /var/lib/zetachat

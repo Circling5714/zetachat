@@ -1,0 +1,82 @@
+name: Release
+
+# A tag v* builds the gateway for Linux (x86_64 and aarch64, static musl
+# binaries) and publishes it as a GitHub release: install.sh downloads it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build again, e.g. v0.1.0 (it must exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: musl
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p zeta-gateway --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="zetachat-gateway-${{ matrix.arch }}-linux"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/zetachat-gateway" "dist/$name/"
+          cp README.md LICENSE-MIT LICENSE-APACHE install.sh deploy/zetachat-gateway.service "dist/$name/"
+          file "dist/$name/zetachat-gateway"
+          "dist/$name/zetachat-gateway" --version
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: dist/*.tar.gz*
+
+  publish:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          ls -l dist
+          notes="Cài hoặc nâng cấp trên một máy Linux có systemd (Ubuntu, Debian, LXC…):
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sudo bash
+          \`\`\`
+
+          Các tệp dưới đây là chương trình zetachat-gateway đã build sẵn (tĩnh, musl) cho x86_64 và aarch64, kèm SHA-256."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "zetachat $TAG" --notes "$notes"
+          fi
