@@ -337,6 +337,18 @@ fn fake_connector(
                         .unwrap();
                     let _ = reply.send(Ok(message));
                 }
+                // Zalo keeps one quick message; adding another is refused
+                // as Zalo does for a personal account (821).
+                ZaloCommand::Quick { action, reply } => {
+                    let one = json!([{ "id": 7, "keyword": "chao", "text": "Xin chào",
+                        "photo": "", "updated_at": 1 }]);
+                    let _ = reply.send(match action {
+                        zeta_gateway::zalo::QuickAction::Add { .. } => {
+                            Err("Zalo không cho tài khoản này lưu thêm tin nhắn nhanh".into())
+                        }
+                        _ => Ok(one),
+                    });
+                }
                 ZaloCommand::Cards { action, reply } => match action {
                     zeta_gateway::zalo::CardAction::SendBank {
                         kind,
@@ -1479,6 +1491,96 @@ async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
     )
     .await;
     assert_eq!(sent["mentions"], json!([]));
+}
+
+#[tokio::test]
+async fn quick_messages_are_kept_here_beside_zalos() {
+    let f = fixture();
+    let (status, list) = call(&f, "GET", "/api/v1/quick-messages", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        list,
+        json!([{ "id": "zalo:7", "keyword": "chao", "text": "Xin chào",
+        "photo": "", "updated_at": 1, "zalo": true }])
+    );
+    // Kept by zetachat: a leading "/" and spaces are dropped.
+    let (status, list) = call(
+        &f,
+        "POST",
+        "/api/v1/quick-messages",
+        Some(json!({ "keyword": " /diachi ", "text": " 12 Lê Lợi " })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    let mine = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["zalo"] == false)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (mine["keyword"].as_str(), mine["text"].as_str()),
+        (Some("diachi"), Some("12 Lê Lợi"))
+    );
+    // A keyword Zalo has already is taken; Zalo refuses more of its own.
+    let (status, _) = call(
+        &f,
+        "POST",
+        "/api/v1/quick-messages",
+        Some(json!({ "keyword": "chao", "text": "x" })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(
+        &f,
+        "POST",
+        "/api/v1/quick-messages",
+        Some(json!({ "keyword": "moi", "text": "x", "zalo": true })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let id = mine["id"].as_str().unwrap();
+    let (status, list) = call(
+        &f,
+        "PUT",
+        &format!("/api/v1/quick-messages/{id}"),
+        Some(json!({ "keyword": "diachi", "text": "34 Lê Lợi" })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list.to_string().contains("34 Lê Lợi"));
+    let (status, list) = call(
+        &f,
+        "DELETE",
+        &format!("/api/v1/quick-messages/{id}"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (status, _) = call(&f, "DELETE", "/api/v1/quick-messages/nowhere:1", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn quick_messages_need_a_keyword_and_a_text() {
+    let f = fixture();
+    for bad in [
+        json!({ "keyword": "hai từ", "text": "x" }),
+        json!({ "keyword": "/", "text": "x" }),
+        json!({ "keyword": "ok", "text": "   " }),
+        json!({ "keyword": "ok", "text": "x".repeat(2001) }),
+    ] {
+        let (status, _) = call(&f, "POST", "/api/v1/quick-messages", Some(bad), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]

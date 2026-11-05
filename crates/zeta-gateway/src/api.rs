@@ -31,15 +31,15 @@ use crate::auth::AuthDevice;
 use crate::events::EventBus;
 use crate::media_cache::{self, CachedFile, FetchError, MediaCache};
 use crate::model::{
-    now_ms, split_thread_id, GroupMembers, Mention, Message, Person, StoredEvent, TextStyle,
-    Thread, ThreadKind, PEOPLE_FRESH_MS,
+    now_ms, split_thread_id, GroupMembers, Mention, Message, Person, QuickItem, StoredEvent,
+    TextStyle, Thread, ThreadKind, PEOPLE_FRESH_MS,
 };
 use crate::stickers::StickerQuery;
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
 use crate::zalo::{
-    photo_type, Attachment, CardAction, FriendAction, LoginState, ReplyTo, SessionState,
-    ZaloCommand, ZaloHandle,
+    photo_type, Attachment, CardAction, FriendAction, LoginState, QuickAction, ReplyTo,
+    SessionState, ZaloCommand, ZaloHandle,
 };
 
 /// Shared state of the HTTP handlers.
@@ -155,6 +155,14 @@ pub fn router(state: AppState) -> Router {
             delete(remove_bank_account),
         )
         .route("/api/v1/vietqr.svg", get(vietqr_svg))
+        .route(
+            "/api/v1/quick-messages",
+            get(quick_messages).post(add_quick_message),
+        )
+        .route(
+            "/api/v1/quick-messages/{item}",
+            put(update_quick_message).delete(remove_quick_message),
+        )
         .route("/api/v1/threads/{id}/members", get(group_members))
         .route("/api/v1/threads/{id}/presence", get(presence))
         .route("/api/v1/users/find", get(find_user))
@@ -885,6 +893,174 @@ async fn remove_bank_account(
     Ok(Json(
         ask_cards(&st, CardAction::RemoveAccount { id: account }).await?,
     ))
+}
+
+/// Ask the connector about quick messages; answers the list.
+async fn ask_quick(st: &AppState, action: QuickAction) -> Result<Value, ApiError> {
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Quick { action, reply })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)
+}
+
+#[derive(Deserialize)]
+struct QuickBody {
+    keyword: String,
+    text: String,
+    /// Keep it on Zalo (synced with the phone) rather than in zetachat.
+    #[serde(default)]
+    zalo: bool,
+}
+
+/// `zalo:<id>` or `local:<id>`.
+fn quick_id(item: &str) -> Result<(bool, i64), ApiError> {
+    let bad = || ApiError::not_found("quick message");
+    let (source, id) = item.split_once(':').ok_or_else(bad)?;
+    let id: i64 = id.parse().map_err(|_| bad())?;
+    match source {
+        "zalo" => Ok((true, id)),
+        "local" => Ok((false, id)),
+        _ => Err(bad()),
+    }
+}
+
+/// The quick messages of both places, by keyword. Zalo's are left out (with a
+/// warning in the log) when Zalo cannot be asked.
+async fn all_quick(st: &AppState, zalo: Option<Value>) -> Result<Vec<QuickItem>, ApiError> {
+    let zalo = match zalo {
+        Some(v) => Some(v),
+        None => match ask_quick(st, QuickAction::List).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e.message, "quick messages of Zalo not listed");
+                None
+            }
+        },
+    };
+    let mut items = st.store.quick_messages().map_err(ApiError::internal)?;
+    let from_zalo: Vec<zeta_zalo::quick::QuickMessage> = zalo
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    items.extend(from_zalo.into_iter().map(|q| QuickItem {
+        id: format!("zalo:{}", q.id),
+        keyword: q.keyword,
+        text: q.text,
+        photo: q.photo,
+        updated_at: q.updated_at,
+        zalo: true,
+    }));
+    items.sort_by(|a, b| a.keyword.cmp(&b.keyword).then(b.zalo.cmp(&a.zalo)));
+    Ok(items)
+}
+
+/// A keyword is taken when any quick message (here or on Zalo) has it.
+async fn keyword_taken(st: &AppState, keyword: &str, except: &str) -> Result<bool, ApiError> {
+    Ok(all_quick(st, None)
+        .await?
+        .iter()
+        .any(|q| q.keyword == keyword && q.id != except))
+}
+
+/// Most characters of a quick message's text.
+const QUICK_TEXT_MAX: usize = 2000;
+
+/// A keyword without spaces (at most 20 characters, a leading "/" dropped)
+/// and a text that says something.
+fn checked_quick(body: &QuickBody) -> Result<(String, String), ApiError> {
+    let keyword = zeta_zalo::quick::keyword(&body.keyword)
+        .ok_or_else(|| ApiError::bad_request("từ khóa không có khoảng trắng, tối đa 20 ký tự"))?;
+    let text = body.text.trim();
+    if text.is_empty() || text.chars().count() > QUICK_TEXT_MAX {
+        return Err(ApiError::bad_request("nội dung trống hoặc quá dài"));
+    }
+    Ok((keyword, text.to_string()))
+}
+
+fn taken() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "đã có tin nhắn nhanh với phím tắt này",
+    )
+}
+
+async fn quick_messages(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Vec<QuickItem>> {
+    Ok(Json(all_quick(&st, None).await?))
+}
+
+async fn add_quick_message(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Json(body): Json<QuickBody>,
+) -> ApiResult<Vec<QuickItem>> {
+    let (keyword, text) = checked_quick(&body)?;
+    if keyword_taken(&st, &keyword, "").await? {
+        return Err(taken());
+    }
+    if body.zalo {
+        let zalo = ask_quick(&st, QuickAction::Add { keyword, text }).await?;
+        return Ok(Json(all_quick(&st, Some(zalo)).await?));
+    }
+    if !st
+        .store
+        .add_quick_message(&keyword, &text)
+        .map_err(ApiError::internal)?
+    {
+        return Err(taken());
+    }
+    Ok(Json(all_quick(&st, None).await?))
+}
+
+async fn update_quick_message(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(item): Path<String>,
+    Json(body): Json<QuickBody>,
+) -> ApiResult<Vec<QuickItem>> {
+    let (zalo, id) = quick_id(&item)?;
+    let (keyword, text) = checked_quick(&body)?;
+    if keyword_taken(&st, &keyword, &item).await? {
+        return Err(taken());
+    }
+    if zalo {
+        let action = QuickAction::Update {
+            id: u64::try_from(id).map_err(|_| ApiError::not_found("quick message"))?,
+            keyword,
+            text,
+        };
+        let zalo = ask_quick(&st, action).await?;
+        return Ok(Json(all_quick(&st, Some(zalo)).await?));
+    }
+    if !st
+        .store
+        .update_quick_message(id, &keyword, &text)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found("quick message"));
+    }
+    Ok(Json(all_quick(&st, None).await?))
+}
+
+async fn remove_quick_message(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(item): Path<String>,
+) -> ApiResult<Vec<QuickItem>> {
+    let (zalo, id) = quick_id(&item)?;
+    if zalo {
+        let id = u64::try_from(id).map_err(|_| ApiError::not_found("quick message"))?;
+        let zalo = ask_quick(&st, QuickAction::Remove { id }).await?;
+        return Ok(Json(all_quick(&st, Some(zalo)).await?));
+    }
+    st.store
+        .remove_quick_message(id)
+        .map_err(ApiError::internal)?;
+    Ok(Json(all_quick(&st, None).await?))
 }
 
 #[derive(Deserialize)]

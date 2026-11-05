@@ -17,8 +17,8 @@ use crate::media;
 #[cfg(test)]
 use crate::model::Mention;
 use crate::model::{
-    now_ms, Device, Media, Message, NewMessage, NewReaction, Person, ReactionCount, StoredEvent,
-    Thread, ThreadKind, ThreadUpsert,
+    now_ms, Device, Media, Message, NewMessage, NewReaction, Person, QuickItem, ReactionCount,
+    StoredEvent, Thread, ThreadKind, ThreadUpsert,
 };
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -116,6 +116,16 @@ const THREAD_COLUMNS: &str = "id, kind, remote_id, name, avatar, last_message_at
               WHERE threads.kind = 'user' AND p.uid = threads.remote_id), '')";
 const PERSON_COLUMNS: &str = "uid, name, zalo_name, avatar, friend, updated_at, alias";
 
+/// Version 12: quick messages kept by zetachat.
+const SCHEMA_V12: &str = "
+CREATE TABLE quick_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword    TEXT NOT NULL UNIQUE,
+    text       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+";
+
 /// Version 8: the names the account gives its contacts.
 const SCHEMA_V8: &str = "ALTER TABLE people ADD COLUMN alias TEXT NOT NULL DEFAULT '';";
 
@@ -147,7 +157,7 @@ ALTER TABLE messages ADD COLUMN urgency INTEGER NOT NULL DEFAULT 0;
 const CARD_ECHO_MS: i64 = 15_000;
 
 /// The version `init` brings every database to.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Version 11: bank account cards, shown as "[Nội dung đặc biệt]" before.
 const REPARSED_IN_V11: [&str; 1] = ["chat.webcontent"];
@@ -656,6 +666,12 @@ impl Store {
                 tracing::info!(count = reparsed, "rich cards parsed again");
             }
         }
+        if version < 12 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V12)?;
+            tx.pragma_update(None, "user_version", 12)?;
+            tx.commit()?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -710,6 +726,50 @@ impl Store {
             set_alias_in(&tx, uid, alias)?;
         }
         tx.commit()
+    }
+
+    /// The quick messages zetachat keeps, by keyword.
+    pub fn quick_messages(&self) -> Result<Vec<QuickItem>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT id, keyword, text, updated_at FROM quick_messages ORDER BY keyword")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(QuickItem {
+                id: format!("local:{}", r.get::<_, i64>(0)?),
+                keyword: r.get(1)?,
+                text: r.get(2)?,
+                photo: String::new(),
+                updated_at: r.get(3)?,
+                zalo: false,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Keep a quick message; false when one has this keyword already.
+    pub fn add_quick_message(&self, keyword: &str, text: &str) -> Result<bool> {
+        let added = self.conn().execute(
+            "INSERT OR IGNORE INTO quick_messages (keyword, text, updated_at) VALUES (?1, ?2, ?3)",
+            params![keyword, text, now_ms()],
+        )?;
+        Ok(added > 0)
+    }
+
+    /// Change one; false when it is gone or another has the keyword.
+    pub fn update_quick_message(&self, id: i64, keyword: &str, text: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE OR IGNORE quick_messages SET keyword = ?2, text = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id, keyword, text, now_ms()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn remove_quick_message(&self, id: i64) -> Result<bool> {
+        let removed = self
+            .conn()
+            .execute("DELETE FROM quick_messages WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
     }
 
     /// Give `uid` an alias (empty: none).
@@ -1489,6 +1549,27 @@ mod tests {
             sent_at: at,
             raw: "{}".into(),
         }
+    }
+
+    #[test]
+    fn quick_messages_have_one_keyword_each() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.add_quick_message("chao", "Xin chào").unwrap());
+        assert!(!s.add_quick_message("chao", "lần hai").unwrap());
+        assert!(s.add_quick_message("camon", "Cảm ơn").unwrap());
+        let list = s.quick_messages().unwrap();
+        assert_eq!(
+            list.iter().map(|q| q.keyword.as_str()).collect::<Vec<_>>(),
+            ["camon", "chao"]
+        );
+        let id: i64 = list[1].id.trim_start_matches("local:").parse().unwrap();
+        assert!(!s.update_quick_message(id, "camon", "trùng").unwrap());
+        assert!(s
+            .update_quick_message(id, "xinchao", "Xin chào bạn")
+            .unwrap());
+        assert!(s.remove_quick_message(id).unwrap());
+        assert!(!s.remove_quick_message(id).unwrap());
+        assert_eq!(s.quick_messages().unwrap().len(), 1);
     }
 
     #[test]

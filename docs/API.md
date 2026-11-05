@@ -35,6 +35,8 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/banks` | Các ngân hàng Zalo hỗ trợ: `[{ "bin", "name", "short_name", "logo", "keywords" }]` (gateway giữ một ngày) |
 | GET, POST | `/bank-accounts` | Tài khoản ngân hàng đã lưu trong Zalo (điện thoại cũng thấy): `[{ "id", "bin", "number", "holder", "default" }]`. POST `{ "bin", "number", "holder" }` lưu thêm một tài khoản và trả về danh sách mới |
 | DELETE | `/bank-accounts/{id}` | Xóa một tài khoản đã lưu; trả về danh sách mới |
+| GET, POST | `/quick-messages` | Tin nhắn nhanh: `[{ "id", "keyword", "text", "photo", "updated_at", "zalo" }]`, theo phím tắt. `id` là `zalo:<số>` (Zalo giữ, đồng bộ với điện thoại) hoặc `local:<số>` (zetachat giữ). POST `{ "keyword", "text", "zalo" }` thêm một tin (`zalo: true` để lưu lên Zalo); phím tắt không có khoảng trắng, tối đa 20 ký tự, dấu `/` ở đầu được bỏ. Phím tắt đã có thì `409`. Trả về danh sách mới |
+| PUT, DELETE | `/quick-messages/{id}` | Sửa `{ "keyword", "text" }` hoặc xóa một tin; trả về danh sách mới. Tin của Zalo có ảnh thì sửa trên điện thoại |
 | GET | `/vietqr.svg?bin=&number=&amount=&note=` | Mã VietQR (SVG) để app ngân hàng quét và chuyển tiền tới tài khoản; `amount` (đồng) và `note` không bắt buộc. Gateway tự tạo, không hỏi Zalo |
 | POST | `/threads/{id}/contact-card` | Gửi danh thiếp `{ "uid" }` (của bạn bè, hay của chính tài khoản); trả về tin đã lưu (`kind` là `chat.recommended`, `media.kind` là `contact`). Chuyển tiếp một danh thiếp cũng gửi lại danh thiếp đó |
 | GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |

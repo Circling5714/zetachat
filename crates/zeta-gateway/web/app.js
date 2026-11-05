@@ -1704,6 +1704,7 @@ document.addEventListener('keydown', (e) => {
   else if (!$('forward').hidden) closeForward();
   else if (!$('card-pick').hidden) closeCardPick();
   else if (!$('stk').hidden) closeStk();
+  else if (!$('quick-modal').hidden) closeQuickModal();
   else if (!$('bank-modal').hidden) closeBankModal();
   else if (!$('new-group').hidden) closeNewGroup();
   else if (!$('add-friend').hidden) closeAddFriend();
@@ -3110,6 +3111,218 @@ $('mark-chip').addEventListener('click', () => {
   focusComposer();
 });
 
+// ------------------------------------------------------------ quick messages
+//
+// Texts saved under a keyword: "/keyword" in the box lists them, as in Zalo.
+// Zalo keeps one per personal account (synced with the phone); zetachat keeps
+// the rest.
+
+const quick = { items: [], shown: [], active: 0, editing: null, loaded: false };
+
+async function loadQuick() {
+  try {
+    quick.items = await api('/quick-messages');
+    quick.loaded = true;
+  } catch (_) {
+    quick.items = quick.items || [];
+  }
+  return quick.items;
+}
+
+/** The "/…" being typed right before the cursor. */
+function quickQuery() {
+  if (format.on || input.selectionStart !== input.selectionEnd) return null;
+  const before = input.value.slice(0, input.selectionStart);
+  const found = /(^|\s)\/([^\s/]{0,20})$/.exec(before);
+  if (!found) return null;
+  return { start: input.selectionStart - found[2].length - 1, text: found[2] };
+}
+
+function closeQuickBox() {
+  $('quick-box').hidden = true;
+  quick.shown = [];
+}
+
+function updateQuickBox() {
+  const q = quickQuery();
+  if (!q || !quick.items.length) {
+    closeQuickBox();
+    return;
+  }
+  const wanted = fold(q.text);
+  const starts = quick.items.filter((x) => fold(x.keyword).startsWith(wanted));
+  const inside = quick.items.filter((x) => !starts.includes(x) && (fold(x.keyword).includes(wanted) || (wanted.length > 1 && fold(x.text).includes(wanted))));
+  quick.shown = starts.concat(inside).slice(0, 8);
+  quick.active = 0;
+  renderQuickBox();
+}
+
+function renderQuickBox() {
+  const box = $('quick-box');
+  box.replaceChildren();
+  if (!quick.shown.length) {
+    box.hidden = true;
+    return;
+  }
+  quick.shown.forEach((x, i) => {
+    const item = el('div', i === quick.active ? 'mention-item quick-pick active' : 'mention-item quick-pick');
+    item.setAttribute('role', 'option');
+    item.append(el('span', 'name', `/${x.keyword}`), el('span', 'note', x.text.replace(/\s+/g, ' ')));
+    if (x.zalo) item.append(el('span', 'tag', 'Zalo'));
+    item.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      pickQuick(x);
+    });
+    box.append(item);
+  });
+  box.hidden = false;
+}
+
+/** Put a quick message where its "/keyword" was typed. */
+function pickQuick(x) {
+  const q = quickQuery();
+  if (q) input.setRangeText(x.text, q.start, input.selectionStart, 'end');
+  else insertAtCursor(x.text);
+  if (x.photo) toast('Ảnh kèm tin nhắn nhanh này chỉ gửi được từ điện thoại');
+  closeQuickBox();
+  autosize();
+  updateSendButton();
+  input.focus();
+}
+
+/** Keys while the list is open; true when the key was for the list. */
+function quickKey(e) {
+  if ($('quick-box').hidden || !quick.shown.length) return false;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    const n = quick.shown.length;
+    quick.active = (quick.active + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+    renderQuickBox();
+  } else if (e.key === 'Enter' || e.key === 'Tab') {
+    pickQuick(quick.shown[quick.active]);
+  } else if (e.key === 'Escape') {
+    closeQuickBox();
+  } else {
+    return false;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  return true;
+}
+
+function openQuickModal() {
+  $('quick-modal').hidden = false;
+  stopQuickEdit();
+  renderQuickList();
+  loadQuick().then(renderQuickList);
+  $('quick-keyword').focus();
+}
+
+function closeQuickModal() {
+  $('quick-modal').hidden = true;
+}
+
+function renderQuickList() {
+  const ul = $('quick-list');
+  ul.replaceChildren();
+  if (!quick.items.length) {
+    ul.append(el('li', 'list-empty', quick.loaded ? 'Chưa có tin nhắn nhanh nào. Thêm ở dưới.' : 'Đang tải…'));
+    return;
+  }
+  for (const x of quick.items) {
+    const li = el('li', 'bank-item quick-item');
+    const body = el('div', 'body');
+    const head = el('div', 'keyword', `/${x.keyword}`);
+    if (x.zalo) head.append(el('span', 'tag', 'Zalo'));
+    body.append(head, el('div', 'quick-text', x.text));
+    const use = el('button', 'btn', 'Dùng');
+    use.type = 'button';
+    use.title = 'Chèn vào ô soạn tin';
+    use.addEventListener('click', () => {
+      closeQuickModal();
+      if (format.on) setFormat(false);
+      insertAtCursor(x.text);
+      input.focus();
+    });
+    const change = el('button', 'btn secondary', 'Sửa');
+    change.type = 'button';
+    change.disabled = Boolean(x.photo);
+    if (x.photo) change.title = 'Tin có ảnh: sửa trên điện thoại';
+    change.addEventListener('click', () => startQuickEdit(x));
+    const remove = el('button', 'btn secondary', 'Xóa');
+    remove.type = 'button';
+    remove.addEventListener('click', () => removeQuick(x));
+    li.append(body, use, change, remove);
+    ul.append(li);
+  }
+}
+
+function startQuickEdit(x) {
+  quick.editing = x;
+  $('quick-form-title').textContent = `Sửa /${x.keyword}`;
+  $('quick-keyword').value = x.keyword;
+  $('quick-text').value = x.text;
+  $('quick-zalo').checked = x.zalo;
+  $('quick-zalo').disabled = true;
+  $('quick-cancel-edit').hidden = false;
+  $('quick-text').focus();
+}
+
+function stopQuickEdit() {
+  quick.editing = null;
+  $('quick-form-title').textContent = 'Thêm tin nhắn nhanh';
+  $('quick-keyword').value = '';
+  $('quick-text').value = '';
+  $('quick-zalo').checked = false;
+  $('quick-zalo').disabled = false;
+  $('quick-cancel-edit').hidden = true;
+}
+
+async function removeQuick(x) {
+  const where = x.zalo ? ' khỏi Zalo (cả trên điện thoại)' : '';
+  if (!window.confirm(`Xóa tin nhắn nhanh /${x.keyword}${where}?`)) return;
+  try {
+    quick.items = await api(`/quick-messages/${encodeURIComponent(x.id)}`, { method: 'DELETE' });
+    if (quick.editing && quick.editing.id === x.id) stopQuickEdit();
+    renderQuickList();
+  } catch (err) {
+    handleError(err, 'Không xóa được: ');
+  }
+}
+
+$('quick-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    keyword: $('quick-keyword').value.trim().replace(/^\/+/, ''),
+    text: $('quick-text').value.trim(),
+    zalo: $('quick-zalo').checked,
+  };
+  if (!body.keyword || /\s/.test(body.keyword)) {
+    toast('Phím tắt không được có khoảng trắng');
+    return;
+  }
+  $('quick-save').disabled = true;
+  try {
+    const editing = quick.editing;
+    quick.items = editing
+      ? await api(`/quick-messages/${encodeURIComponent(editing.id)}`, { method: 'PUT', json: body })
+      : await api('/quick-messages', { json: body });
+    quick.loaded = true;
+    stopQuickEdit();
+    renderQuickList();
+    toast(editing ? 'Đã sửa tin nhắn nhanh' : 'Đã lưu tin nhắn nhanh');
+  } catch (err) {
+    handleError(err, 'Không lưu được: ');
+  } finally {
+    $('quick-save').disabled = false;
+  }
+});
+$('quick-btn').addEventListener('click', openQuickModal);
+$('quick-close').addEventListener('click', closeQuickModal);
+$('quick-cancel-edit').addEventListener('click', stopQuickEdit);
+$('quick-modal').addEventListener('click', (e) => {
+  if (e.target === $('quick-modal')) closeQuickModal();
+});
+
 /** An empty box turns the send button into a quick 👍, as in Zalo. */
 function updateSendButton() {
   const empty = !composerText().trim();
@@ -3124,10 +3337,14 @@ input.addEventListener('input', () => {
   updateSendButton();
   sendTyping();
   updateMentionBox();
+  updateQuickBox();
 });
-input.addEventListener('blur', () => setTimeout(closeMentionBox, 150));
+input.addEventListener('blur', () => setTimeout(() => {
+  closeMentionBox();
+  closeQuickBox();
+}, 150));
 input.addEventListener('keydown', (e) => {
-  if (mentionKey(e)) return;
+  if (mentionKey(e) || quickKey(e)) return;
   // Enter sends; Shift+Enter is a new line; never send while an IME is composing.
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
     e.preventDefault();
@@ -4128,6 +4345,7 @@ async function start() {
   renderStatus(st.zalo);
   await loadThreads();
   loadBanks();
+  loadQuick();
   loadFriends();
   loadRequests();
   openStream();

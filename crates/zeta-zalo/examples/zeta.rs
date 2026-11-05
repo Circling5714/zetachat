@@ -39,7 +39,7 @@ Cách dùng:
   zeta send    <session.json> user|group <id> <nội dung> [--styles JSON] [--urgency 0|1|2]
   zeta card    <session.json> user|group <id> <uid | me> [số điện thoại]   gửi danh thiếp
   zeta bank    <session.json> banks | accounts | add <bin> <số TK> <tên> | remove <bin> <số TK> | send user|group <id> <bin> <số TK> <tên>
-  zeta quick   <session.json> list | add <từ khóa> <nội dung> | remove <id>   tin nhắn nhanh
+  zeta quick   <session.json> list | add <từ khóa> <nội dung> | change <từ khóa> <nội dung> | remove <từ khóa>   tin nhắn nhanh
   zeta board   <session.json> list <group id> | reminders user|group <id> | remind user|group <id> <tiêu đề> <phút nữa> | unremind user|group <id> <reminder id> | poll <poll id>
       (id \"cloud\" với user là \"Cloud của tôi\")
   zeta react   <session.json> user|group <id> <msgId> <cliMsgId> <biểu tượng, \"\" để gỡ>
@@ -646,10 +646,33 @@ async fn quick(args: &[String]) -> Result<()> {
             let item = client.add_quick_message(keyword, text).await?;
             println!("ADDED id={} keyword={}", item.id, item.keyword);
         }
+        "change" => {
+            // Only the item with exactly this keyword.
+            let (Some(keyword), Some(text)) = (args.get(2), args.get(3)) else {
+                bail!("cần: quick <session.json> change <từ khóa> <nội dung mới>");
+            };
+            let items = client.quick_messages().await?;
+            let item = items
+                .iter()
+                .find(|q| &q.keyword == keyword)
+                .context("không có tin nhắn nhanh với từ khóa này")?;
+            let changed = client.update_quick_message(item.id, keyword, text).await?;
+            println!(
+                "CHANGED keyword={} same text {}",
+                changed.keyword,
+                &changed.text == text
+            );
+        }
         "remove" => {
-            let id: u64 = args.get(2).context("thiếu id")?.parse()?;
-            client.remove_quick_message(id).await?;
-            println!("REMOVED {id}");
+            // Only the item with exactly this keyword.
+            let keyword = args.get(2).context("thiếu từ khóa")?;
+            let items = client.quick_messages().await?;
+            let item = items
+                .iter()
+                .find(|q| &q.keyword == keyword)
+                .context("không có tin nhắn nhanh với từ khóa này")?;
+            client.remove_quick_message(item.id).await?;
+            println!("REMOVED {keyword}");
         }
         other => bail!("không hiểu \"{other}\": list | add | remove"),
     }

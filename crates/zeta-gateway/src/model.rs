@@ -214,6 +214,23 @@ pub struct NewMessage {
     pub raw: String,
 }
 
+/// A quick message ("tin nhắn nhanh"), from Zalo (synced with the phone) or
+/// kept by zetachat (Zalo lets a personal account keep only one).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QuickItem {
+    /// `zalo:<id>` or `local:<id>`.
+    pub id: String,
+    /// What follows "/" to call it.
+    pub keyword: String,
+    pub text: String,
+    /// A photo saved with it (Zalo only); empty for most.
+    pub photo: String,
+    /// Milliseconds since the epoch, 0 when unknown.
+    pub updated_at: i64,
+    /// Kept by Zalo rather than by zetachat.
+    pub zalo: bool,
+}
+
 /// A client device allowed to use the API.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Device {

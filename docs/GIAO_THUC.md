@@ -201,6 +201,19 @@ Gateway đọc mẫu này khi có client xem thẻ lần đầu. Mã ngân hàng
 
 VietQR là chuẩn EMVCo: `00 02 01`, `01 02 11|12`, `38` (`00` `A000000727`, `01` (`00` BIN, `01` số tài khoản), `02` `QRIBFTTA`), `53 03 704`, `54` số tiền, `58 02 VN`, `62` (`08` nội dung), `63 04` CRC-16/CCITT-FALSE. Thẻ của Zalo thêm trường `80` (`com.vng.zalo`, `ZABANKCARD`). Gateway tự tạo mã QR (`/vietqr.svg`) cho thẻ và cho số tài khoản nhận ra trong tin nhắn.
 
+## 8q. Tin nhắn nhanh (đã kiểm chứng)
+
+Dịch vụ `quick_message` (`quickmessage-wpa.zaloapp.com`), mọi lời gọi đều là GET với tham số mã hóa, như zca-js và Zalo Web:
+
+- Danh sách: `/api/quickmessage/list` với `{ version: 0, lang: 0, imei }` trả về `{ cursor, version, items: [{ id, keyword, type, message: { title, params }, media, createdTime, lastModified }] }`.
+- Thêm: `/api/quickmessage/create` với `{ keyword, message: { title, params: "" }, type: 0, imei }`.
+- Sửa: `/api/quickmessage/update` với `{ itemId, keyword, message, type: 0 }`.
+- Xóa: `/api/quickmessage/delete` với `{ itemIds }`.
+
+Tin `type` 1 có thêm ảnh trong `media.items`.
+
+Đã thử thật: tài khoản thử có 1 tin. Thêm tin thứ hai thì Zalo trả mã **821** "Item size not support". `getServerInfo` cho biết lý do: `quick_message.max_creation_quantity` bằng 1, tức tài khoản cá nhân chỉ được giữ 1 tin; Zalo Web hiện "Tin nhắn nhanh (n/tối đa)". Mã 820 là phím tắt trùng. Vì vậy zetachat tự giữ các tin còn lại (schema v12, bảng `quick_messages`) và gộp với tin của Zalo.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

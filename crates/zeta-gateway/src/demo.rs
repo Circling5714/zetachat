@@ -769,6 +769,62 @@ fn store_and_publish(
     Some(message)
 }
 
+/// The demo's quick messages, changed by adding, changing and removing.
+static DEMO_QUICK: std::sync::Mutex<Option<Vec<zeta_zalo::quick::QuickMessage>>> =
+    std::sync::Mutex::new(None);
+
+fn demo_quick(action: crate::zalo::QuickAction) -> Value {
+    use crate::zalo::QuickAction;
+    let mut guard = DEMO_QUICK.lock().unwrap_or_else(|e| e.into_inner());
+    let list = guard.get_or_insert_with(|| {
+        [
+            (
+                1,
+                "chao",
+                "Xin chào, cảm ơn bạn đã nhắn tin! Mình sẽ trả lời sớm nhé.",
+            ),
+            (
+                2,
+                "diachi",
+                "Địa chỉ: 12 Lê Lợi, Quận 1, TP. Hồ Chí Minh. Mở cửa 8:00–21:00.",
+            ),
+            (3, "camon", "Cảm ơn bạn rất nhiều 🙏"),
+        ]
+        .into_iter()
+        .map(|(id, keyword, text)| zeta_zalo::quick::QuickMessage {
+            id,
+            keyword: keyword.into(),
+            text: text.into(),
+            photo: String::new(),
+            updated_at: 0,
+        })
+        .collect()
+    });
+    match action {
+        QuickAction::List => {}
+        QuickAction::Add { keyword, text } => {
+            let id = list.iter().map(|q| q.id).max().unwrap_or(0) + 1;
+            list.push(zeta_zalo::quick::QuickMessage {
+                id,
+                keyword,
+                text,
+                photo: String::new(),
+                updated_at: now_ms(),
+            });
+        }
+        QuickAction::Update { id, keyword, text } => {
+            if let Some(q) = list.iter_mut().find(|q| q.id == id) {
+                q.keyword = keyword;
+                q.text = text;
+                q.updated_at = now_ms();
+            }
+        }
+        QuickAction::Remove { id } => list.retain(|q| q.id != id),
+    }
+    list.sort_by(|a, b| a.keyword.cmp(&b.keyword));
+    json!(list)
+}
+
 /// Banks of the demo: a few real ones (public codes and names).
 fn demo_banks() -> Vec<zeta_zalo::card::Bank> {
     [
@@ -1265,6 +1321,9 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 }
                 ZaloCommand::Cards { action, reply } => {
                     let _ = reply.send(demo_cards(&store, &bus, action));
+                }
+                ZaloCommand::Quick { action, reply } => {
+                    let _ = reply.send(Ok(demo_quick(action)));
                 }
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {

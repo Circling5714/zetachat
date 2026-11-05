@@ -231,8 +231,33 @@ pub enum ZaloCommand {
         action: CardAction,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Quick messages ("tin nhắn nhanh"); every action answers the list.
+    Quick {
+        action: QuickAction,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
+    },
+}
+
+/// What to do with quick messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuickAction {
+    List,
+    Add {
+        keyword: String,
+        text: String,
+    },
+    /// Change the keyword and text of one (not those with a photo, which
+    /// Zalo would drop: those are changed on the phone).
+    Update {
+        id: u64,
+        keyword: String,
+        text: String,
+    },
+    Remove {
+        id: u64,
     },
 }
 
@@ -1373,6 +1398,15 @@ impl Connector {
                     let _ = reply.send(card_action(&client, &ctx, action).await);
                 });
             }
+            ZaloCommand::Quick { action, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _ = reply.send(quick_action(&client, action).await);
+                });
+            }
             ZaloCommand::StartLogin { reply } => {
                 if self.login_running {
                     let current = self
@@ -2089,6 +2123,48 @@ fn person_name(p: &Person) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or("Người dùng Zalo")
         .to_string()
+}
+
+async fn quick_action(client: &ZaloClient, action: QuickAction) -> Result<Value, String> {
+    let err = |e: zeta_zalo::Error| match e {
+        // Seen live: a personal account may keep one (getServerInfo:
+        // quick_message.max_creation_quantity).
+        zeta_zalo::Error::Server { code: 821, .. } => {
+            "Zalo không cho tài khoản này lưu thêm tin nhắn nhanh; hãy lưu trong zetachat"
+                .to_string()
+        }
+        zeta_zalo::Error::Server { code: 820, .. } => {
+            "Zalo đã có tin nhắn nhanh với phím tắt này".to_string()
+        }
+        other => other.to_string(),
+    };
+    match action {
+        QuickAction::List => {}
+        QuickAction::Add { keyword, text } => {
+            client
+                .add_quick_message(&keyword, &text)
+                .await
+                .map_err(err)?;
+        }
+        QuickAction::Update { id, keyword, text } => {
+            let items = client.quick_messages().await.map_err(err)?;
+            let item = items
+                .iter()
+                .find(|q| q.id == id)
+                .ok_or_else(|| "không có tin nhắn nhanh này".to_string())?;
+            if !item.photo.is_empty() {
+                return Err("tin nhắn nhanh có ảnh: hãy sửa trên điện thoại".into());
+            }
+            client
+                .update_quick_message(id, &keyword, &text)
+                .await
+                .map_err(err)?;
+        }
+        QuickAction::Remove { id } => client.remove_quick_message(id).await.map_err(err)?,
+    }
+    let mut items = client.quick_messages().await.map_err(err)?;
+    items.sort_by(|a, b| a.keyword.cmp(&b.keyword));
+    Ok(json!(items))
 }
 
 /// What a card action needs besides the client.
