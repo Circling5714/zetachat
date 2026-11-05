@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Semaphore};
-use zeta_zalo::api::{LastOnline, Recipient, SessionHealth};
+use zeta_zalo::api::{LastOnline, Recipient, SessionHealth, TextExtras};
 use zeta_zalo::message::QuotedMessage;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::sticker::Sticker;
@@ -26,7 +26,7 @@ use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
     now_ms, thread_id, GroupMembers, Media, Member, Mention, Message, NewMessage, NewReaction,
-    Person, Quote, Thread, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
+    Person, Quote, TextStyle, Thread, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
 };
 use crate::stickers::{StickerCache, StickerQuery};
 use crate::store::Store;
@@ -114,6 +114,10 @@ pub enum ZaloCommand {
         reply_to: Option<Box<ReplyTo>>,
         /// People named in a group message.
         mentions: Vec<Mention>,
+        /// How runs of the text are drawn.
+        styles: Vec<TextStyle>,
+        /// 0 normal, 1 important, 2 urgent.
+        urgency: u8,
         reply: oneshot::Sender<Result<Message, String>>,
     },
     /// Recall one of the account's messages for everyone; answers with the
@@ -249,10 +253,35 @@ pub struct ReplyTo {
     pub raw: Value,
 }
 
+/// The Zalo JSON kept for a text sent from here, shaped like Zalo's own (so
+/// it reads back the same): `mentions`, a styled text's `rtf` content and
+/// `specialMsgType`. `None` for a plain text.
+pub fn sent_text_raw(text: &str, extras: &TextExtras) -> Option<Value> {
+    let mut raw = serde_json::Map::new();
+    if !extras.mentions.is_empty() {
+        raw.insert("mentions".into(), json!(extras.mentions));
+    }
+    if !extras.styles.is_empty() {
+        let params = json!({ "styles": extras.styles, "ver": 0 }).to_string();
+        raw.insert(
+            "content".into(),
+            json!({ "action": "rtf", "title": text, "params": params }),
+        );
+    }
+    if matches!(extras.urgency, 1 | 2) {
+        raw.insert("specialMsgType".into(), json!(extras.urgency));
+    }
+    (!raw.is_empty()).then_some(Value::Object(raw))
+}
+
 /// What Zalo needs to know of a quoted message.
 fn quoted_message(r: &ReplyTo, self_uid: &str) -> QuotedMessage {
     let m = &r.message;
     let content = match r.raw.get("content") {
+        // A styled text is quoted by its words, as a plain one.
+        Some(content) if content.get("action").and_then(Value::as_str) == Some("rtf") => {
+            json!(m.text)
+        }
         Some(content) if !content.is_null() => content.clone(),
         // Sent from here: no original JSON, rebuild what the official client reads.
         _ => match &m.media {
@@ -868,6 +897,8 @@ impl Connector {
                 text,
                 reply_to,
                 mentions,
+                styles,
+                urgency,
                 reply,
             } => {
                 let Some(client) = self.client.clone() else {
@@ -885,6 +916,11 @@ impl Connector {
                         .display_name
                         .clone(),
                 };
+                let extras = TextExtras {
+                    mentions,
+                    styles,
+                    urgency,
+                };
                 tokio::spawn(async move {
                     let target = (kind, remote_id.as_str());
                     let result = send_and_store(
@@ -893,7 +929,7 @@ impl Connector {
                         &bus,
                         &me,
                         target,
-                        (&text, &mentions),
+                        (&text, &extras),
                         reply_to.as_deref(),
                     )
                     .await;
@@ -1508,11 +1544,36 @@ impl Connector {
         }
     }
 
+    /// A message deleted for this account on another device (`chat.delete`)
+    /// goes here too.
+    fn apply_deletions(&self, m: &ParsedMessage) {
+        let thread = thread_id(m.kind, &m.peer);
+        for (remote_id, client_id) in media::deleted_ids(m.raw.get("content")) {
+            match self.store.delete_by_ids(&thread, &remote_id, &client_id) {
+                Ok(Some(gone)) => {
+                    let snapshot = self.store.thread(&gone.thread_id).ok().flatten();
+                    let payload = json!({
+                        "thread_id": gone.thread_id, "seq": gone.seq, "thread": snapshot,
+                    });
+                    if let Err(e) = self.bus.publish("message_deleted", payload) {
+                        tracing::error!(error = %e, "cannot publish a deletion");
+                    }
+                }
+                Ok(None) => tracing::debug!("deletion of a message that is not stored"),
+                Err(e) => tracing::error!(error = %e, "cannot apply a deletion"),
+            }
+        }
+    }
+
     /// Store a parsed message; returns it when it was new. `live` messages count as
     /// unread when incoming.
     fn store_parsed(&self, m: ParsedMessage, live: bool) -> Option<Message> {
         if m.msg_type == "chat.undo" {
             self.apply_recall(&m);
+            return None;
+        }
+        if m.msg_type == "chat.delete" {
+            self.apply_deletions(&m);
             return None;
         }
         // A 1-1 sender's display name fills in an unnamed thread; contacts win.
@@ -1992,7 +2053,7 @@ async fn send_and_store(
     bus: &EventBus,
     me: &Me,
     (kind, remote_id): (ThreadKind, &str),
-    (text, mentions): (&str, &[Mention]),
+    (text, extras): (&str, &TextExtras),
     reply_to: Option<&ReplyTo>,
 ) -> Result<Message, String> {
     let to = recipient(kind, remote_id);
@@ -2000,7 +2061,7 @@ async fn send_and_store(
     let (sent, quote) = match reply_to {
         Some(r) => {
             let sent = client
-                .send_reply_with(to, text, &quoted_message(r, &me.uid), mentions)
+                .send_reply_with(to, text, &quoted_message(r, &me.uid), extras)
                 .await
                 .map_err(err)?;
             let quote = Quote {
@@ -2015,10 +2076,7 @@ async fn send_and_store(
             (sent, Some(quote))
         }
         None => (
-            client
-                .send_text_with(to, text, mentions)
-                .await
-                .map_err(err)?,
+            client.send_text_with(to, text, extras).await.map_err(err)?,
             None,
         ),
     };
@@ -2030,7 +2088,7 @@ async fn send_and_store(
         media: None,
         quote,
         // Kept the way Zalo writes them, so they show like received ones.
-        raw: (!mentions.is_empty()).then(|| json!({ "mentions": mentions })),
+        raw: sent_text_raw(text, extras),
     };
     store_sent(store, bus, &me.uid, kind, remote_id, sent)
 }

@@ -1,7 +1,7 @@
 //! First set of authenticated calls. Each needs a logged-in [`ZaloClient`].
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::client::ZaloClient;
 use crate::domains::Service;
@@ -105,6 +105,71 @@ pub(crate) fn mention_info(mentions: &[Mention]) -> String {
         })
         .collect();
     Value::Array(list).to_string()
+}
+
+/// A run of text drawn one way, as Zalo's clients send it in `textProperties`
+/// (`{ styles: [{ start, len, st }], ver: 0 }`, zca-js and Zalo Web alike):
+/// `len` UTF-16 units from `start`. `st` is one of Zalo's codes, see
+/// [`known_style`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextStyle {
+    pub start: u32,
+    pub len: u32,
+    pub st: String,
+}
+
+/// Whether `st` is a style code Zalo's clients send: `b` bold, `i` italic,
+/// `u` underlined, `s` struck through, `c_<rrggbb>` a colour (`c_db342e`
+/// red, `c_f27806` orange, `c_f7b503` yellow, `c_15a85f` green), `f_<px>` a
+/// size (`f_13` small, `f_18` big), `lst_1` a bulleted and `lst_2` a numbered
+/// list, `ind_<n>0` indented `n` steps.
+pub fn known_style(st: &str) -> bool {
+    let digits = |n: &str| !n.is_empty() && n.len() <= 3 && n.bytes().all(|b| b.is_ascii_digit());
+    match st {
+        "b" | "i" | "u" | "s" | "lst_1" | "lst_2" => true,
+        _ => {
+            if let Some(hex) = st.strip_prefix("c_") {
+                hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            } else if let Some(n) = st.strip_prefix("f_").or_else(|| st.strip_prefix("ind_")) {
+                digits(n)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// How much a message matters, as Zalo's "Đánh dấu tin nhắn": sent as
+/// `metaData: { urgency }`.
+pub const URGENCY_NORMAL: u8 = 0;
+/// "Quan trọng".
+pub const URGENCY_IMPORTANT: u8 = 1;
+/// "Khẩn cấp".
+pub const URGENCY_URGENT: u8 = 2;
+
+/// What a text can carry besides its words.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextExtras {
+    /// People named (groups only).
+    pub mentions: Vec<Mention>,
+    /// How runs of the text are drawn.
+    pub styles: Vec<TextStyle>,
+    /// [`URGENCY_NORMAL`], [`URGENCY_IMPORTANT`] or [`URGENCY_URGENT`].
+    pub urgency: u8,
+}
+
+impl TextExtras {
+    /// Add `textProperties` and `metaData` to the params of a send, as Zalo
+    /// Web does (nothing for plain, normal text).
+    pub(crate) fn apply(&self, params: &mut Map<String, Value>) {
+        if !self.styles.is_empty() {
+            let properties = json!({ "styles": self.styles, "ver": 0 });
+            params.insert("textProperties".into(), json!(properties.to_string()));
+        }
+        if matches!(self.urgency, URGENCY_IMPORTANT | URGENCY_URGENT) {
+            params.insert("metaData".into(), json!({ "urgency": self.urgency }));
+        }
+    }
 }
 
 /// Result of a send.
@@ -248,7 +313,7 @@ fn created_group_of(data: &Value) -> Result<CreatedGroup> {
 }
 
 /// Group endpoints sometimes double-encode `data` as a JSON string.
-fn unwrap_json_string(v: Value) -> Value {
+pub(crate) fn unwrap_json_string(v: Value) -> Value {
     match &v {
         Value::String(s) => serde_json::from_str(s.trim()).unwrap_or(v),
         _ => v,
@@ -574,20 +639,21 @@ impl ZaloClient {
     /// Sent to the primary host only: a send that timed out may still have been
     /// delivered, so retrying on another host could duplicate it.
     pub async fn send_text(&self, to: Recipient<'_>, text: &str) -> Result<SentMessage> {
-        self.send_text_with(to, text, &[]).await
+        self.send_text_with(to, text, &TextExtras::default()).await
     }
 
-    /// Send a text naming people (groups only, as zca-js): with mentions it
-    /// goes to `group/mention` with `mentionInfo`, else as [`Self::send_text`].
+    /// Send a text with extras: naming people (groups only, as zca-js: it then
+    /// goes to `group/mention` with `mentionInfo`), styled runs, urgency.
     pub async fn send_text_with(
         &self,
         to: Recipient<'_>,
         text: &str,
-        mentions: &[Mention],
+        extras: &TextExtras,
     ) -> Result<SentMessage> {
         let key = self.session_key()?;
         let client_id = now_millis();
         let imei = &self.device().imei;
+        let mentions = &extras.mentions;
         let (service, path, payload) = match to {
             Recipient::User(uid) => (
                 Service::Chat,
@@ -612,17 +678,78 @@ impl ZaloClient {
                 }),
             ),
         };
+        let mut payload = match payload {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        extras.apply(&mut payload);
         let url = format!(
             "{}{path}?{}",
             self.domains().primary(service),
             Self::common_params()
         );
-        let form = format!("params={}", self.encrypt_params(&payload)?);
+        let form = format!("params={}", self.encrypt_params(&Value::Object(payload))?);
         let data = self.post_form(&url, form, Some(key)).await?;
         Ok(SentMessage {
             msg_id: first_str(&data, &["msgId"]),
             client_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    #[test]
+    fn style_codes() {
+        for ok in [
+            "b", "i", "u", "s", "c_db342e", "f_13", "f_18", "lst_1", "lst_2", "ind_10",
+        ] {
+            assert!(known_style(ok), "{ok}");
+        }
+        for bad in [
+            "", "x", "c_red", "c_db342", "f_", "ind_", "f_1000", "lst_3", "B",
+        ] {
+            assert!(!known_style(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn extras_become_text_properties_and_meta_data() {
+        let mut params = Map::new();
+        TextExtras::default().apply(&mut params);
+        assert!(params.is_empty(), "plain text sends nothing more");
+
+        let extras = TextExtras {
+            styles: vec![TextStyle {
+                start: 0,
+                len: 4,
+                st: "b".into(),
+            }],
+            urgency: URGENCY_URGENT,
+            ..TextExtras::default()
+        };
+        extras.apply(&mut params);
+        // Zalo wants the JSON as text, as for `mentionInfo`.
+        let properties: Value =
+            serde_json::from_str(params["textProperties"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            properties,
+            json!({ "styles": [{ "start": 0, "len": 4, "st": "b" }], "ver": 0 })
+        );
+        assert_eq!(params["metaData"], json!({ "urgency": 2 }));
+
+        let mut normal = Map::new();
+        TextExtras {
+            urgency: 7,
+            ..TextExtras::default()
+        }
+        .apply(&mut normal);
+        assert!(
+            normal.get("metaData").is_none(),
+            "unknown urgency is not sent"
+        );
     }
 }
 

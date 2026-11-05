@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::media::{Media, Quote};
-pub use zeta_zalo::api::Mention;
+pub use zeta_zalo::api::{Mention, TextStyle};
 
 /// One conversation: a 1-1 chat or a group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +158,11 @@ pub struct Message {
     pub status: i64,
     /// People named in the text (`@Tên`), positions in UTF-16 units.
     pub mentions: Vec<Mention>,
+    /// How runs of the text are drawn: `{ start, len, st }` in UTF-16 units,
+    /// `st` one of Zalo's codes (`b`, `i`, `u`, `s`, `c_db342e`, `f_18`…).
+    pub styles: Vec<TextStyle>,
+    /// 0 normal, 1 important ("Quan trọng"), 2 urgent ("Khẩn cấp").
+    pub urgency: u8,
 }
 
 /// Reactions to a message with one icon.

@@ -365,6 +365,26 @@ fn naming(
     }
 }
 
+/// A styled text, maybe marked (1 important, 2 urgent), with the Zalo JSON
+/// it comes with (`rtf` content, `specialMsgType`).
+fn styled(
+    sender: &'static str,
+    text: &'static str,
+    minutes_ago: i64,
+    styles: Value,
+    urgency: u8,
+) -> Sample {
+    let params = json!({ "styles": styles, "ver": 0 }).to_string();
+    let mut raw = json!({ "content": { "action": "rtf", "title": text, "params": params } });
+    if urgency > 0 {
+        raw["specialMsgType"] = json!(urgency);
+    }
+    Sample {
+        raw: raw.to_string(),
+        ..say(false, sender, text, minutes_ago)
+    }
+}
+
 /// An outgoing reply quoting `quoted` by `author`.
 fn reply(text: &'static str, minutes_ago: i64, author: &str, quoted: &str) -> Sample {
     Sample {
@@ -547,6 +567,26 @@ fn seed(store: &Store) {
                     duration_ms: 42_000,
                     ..Media::default()
                 },
+            ),
+            styled(
+                "Minh",
+                "Việc cần mua:\nThịt gà\nRau muống\nNhớ mua trước 10 giờ",
+                20,
+                json!([
+                    { "start": 0, "len": 13, "st": "b" },
+                    { "start": 14, "len": 7, "st": "lst_2" },
+                    { "start": 22, "len": 9, "st": "lst_2" },
+                    { "start": 32, "len": 20, "st": "i" },
+                    { "start": 46, "len": 6, "st": "c_db342e" }
+                ]),
+                1,
+            ),
+            styled(
+                "Mẹ",
+                "Mai 6 giờ sáng có mặt ở nhà nhé!",
+                15,
+                json!([{ "start": 4, "len": 10, "st": "u" }, { "start": 4, "len": 10, "st": "f_18" }]),
+                2,
             ),
         ],
     );
@@ -803,6 +843,8 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     text,
                     reply_to,
                     mentions,
+                    styles,
+                    urgency,
                     reply,
                 } => {
                     let quote = reply_to.map(|r| Quote {
@@ -823,7 +865,16 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                         "",
                         Content {
                             quote,
-                            raw: json!({ "mentions": mentions }).to_string(),
+                            raw: crate::zalo::sent_text_raw(
+                                &text,
+                                &zeta_zalo::api::TextExtras {
+                                    mentions,
+                                    styles,
+                                    urgency,
+                                },
+                            )
+                            .unwrap_or_else(|| json!({}))
+                            .to_string(),
                             ..self::text(&text)
                         },
                     );

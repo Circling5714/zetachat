@@ -68,8 +68,18 @@ fn fake_connector(
                     text,
                     reply_to,
                     mentions,
+                    styles,
+                    urgency,
                     reply,
                 } => {
+                    let extras = zeta_zalo::api::TextExtras {
+                        mentions,
+                        styles,
+                        urgency,
+                    };
+                    let raw = zeta_gateway::zalo::sent_text_raw(&text, &extras)
+                        .unwrap_or_else(|| json!({}))
+                        .to_string();
                     let thread = ThreadUpsert {
                         kind,
                         remote_id: remote_id.clone(),
@@ -94,7 +104,7 @@ fn fake_connector(
                                 remote_id: r.message.remote_id,
                             }),
                             sent_at: 10,
-                            raw: json!({ "mentions": mentions }).to_string(),
+                            raw,
                         })
                         .unwrap()
                         .unwrap();
@@ -1380,6 +1390,79 @@ async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
     )
     .await;
     assert_eq!(sent["mentions"], json!([]));
+}
+
+#[tokio::test]
+async fn styled_and_marked_texts() {
+    let f = fixture();
+    let user = thread_id(ThreadKind::User, "70");
+    // "  đậm thường" is trimmed: runs move back by two, codes Zalo does not
+    // know are dropped, a run past the end is cut.
+    let body = json!({
+        "text": "  đậm thường",
+        "styles": [
+            { "start": 2, "len": 3, "st": "b" },
+            { "start": 2, "len": 3, "st": "blink" },
+            { "start": 6, "len": 99, "st": "c_db342e" }
+        ],
+        "urgency": 2
+    });
+    let (status, sent) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/messages"),
+        Some(body),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["text"], "đậm thường");
+    assert_eq!(
+        sent["styles"],
+        json!([
+            { "start": 0, "len": 3, "st": "b" },
+            { "start": 4, "len": 6, "st": "c_db342e" }
+        ])
+    );
+    assert_eq!(sent["urgency"], 2);
+    // Read back from the store as clients load the thread.
+    let (_, page) = call(
+        &f,
+        "GET",
+        &format!("/api/v1/threads/{user}/messages"),
+        None,
+        true,
+    )
+    .await;
+    let last = page
+        .as_array()
+        .and_then(|list| list.iter().find(|m| m["seq"] == sent["seq"]))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(last["styles"], sent["styles"]);
+    assert_eq!(last["urgency"], 2);
+
+    let (status, _) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/messages"),
+        Some(json!({ "text": "a", "urgency": 3 })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, plain) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/messages"),
+        Some(json!({ "text": "a" })),
+        true,
+    )
+    .await;
+    assert_eq!(
+        (plain["styles"].clone(), plain["urgency"].clone()),
+        (json!([]), json!(0))
+    );
 }
 
 #[tokio::test]

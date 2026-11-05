@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use zeta_zalo::api::{Recipient, SessionHealth};
+use zeta_zalo::api::{Recipient, SessionHealth, TextExtras};
+use zeta_zalo::board::{BoardItem, NewReminder};
 use zeta_zalo::login::QrEvent;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::{Device, SessionData, ZaloClient};
@@ -35,7 +36,12 @@ Cách dùng:
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
   zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
-  zeta send    <session.json> user|group <id> <nội dung>
+  zeta send    <session.json> user|group <id> <nội dung> [--styles JSON] [--urgency 0|1|2]
+  zeta card    <session.json> user|group <id> <uid | me> [số điện thoại]   gửi danh thiếp
+  zeta bank    <session.json> banks | accounts | send user|group <id> <bin> <số TK> <tên>
+  zeta quick   <session.json> list | add <từ khóa> <nội dung> | remove <id>   tin nhắn nhanh
+  zeta board   <session.json> list <group id> | reminders user|group <id> | remind user|group <id> <tiêu đề> <phút nữa> | unremind user|group <id> <reminder id> | poll <poll id>
+      (id \"cloud\" với user là \"Cloud của tôi\")
   zeta react   <session.json> user|group <id> <msgId> <cliMsgId> <biểu tượng, \"\" để gỡ>
   zeta listen  <session.json> [giây]             nghe sự kiện thời gian thực
   zeta import-ctdozlite <ctdozlite.json> <out.json>";
@@ -64,6 +70,10 @@ async fn main() -> Result<()> {
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
         Some("send") => send(rest).await,
+        Some("card") => card(rest).await,
+        Some("bank") => bank(rest).await,
+        Some("quick") => quick(rest).await,
+        Some("board") => board(rest).await,
         Some("react") => react(rest).await,
         Some("listen") => listen(rest).await,
         Some("import-ctdozlite") => import_ctdozlite(rest),
@@ -84,6 +94,22 @@ fn load_client(path: &Path) -> Result<ZaloClient> {
     let session = SessionData::load(path)
         .with_context(|| format!("không đọc được phiên {}", path.display()))?;
     Ok(ZaloClient::from_session(session)?)
+}
+
+/// `user <id>` or `group <id>`; `user cloud` is the account's "Cloud của tôi",
+/// so tests need not name it.
+fn recipient<'a>(client: &'a ZaloClient, kind: &str, id: &'a str) -> Result<Recipient<'a>> {
+    match (kind, id) {
+        ("user", "cloud") => client
+            .session()
+            .map(|s| s.send2me_id.as_str())
+            .filter(|s| !s.is_empty())
+            .map(Recipient::User)
+            .context("phiên không có send2me_id"),
+        ("user", id) => Ok(Recipient::User(id)),
+        ("group", id) => Ok(Recipient::Group(id)),
+        (other, _) => bail!("loại người nhận không hợp lệ: {other}"),
+    }
 }
 
 fn print_qr(payload: &str) {
@@ -491,15 +517,187 @@ async fn limits(args: &[String]) -> Result<()> {
 async fn send(args: &[String]) -> Result<()> {
     let client = load_client(&session_path(args)?)?;
     let (Some(kind), Some(id), Some(text)) = (args.get(1), args.get(2), args.get(3)) else {
-        bail!("cần: send <session.json> user|group <id> <nội dung>");
+        bail!(
+            "cần: send <session.json> user|group <id> <nội dung> [--styles JSON] [--urgency 0|1|2]"
+        );
     };
-    let to = match kind.as_str() {
-        "user" => Recipient::User(id),
-        "group" => Recipient::Group(id),
-        other => bail!("loại người nhận không hợp lệ: {other}"),
-    };
-    let sent = client.send_text(to, text).await?;
+    let to = recipient(&client, kind, id)?;
+    let mut extras = TextExtras::default();
+    let mut flags = args.get(4..).unwrap_or_default().iter();
+    while let Some(flag) = flags.next() {
+        let value = flags.next().context("thiếu giá trị sau cờ")?;
+        match flag.as_str() {
+            "--styles" => {
+                extras.styles = serde_json::from_str(value).context("--styles không phải JSON")?
+            }
+            "--urgency" => extras.urgency = value.parse().context("--urgency là 0, 1 hoặc 2")?,
+            other => bail!("cờ không hỗ trợ: {other}"),
+        }
+    }
+    let sent = client.send_text_with(to, text, &extras).await?;
     println!("SENT msgId={} clientId={}", sent.msg_id, sent.client_id);
+    Ok(())
+}
+
+/// Send a contact card; `me` is the account's own.
+async fn card(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let (Some(kind), Some(id), Some(uid)) = (args.get(1), args.get(2), args.get(3)) else {
+        bail!("cần: card <session.json> user|group <id> <uid | me> [số điện thoại]");
+    };
+    let to = recipient(&client, kind, id)?;
+    let uid = match uid.as_str() {
+        "me" => client.session().map(|s| s.uid.clone()).unwrap_or_default(),
+        other => other.to_string(),
+    };
+    let phone = args.get(4).map(String::as_str).unwrap_or("");
+    match client.send_contact_card(to, &uid, phone).await {
+        Ok(sent) => println!(
+            "CARD SENT msgId {} clientId={}",
+            if sent.msg_id.is_empty() {
+                "trống"
+            } else {
+                "có"
+            },
+            sent.client_id
+        ),
+        Err(e) => println!("LỖI {e}"),
+    }
+    Ok(())
+}
+
+/// Banks Zalo knows (public), saved accounts (counted only), sending one.
+async fn bank(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    match args.get(1).map(String::as_str).unwrap_or("banks") {
+        "banks" => {
+            let banks = client.banks().await?;
+            let with_logo = banks.iter().filter(|b| !b.logo.is_empty()).count();
+            println!("{} ngân hàng ({with_logo} có logo)", banks.len());
+            for b in banks.iter().take(8) {
+                println!("  {} {} [{}]", b.bin, b.short_name, b.keywords);
+            }
+        }
+        "accounts" => {
+            let accounts = client.bank_accounts().await?;
+            let defaults = accounts.iter().filter(|a| a.default).count();
+            println!("{} tài khoản đã lưu ({defaults} mặc định)", accounts.len());
+        }
+        "send" => {
+            let (Some(kind), Some(id), Some(bin), Some(number)) =
+                (args.get(2), args.get(3), args.get(4), args.get(5))
+            else {
+                bail!("cần: bank <session.json> send user|group <id> <bin> <số TK> [tên]");
+            };
+            let to = recipient(&client, kind, id)?;
+            let holder = args.get(6).map(String::as_str).unwrap_or("");
+            match client.send_bank_card(to, bin, number, holder).await {
+                Ok(sent) => println!("BANK CARD SENT clientId={}", sent.client_id),
+                Err(e) => println!("LỖI {e}"),
+            }
+        }
+        other => bail!("không hiểu \"{other}\": banks | accounts | send …"),
+    }
+    Ok(())
+}
+
+/// Quick messages: counted, added, removed (a test adds one and removes it).
+async fn quick(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    match args.get(1).map(String::as_str).unwrap_or("list") {
+        "list" => {
+            let items = client.quick_messages().await?;
+            let photos = items.iter().filter(|q| !q.photo.is_empty()).count();
+            println!("{} tin nhắn nhanh ({photos} có ảnh)", items.len());
+        }
+        "add" => {
+            let (Some(keyword), Some(text)) = (args.get(2), args.get(3)) else {
+                bail!("cần: quick <session.json> add <từ khóa> <nội dung>");
+            };
+            let item = client.add_quick_message(keyword, text).await?;
+            println!("ADDED id={} keyword={}", item.id, item.keyword);
+        }
+        "remove" => {
+            let id: u64 = args.get(2).context("thiếu id")?.parse()?;
+            client.remove_quick_message(id).await?;
+            println!("REMOVED {id}");
+        }
+        other => bail!("không hiểu \"{other}\": list | add | remove"),
+    }
+    Ok(())
+}
+
+/// A group's board and the reminders of a chat: counts, or one test reminder.
+async fn board(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    match args.get(1).map(String::as_str).unwrap_or("") {
+        "list" => {
+            let group = args.get(2).context("thiếu group id")?;
+            let items = client.board(group).await?;
+            let count = |f: fn(&BoardItem) -> bool| items.iter().filter(|i| f(i)).count();
+            println!(
+                "bảng tin: {} ghi chú, {} tin ghim, {} bình chọn",
+                count(|i| matches!(i, BoardItem::Note(_))),
+                count(|i| matches!(i, BoardItem::Pinned(_))),
+                count(|i| matches!(i, BoardItem::Poll(_))),
+            );
+        }
+        "reminders" => {
+            let (Some(kind), Some(id)) = (args.get(2), args.get(3)) else {
+                bail!("cần: board <session.json> reminders user|group <id>");
+            };
+            let list = client.reminders(recipient(&client, kind, id)?).await?;
+            let repeating = list.iter().filter(|r| r.repeat > 0).count();
+            println!("{} nhắc hẹn ({repeating} lặp lại)", list.len());
+        }
+        "remind" => {
+            let (Some(kind), Some(id), Some(title), Some(minutes)) =
+                (args.get(2), args.get(3), args.get(4), args.get(5))
+            else {
+                bail!("cần: board <session.json> remind user|group <id> <tiêu đề> <phút nữa>");
+            };
+            let minutes: i64 = minutes.parse()?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64;
+            let reminder = NewReminder {
+                title: title.clone(),
+                start_at: now + minutes * 60_000,
+                ..NewReminder::default()
+            };
+            match client
+                .create_reminder(recipient(&client, kind, id)?, &reminder)
+                .await
+            {
+                Ok(t) => println!("REMINDER id={} start_at={}", t.id, t.start_at),
+                Err(e) => println!("LỖI {e}"),
+            }
+        }
+        "unremind" => {
+            let (Some(kind), Some(id), Some(reminder)) = (args.get(2), args.get(3), args.get(4))
+            else {
+                bail!("cần: board <session.json> unremind user|group <id> <reminder id>");
+            };
+            match client
+                .remove_reminder(recipient(&client, kind, id)?, reminder)
+                .await
+            {
+                Ok(()) => println!("REMOVED {reminder}"),
+                Err(e) => println!("LỖI {e}"),
+            }
+        }
+        "poll" => {
+            let id: u64 = args.get(2).context("thiếu poll id")?.parse()?;
+            let p = client.poll(id).await?;
+            println!(
+                "bình chọn: {} lựa chọn, {} người bầu, đóng: {}",
+                p.options.len(),
+                p.voters,
+                p.closed
+            );
+        }
+        other => bail!("không hiểu \"{other}\": list | reminders | remind | unremind | poll"),
+    }
     Ok(())
 }
 

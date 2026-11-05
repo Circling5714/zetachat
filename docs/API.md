@@ -32,7 +32,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | POST | `/threads/{id}/stickers` | Gửi nhãn dán `{ "id", "cate_id", "type" }` lấy từ các đường dẫn trên; trả về tin đã lưu (`kind` là `chat.sticker`) |
 | GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
-| POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu. Thêm `"reply_to": <seq>` để trả lời một tin: tin mới mang `quote` của tin đó. Trong nhóm, `"mentions": [{ "uid", "pos", "len" }]` nhắc tên: vị trí và độ dài tính theo đơn vị UTF-16 của `text` (như chuỗi JavaScript), `uid` "-1" là cả nhóm. Gateway điều chỉnh vị trí khi cắt khoảng trắng đầu và bỏ những mục nằm ngoài chữ |
+| POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu. Thêm `"reply_to": <seq>` để trả lời một tin: tin mới mang `quote` của tin đó. Trong nhóm, `"mentions": [{ "uid", "pos", "len" }]` nhắc tên: vị trí và độ dài tính theo đơn vị UTF-16 của `text` (như chuỗi JavaScript), `uid` "-1" là cả nhóm. Gateway điều chỉnh vị trí khi cắt khoảng trắng đầu và bỏ những mục nằm ngoài chữ. `"styles": [{ "start", "len", "st" }]` định dạng từng đoạn chữ (vị trí cũng theo UTF-16), `st` là mã của Zalo: `b` đậm, `i` nghiêng, `u` gạch chân, `s` gạch ngang, `c_db342e` / `c_f27806` / `c_f7b503` / `c_15a85f` chữ đỏ, cam, vàng, xanh lá, `f_13` / `f_18` chữ nhỏ, lớn, `lst_1` / `lst_2` dòng thuộc danh sách dấu chấm hoặc danh sách số, `ind_10`, `ind_20`… thụt lề; mã lạ bị bỏ. `"urgency": 1` đánh dấu tin "Quan trọng", `2` là "Khẩn cấp" |
 | POST | `/threads/{id}/messages/{seq}/recall` | Thu hồi một tin mình đã gửi, với mọi người trong cuộc trò chuyện; trả về tin đã thành `chat.undo`. `409` với tin của người khác, tin chưa được Zalo xác nhận hoặc đã thu hồi |
 | POST | `/threads/{id}/messages/{seq}/forward` | Chuyển tiếp một tin `{ "to": ["zalo:u:…", "zalo:g:…"] }` (tối đa 20 hội thoại). Trả về `{ "results": [{ "to", "message" }, { "to", "upload" }, { "to", "error" }] }`, mỗi hội thoại một mục: tin chữ và liên kết đi bằng chức năng chuyển tiếp của Zalo, nhãn dán được gửi lại; ảnh, video, tin nhắn thoại và tệp được gateway gửi lại từ bản nó giữ, thành một lượt gửi tệp (`upload`) để theo dõi. `409` với loại tin chưa chuyển tiếp được (vị trí…) hoặc tin chưa được Zalo xác nhận |
 | DELETE | `/threads/{id}/messages/{seq}` | Xóa tin ở phía mình: mất khỏi gateway, và nhờ Zalo, khỏi các thiết bị khác của tài khoản; người khác vẫn thấy tin. Các client nhận sự kiện `message_deleted` |
@@ -53,7 +53,7 @@ Mã hội thoại có dạng `zalo:u:<id người dùng>` hoặc `zalo:g:<id nh�
 
 ## Tin nhắn và media
 
-Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, `sender_name`, `outgoing`, `kind` (`msgType` của Zalo: `webchat`, `chat.photo`, `chat.video.msg`, `chat.sticker`, `share.file`…), `text`, `sent_at` (mili giây), `media`, `quote`, `mentions` (người được nhắc tên: `[{ "uid", "pos", "len" }]`, vị trí theo UTF-16) và `status`: với tin của chính mình, 0 là đã gửi, 1 là đã tới máy người nhận, 2 là đã được xem.
+Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, `sender_name`, `outgoing`, `kind` (`msgType` của Zalo: `webchat`, `chat.photo`, `chat.video.msg`, `chat.sticker`, `share.file`…), `text`, `sent_at` (mili giây), `media`, `quote`, `mentions` (người được nhắc tên: `[{ "uid", "pos", "len" }]`, vị trí theo UTF-16), `styles` (chữ có định dạng, như khi gửi; `[]` với chữ thường), `urgency` (0 thường, 1 quan trọng, 2 khẩn cấp) và `status`: với tin của chính mình, 0 là đã gửi, 1 là đã tới máy người nhận, 2 là đã được xem.
 
 `quote` là tin được trả lời (`null` nếu không phải tin trả lời): `{ "sender_name", "text", "remote_id" }`. `reactions` là cảm xúc dưới tin, nhiều nhất trước: `[{ "icon": "/-heart", "emoji": "❤️", "count": 3, "mine": true }]`; mỗi người thả được nhiều lần, `count` đếm tất cả, `mine` cho biết tài khoản này có thả biểu tượng đó. Tin bị người gửi thu hồi có `kind` là `chat.undo`, `text` là "Tin nhắn đã được thu hồi", không còn `media` hay `quote`; gateway xóa hẳn nội dung gốc khỏi kho.
 
@@ -98,7 +98,7 @@ Lượt gửi không sống qua lần khởi động lại gateway: tệp chưa 
 |---|---|
 | `message` | `{ "message": {…}, "thread": {…} }`: tin nhắn mới, đến hay đi |
 | `message_updated` | `{ "message": {…}, "thread": {…} }`: một tin đã lưu thay đổi (bị thu hồi, có cảm xúc mới); client thay tin có cùng `seq` |
-| `message_deleted` | `{ "thread_id", "seq", "thread" }`: một tin đã bị xóa ở phía mình; client bỏ tin có `seq` đó |
+| `message_deleted` | `{ "thread_id", "seq", "thread" }`: một tin đã bị xóa ở phía mình (ở đây, hoặc trên điện thoại của tài khoản); client bỏ tin có `seq` đó |
 | `thread_read` | `{ "thread_id", "unread" }`: hội thoại đã được đọc, ở đây hoặc trên thiết bị khác của tài khoản (ví dụ điện thoại); `unread` là số tin còn chưa đọc (thường là 0) |
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |

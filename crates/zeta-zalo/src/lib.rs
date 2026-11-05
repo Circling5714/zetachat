@@ -11,6 +11,8 @@
 
 pub mod alias;
 pub mod api;
+pub mod board;
+pub mod card;
 pub mod client;
 pub mod crypto;
 pub mod domains;
@@ -20,6 +22,7 @@ pub mod login;
 pub mod media;
 pub mod message;
 pub mod param_cipher;
+pub mod quick;
 pub mod reaction;
 pub mod receipt;
 pub mod session;
@@ -43,6 +46,30 @@ pub const ZPW_TYPE: &str = "30";
 /// it as "Chrome 12x - Windows 10".
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36";
+
+/// Lower case without Vietnamese accents ("Đà Nẵng" → "da nang"), for matching
+/// what people type against names and texts.
+pub fn fold(s: &str) -> String {
+    s.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ' | 'ắ'
+            | 'ặ' | 'ẳ' | 'ẵ' => 'a',
+            'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
+                'e'
+            }
+            'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
+            'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ' | 'ớ'
+            | 'ợ' | 'ở' | 'ỡ' => 'o',
+            'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
+                'u'
+            }
+            'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
+            'đ' => 'd',
+            other => other,
+        })
+        .collect()
+}
 
 /// Unix time in seconds.
 pub(crate) fn unix_now() -> i64 {

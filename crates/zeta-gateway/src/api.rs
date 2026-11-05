@@ -31,8 +31,8 @@ use crate::auth::AuthDevice;
 use crate::events::EventBus;
 use crate::media_cache::{self, CachedFile, FetchError, MediaCache};
 use crate::model::{
-    now_ms, split_thread_id, GroupMembers, Mention, Message, Person, StoredEvent, Thread,
-    ThreadKind, PEOPLE_FRESH_MS,
+    now_ms, split_thread_id, GroupMembers, Mention, Message, Person, StoredEvent, TextStyle,
+    Thread, ThreadKind, PEOPLE_FRESH_MS,
 };
 use crate::stickers::StickerQuery;
 use crate::store::Store;
@@ -777,6 +777,35 @@ struct SendBody {
     /// of `text` as sent.
     #[serde(default)]
     mentions: Vec<Mention>,
+    /// How runs of `text` are drawn, positions as for `mentions`.
+    #[serde(default)]
+    styles: Vec<TextStyle>,
+    /// 0 normal, 1 important ("Quan trọng"), 2 urgent ("Khẩn cấp").
+    #[serde(default)]
+    urgency: u8,
+}
+
+/// Styles that fit the text once it is trimmed (as [`checked_mentions`]),
+/// with codes Zalo knows. At most 300.
+fn checked_styles(raw: &str, text: &str, styles: Vec<TextStyle>) -> Vec<TextStyle> {
+    let lead = raw.len() - raw.trim_start().len();
+    let shift = raw[..lead].encode_utf16().count() as u32;
+    let units = text.encode_utf16().count() as u32;
+    styles
+        .into_iter()
+        .filter(|s| zeta_zalo::api::known_style(&s.st))
+        .filter_map(|s| {
+            // A run that started in the trimmed space starts at the text.
+            let start = s.start.saturating_sub(shift);
+            let end = (s.start + s.len).saturating_sub(shift).min(units);
+            (end > start).then(|| TextStyle {
+                start,
+                len: end - start,
+                st: s.st,
+            })
+        })
+        .take(300)
+        .collect()
 }
 
 /// Mentions that fit the text once it is trimmed: shifted by what the trim took
@@ -829,6 +858,10 @@ async fn send_message(
         ThreadKind::Group => checked_mentions(&body.text, text, body.mentions),
         ThreadKind::User => Vec::new(),
     };
+    if body.urgency > 2 {
+        return Err(ApiError::bad_request("urgency is 0, 1 or 2"));
+    }
+    let styles = checked_styles(&body.text, text, body.styles);
     let reply_to = match body.reply_to {
         Some(seq) => {
             let message = message_in(&st, &id, seq)?;
@@ -852,6 +885,8 @@ async fn send_message(
             text: text.to_string(),
             reply_to,
             mentions,
+            styles,
+            urgency: body.urgency,
             reply,
         })
         .await

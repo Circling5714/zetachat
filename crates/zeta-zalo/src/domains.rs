@@ -32,10 +32,16 @@ pub enum Service {
     Reaction,
     /// Names the account gives its contacts ("tên gợi nhớ").
     Alias,
+    /// Notes and reminders of chats ("ghi chú", "nhắc hẹn").
+    GroupBoard,
+    /// Saved texts called by a keyword ("tin nhắn nhanh").
+    QuickMessage,
+    /// Bank accounts and the cards that send them.
+    Zimsg,
 }
 
 /// Services that `zpw_service_map_v3` can list.
-const MAPPED_SERVICES: [Service; 10] = [
+const MAPPED_SERVICES: [Service; 13] = [
     Service::Chat,
     Service::Conversation,
     Service::Friend,
@@ -46,6 +52,9 @@ const MAPPED_SERVICES: [Service; 10] = [
     Service::GroupCloudMessage,
     Service::Reaction,
     Service::Alias,
+    Service::GroupBoard,
+    Service::QuickMessage,
+    Service::Zimsg,
 ];
 
 impl Service {
@@ -64,6 +73,9 @@ impl Service {
             Self::GroupCloudMessage => "group_cloud_message",
             Self::Reaction => "reaction",
             Self::Alias => "alias",
+            Self::GroupBoard => "group_board",
+            Self::QuickMessage => "quick_message",
+            Self::Zimsg => "zimsg",
         }
     }
 }
@@ -87,6 +99,13 @@ pub struct Domains {
     /// Sessions saved before aliases existed lack it.
     #[serde(default = "default_alias_host")]
     pub alias: String,
+    /// Sessions saved before boards existed lack these three.
+    #[serde(default = "default_group_board_host")]
+    pub group_board: String,
+    #[serde(default = "default_quick_message_host")]
+    pub quick_message: String,
+    #[serde(default = "default_zimsg_host")]
+    pub zimsg: String,
     /// `zpw_chts_new[0]`: HTTP long-polling for messages.
     pub lp_chat: String,
     /// `zpw_ctrs_new[0]`: HTTP long-polling for control events.
@@ -113,6 +132,9 @@ impl Default for Domains {
             group_cloud_message: "https://tt-group-cm.api.zaloapp.com".into(),
             reaction: default_reaction_host(),
             alias: default_alias_host(),
+            group_board: default_group_board_host(),
+            quick_message: default_quick_message_host(),
+            zimsg: default_zimsg_host(),
             lp_chat: "https://p4-msg-chat.zaloapp.com".into(),
             lp_control: "https://p4-ctl-chat.zaloapp.com".into(),
             ws: (1..=8)
@@ -130,6 +152,19 @@ fn default_reaction_host() -> String {
 /// Seen live in `zpw_service_map_v3` (November 2026).
 fn default_alias_host() -> String {
     "https://tt-alias-wpa.api.zaloapp.com".into()
+}
+
+/// Seen live in `zpw_service_map_v3` (November 2026), as the next two.
+fn default_group_board_host() -> String {
+    "https://groupboard-wpa.api.zaloapp.com".into()
+}
+
+fn default_quick_message_host() -> String {
+    "https://quickmessage-wpa.zaloapp.com".into()
+}
+
+fn default_zimsg_host() -> String {
+    "https://zimsg.chat.zalo.me".into()
 }
 
 /// URLs of a service-map entry, which can be a string or an array of strings.
@@ -168,6 +203,9 @@ impl Domains {
             Service::GroupCloudMessage => &self.group_cloud_message,
             Service::Reaction => &self.reaction,
             Service::Alias => &self.alias,
+            Service::GroupBoard => &self.group_board,
+            Service::QuickMessage => &self.quick_message,
+            Service::Zimsg => &self.zimsg,
         }
     }
 

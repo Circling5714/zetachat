@@ -1140,6 +1140,86 @@ function appendMentioned(parent, text, mentions) {
   if (last < text.length) appendText(parent, inlineEmoticons(text.slice(last)));
 }
 
+const INLINE_STYLE = /^(?:b|i|u|s|c_[0-9a-f]{6}|f_\d{1,3})$/i;
+const LINE_STYLE = /^(?:lst_[12]|ind_\d{1,3})$/;
+const PALETTE = new Set(['db342e', 'f27806', 'f7b503', '15a85f']);
+
+/** Draw a run of text as Zalo's codes say (`b`, `i`, `u`, `s`, colours, sizes). */
+function decorate(node, styles) {
+  const lines = [];
+  for (const s of styles) {
+    if (s.st === 'b') node.style.fontWeight = '700';
+    else if (s.st === 'i') node.style.fontStyle = 'italic';
+    else if (s.st === 'u') lines.push('underline');
+    else if (s.st === 's') lines.push('line-through');
+    else if (s.st.startsWith('c_')) {
+      const hex = s.st.slice(2).toLowerCase();
+      if (PALETTE.has(hex)) node.classList.add(`rt-c-${hex}`);
+      else node.style.color = `#${hex}`;
+    } else if (s.st.startsWith('f_')) {
+      const px = Number(s.st.slice(2));
+      if (px >= 8 && px <= 40) node.style.fontSize = `${px}px`;
+    }
+  }
+  if (lines.length) node.style.textDecorationLine = lines.join(' ');
+}
+
+/**
+ * A styled text (positions in UTF-16 units, as Zalo counts): line by line,
+ * lists (`lst_1` bullets, `lst_2` numbers) and indents (`ind_<n>0`) for
+ * whole lines, the other codes on runs; the people it names picked out.
+ */
+function appendRich(parent, text, styles, mentions) {
+  const me = state.status && state.status.uid;
+  const inline = styles.filter((s) => INLINE_STYLE.test(s.st));
+  const perLine = styles.filter((s) => LINE_STYLE.test(s.st));
+  const named = (mentions || []).filter((r) => r.len > 0 && r.pos + r.len <= text.length);
+  const box = el('div', 'rich');
+  let from = 0;
+  let number = 0;
+  let previous = null;
+  for (const line of text.split('\n')) {
+    const to = from + line.length;
+    const covers = (s) => s.start < Math.max(to, from + 1) && s.start + s.len > from;
+    const row = el('div', 'rt-line');
+    const list = perLine.find((s) => s.st.startsWith('lst_') && covers(s));
+    if (list) {
+      number = previous === 'lst_2' && list.st === 'lst_2' ? number + 1 : 1;
+      row.classList.add('rt-li');
+      row.dataset.marker = list.st === 'lst_2' ? `${number}.` : '•';
+    }
+    previous = list ? list.st : null;
+    const indent = Math.max(0, ...perLine.filter((s) => s.st.startsWith('ind_') && covers(s)).map((s) => Math.floor(Number(s.st.slice(4)) / 10)));
+    if (indent) row.style.paddingLeft = `${Math.min(indent, 6) * 20}px`;
+    const cuts = new Set([from, to]);
+    const cut = (at) => { if (at > from && at < to) cuts.add(at); };
+    for (const s of inline) { cut(s.start); cut(s.start + s.len); }
+    for (const r of named) { cut(r.pos); cut(r.pos + r.len); }
+    const points = [...cuts].sort((a, b) => a - b);
+    for (let k = 0; k + 1 < points.length; k += 1) {
+      const [a, b] = [points[k], points[k + 1]];
+      const part = text.slice(a, b);
+      const on = inline.filter((s) => s.start <= a && s.start + s.len >= b);
+      const who = named.find((r) => r.pos <= a && r.pos + r.len >= b);
+      if (!on.length && !who) {
+        appendText(row, inlineEmoticons(part));
+        continue;
+      }
+      const span = el('span', who ? (who.uid === '-1' || (me && who.uid === me) ? 'mention me' : 'mention') : null);
+      decorate(span, on);
+      if (who) span.textContent = part;
+      else appendText(span, inlineEmoticons(part));
+      row.append(span);
+    }
+    if (!line.length) row.append(document.createElement('br'));
+    box.append(row);
+    from = to + 1;
+  }
+  parent.append(box);
+}
+
+const URGENCY_TEXT = ['', 'Quan trọng', 'Khẩn cấp'];
+
 const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\p{Regional_Indicator}|[\u200d\ufe0f\u20e3]|\s)+$/u;
 
 /** Up to three emoji and nothing else: shown large, without a bubble. */
@@ -1186,17 +1266,22 @@ function messageNode(m, prev, t) {
   const recalled = m.kind === 'chat.undo';
   const md = recalled ? null : m.media;
   const media = md && MEDIA[md.kind];
-  const text = recalled || media ? m.text : displayText(m.text);
+  const styled = !recalled && !media && m.styles && m.styles.length > 0;
+  const text = recalled || media || styled ? m.text : displayText(m.text);
+  const urgency = recalled ? 0 : m.urgency || 0;
   let cls = `msg ${m.outgoing ? 'out' : 'in'}`;
   if (media) cls += ` ${media[1]}`;
   if (recalled) cls += ' recalled';
-  else if (!media && !m.quote && emojiOnly(text)) cls += ' emoji-only';
+  else if (!media && !m.quote && !styled && !urgency && emojiOnly(text)) cls += ' emoji-only';
+  if (urgency === 1) cls += ' important';
+  if (urgency === 2) cls += ' urgent';
   const bubble = el('div', cls);
   bubble.dataset.seq = String(m.seq);
   const newSender = !prev || prev.outgoing || prev.sender_id !== m.sender_id || !sameDay(prev.sent_at, m.sent_at);
   if (isGroup && !m.outgoing && newSender) {
     bubble.appendChild(el('div', 'sender', senderLabel(m) || 'Thành viên'));
   }
+  if (urgency) bubble.appendChild(el('div', 'urgency-tag', URGENCY_TEXT[urgency]));
   if (m.quote && !recalled) {
     const quote = el('div', 'quote');
     if (m.quote.sender_name) quote.appendChild(el('div', 'quote-name', m.quote.sender_name));
@@ -1212,6 +1297,8 @@ function messageNode(m, prev, t) {
       appendText(caption, md.description);
       bubble.appendChild(caption);
     }
+  } else if (styled) {
+    appendRich(bubble, m.text || '', m.styles, m.mentions);
   } else if (m.mentions && m.mentions.length) {
     appendMentioned(bubble, m.text || '', m.mentions);
   } else {
@@ -1296,6 +1383,36 @@ function menuButton(label, action, className) {
   return button;
 }
 
+/** Put a floating box next to `anchor`: above it, or below when there is no room. */
+function placeNear(box, anchor) {
+  const at = anchor.getBoundingClientRect();
+  const left = Math.min(window.innerWidth - box.offsetWidth - 8, Math.max(8, at.left + at.width / 2 - box.offsetWidth / 2));
+  let top = at.top - box.offsetHeight - 6;
+  if (top < 8) top = at.bottom + 6;
+  box.style.left = `${left}px`;
+  box.style.top = `${top}px`;
+}
+
+/** A small menu next to `anchor`: `items` are `[label, action, className, hint]`. */
+function openMenu(anchor, items, title) {
+  closePicker();
+  const box = el('div', 'react-picker composer-menu');
+  box.setAttribute('role', 'menu');
+  if (title) box.append(el('div', 'menu-title', title));
+  const actions = el('div', 'menu-actions column');
+  for (const [label, action, className, hint] of items) {
+    const button = menuButton(label, action, className);
+    button.setAttribute('role', 'menuitem');
+    if (hint) button.title = hint;
+    actions.append(button);
+  }
+  box.append(actions);
+  document.body.append(box);
+  placeNear(box, anchor);
+  picker = box;
+  box.querySelector('button').focus();
+}
+
 /** Reactions on top, then what can be done with the message. */
 function openPicker(m, anchor) {
   closePicker();
@@ -1323,12 +1440,7 @@ function openPicker(m, anchor) {
   actions.append(remove);
   box.append(row, actions);
   document.body.append(box);
-  const at = anchor.getBoundingClientRect();
-  const left = Math.min(window.innerWidth - box.offsetWidth - 8, Math.max(8, at.left + at.width / 2 - box.offsetWidth / 2));
-  let top = at.top - box.offsetHeight - 6;
-  if (top < 8) top = at.bottom + 6;
-  box.style.left = `${left}px`;
-  box.style.top = `${top}px`;
+  placeNear(box, anchor);
   picker = box;
   box.querySelector('button').focus();
 }
@@ -1643,7 +1755,7 @@ async function openThread(id, focusSeq) {
     handleError(err);
   }
   markRead(id);
-  $('input').focus();
+  focusComposer();
 }
 
 async function loadOlder() {
@@ -2031,7 +2143,7 @@ function onTyping(p) {
 /** Tell the gateway we are typing, at most every few seconds per thread. */
 function sendTyping() {
   const id = state.current;
-  if (!id || !input.value.trim()) return;
+  if (!id || !composerText().trim()) return;
   const now = Date.now();
   if (now - (state.typingSent.get(id) || 0) < TYPING_SEND_MS) return;
   state.typingSent.set(id, now);
@@ -2177,9 +2289,320 @@ function draftMentions(text) {
   return out.sort((a, b) => a.pos - b.pos);
 }
 
+// ------------------------------------------------------------- formatting
+//
+// "Aa" turns the box into a rich editor with a toolbar, as Zalo PC does:
+// bold, italic, underline, strike, Zalo's four colours, two sizes, lists.
+// What is sent is the plain text and its runs (`styles`, UTF-16 units).
+
+const rich = $('rich');
+const format = { on: false, range: null };
+const BLOCK_TAGS = new Set(['DIV', 'P', 'LI', 'UL', 'OL', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'PRE']);
+
+/** `#db342e`, `rgb(219, 52, 46)` → `db342e`; '' when not a colour. */
+function hexColor(css) {
+  const c = (css || '').trim().toLowerCase();
+  let m = /^#([0-9a-f]{6})$/.exec(c);
+  if (m) return m[1];
+  m = /^#([0-9a-f]{3})$/.exec(c);
+  if (m) return [...m[1]].map((x) => x + x).join('');
+  m = /^rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(c);
+  return m ? m.slice(1, 4).map((n) => Number(n).toString(16).padStart(2, '0')).join('') : '';
+}
+
+/** The formats an element adds to those it is inside. */
+function formatsOf(node, outer) {
+  const f = { ...outer };
+  const tag = node.tagName;
+  if (tag === 'B' || tag === 'STRONG') f.b = true;
+  if (tag === 'I' || tag === 'EM') f.i = true;
+  if (tag === 'U') f.u = true;
+  if (tag === 'S' || tag === 'STRIKE' || tag === 'DEL') f.s = true;
+  if (tag === 'FONT') {
+    if (node.hasAttribute('color')) f.color = hexColor(node.getAttribute('color'));
+    const size = Number(node.getAttribute('size'));
+    if (size) f.size = size <= 2 ? 'f_13' : size >= 4 ? 'f_18' : '';
+  }
+  const st = node.style;
+  if (st) {
+    if (st.fontWeight === 'bold' || Number(st.fontWeight) >= 600) f.b = true;
+    if (st.fontStyle === 'italic') f.i = true;
+    const deco = `${st.textDecorationLine || ''} ${st.textDecoration || ''}`;
+    if (deco.includes('underline')) f.u = true;
+    if (deco.includes('line-through')) f.s = true;
+    if (st.color) f.color = hexColor(st.color);
+  }
+  return f;
+}
+
+/** Merge runs of the same code that touch or overlap. */
+function mergeRuns(runs) {
+  const out = [];
+  const byCode = new Map();
+  for (const r of runs) {
+    if (!byCode.has(r.st)) byCode.set(r.st, []);
+    byCode.get(r.st).push(r);
+  }
+  for (const [st, list] of byCode) {
+    list.sort((a, b) => a.start - b.start);
+    let cur = null;
+    for (const r of list) {
+      if (cur && r.start <= cur.start + cur.len) {
+        cur.len = Math.max(cur.len, r.start + r.len - cur.start);
+      } else {
+        if (cur) out.push(cur);
+        cur = { start: r.start, len: r.len, st };
+      }
+    }
+    if (cur) out.push(cur);
+  }
+  return out.sort((a, b) => a.start - b.start || a.st.localeCompare(b.st));
+}
+
+/**
+ * The rich box as Zalo takes it: `{ text, styles }`, the text trimmed and
+ * the runs moved and cut to match. Colours outside Zalo's four are left out
+ * (the "default colour" button paints the text's own colour).
+ */
+function richValue() {
+  let text = '';
+  const runs = [];
+  const add = (st, start, len) => { if (len > 0) runs.push({ start, len, st }); };
+  const newline = () => { if (text && !text.endsWith('\n')) text += '\n'; };
+  const walk = (node, f, list) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const part = child.nodeValue.replace(/\u00a0/g, ' ').replace(/\u200b/g, '');
+        if (!part) continue;
+        const start = text.length;
+        text += part;
+        for (const key of ['b', 'i', 'u', 's']) if (f[key]) add(key, start, part.length);
+        if (f.color && PALETTE.has(f.color)) add(`c_${f.color}`, start, part.length);
+        if (f.size) add(f.size, start, part.length);
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        if (child.tagName === 'BR') {
+          text += '\n';
+          continue;
+        }
+        const block = BLOCK_TAGS.has(child.tagName);
+        const inList = child.tagName === 'UL' ? 'lst_1' : child.tagName === 'OL' ? 'lst_2' : list;
+        if (block) newline();
+        const start = text.length;
+        walk(child, formatsOf(child, f), inList);
+        if (child.tagName === 'LI' && inList) add(inList, start, text.replace(/\n+$/, '').length - start);
+        if (block) newline();
+      }
+    }
+  };
+  walk(rich, {}, null);
+  const lead = text.length - text.trimStart().length;
+  const kept = text.trim();
+  const styles = mergeRuns(runs
+    .map((r) => {
+      const start = Math.max(0, r.start - lead);
+      const end = Math.min(kept.length, r.start + r.len - lead);
+      return { start, len: end - start, st: r.st };
+    })
+    .filter((r) => r.len > 0));
+  return { text: kept, styles };
+}
+
+/** What the box holds now, whichever box is in use. */
+function composerText() {
+  return format.on ? richValue().text : input.value;
+}
+
+function focusComposer() {
+  if (!format.on) {
+    input.focus();
+    return;
+  }
+  // Keep the selection when it is in the box already (a toolbar click), else
+  // go back to where it last was, or to the end.
+  const sel = getSelection();
+  const current = sel.rangeCount && rich.contains(sel.anchorNode) ? sel.getRangeAt(0).cloneRange() : null;
+  rich.focus();
+  let range = current;
+  if (!range && format.range && rich.contains(format.range.startContainer)) range = format.range;
+  if (!range) {
+    range = document.createRange();
+    range.selectNodeContents(rich);
+    range.collapse(false);
+  }
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+/** Turn the rich box on (the text so far moves in) or off (back to plain text). */
+function setFormat(on) {
+  if (on === format.on) return;
+  closeMentionBox();
+  const btn = $('format-btn');
+  btn.classList.toggle('on', on);
+  btn.setAttribute('aria-pressed', String(on));
+  $('format-bar').hidden = !on;
+  if (on) {
+    rich.textContent = input.value;
+    input.value = '';
+    autosize();
+    input.hidden = true;
+    rich.hidden = false;
+    format.on = true;
+    format.range = null;
+    try { document.execCommand('styleWithCSS', false, false); } catch (_) { /* old engines */ }
+  } else {
+    const { text } = richValue();
+    format.on = false;
+    rich.replaceChildren();
+    rich.hidden = true;
+    input.hidden = false;
+    input.value = text;
+    autosize();
+  }
+  updateSendButton();
+  focusComposer();
+}
+
+/** The selection in the box as character counts from its start. */
+function caretOffsets() {
+  const sel = getSelection();
+  if (!sel.rangeCount || !rich.contains(sel.anchorNode)) return null;
+  const r = sel.getRangeAt(0);
+  const upTo = (node, offset) => {
+    const before = document.createRange();
+    before.selectNodeContents(rich);
+    before.setEnd(node, offset);
+    return before.toString().length;
+  };
+  return [upTo(r.startContainer, r.startOffset), upTo(r.endContainer, r.endOffset)];
+}
+
+/** Put the selection back at character counts from `caretOffsets`. */
+function setCaretOffsets(at) {
+  if (!at) return;
+  const walker = document.createTreeWalker(rich, NodeFilter.SHOW_TEXT);
+  let pos = 0;
+  let start = null;
+  let end = null;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const len = n.nodeValue.length;
+    if (!start && at[0] <= pos + len) start = [n, at[0] - pos];
+    if (!end && at[1] <= pos + len) end = [n, at[1] - pos];
+    if (start && end) break;
+    pos += len;
+  }
+  if (!start || !end) return;
+  const range = document.createRange();
+  range.setStart(...start);
+  range.setEnd(...end);
+  const sel = getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+/** Light up the toolbar buttons that apply where the cursor is. */
+function renderFormatState() {
+  if (!format.on) return;
+  for (const b of $('format-bar').querySelectorAll('button[data-cmd]')) {
+    let on = false;
+    try { on = document.queryCommandState(b.dataset.cmd); } catch (_) { on = false; }
+    b.classList.toggle('on', on);
+  }
+}
+
+$('format-btn').addEventListener('click', () => setFormat(!format.on));
+// Pressing a toolbar button must not take the cursor out of the box.
+$('format-bar').addEventListener('mousedown', (e) => {
+  if (e.target.closest('button')) e.preventDefault();
+});
+$('format-bar').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b || !format.on) return;
+  focusComposer();
+  if (b.dataset.cmd) {
+    // Making a list puts the cursor at the start of the line; keep it where it was.
+    const at = b.dataset.cmd.startsWith('insert') ? caretOffsets() : null;
+    document.execCommand(b.dataset.cmd, false, null);
+    setCaretOffsets(at);
+  } else if ('color' in b.dataset) {
+    document.execCommand('foreColor', false, b.dataset.color || getComputedStyle(rich).color);
+  } else if (b.dataset.size) {
+    document.execCommand('fontSize', false, b.dataset.size);
+  }
+  renderFormatState();
+  updateSendButton();
+});
+document.addEventListener('selectionchange', () => {
+  if (!format.on) return;
+  const sel = getSelection();
+  if (sel.rangeCount && rich.contains(sel.anchorNode)) {
+    format.range = sel.getRangeAt(0).cloneRange();
+    renderFormatState();
+  }
+});
+rich.addEventListener('input', () => {
+  if (!rich.textContent && rich.querySelector('br') && rich.childNodes.length === 1) rich.replaceChildren();
+  updateSendButton();
+  sendTyping();
+});
+rich.addEventListener('keydown', (e) => {
+  // Enter starts a new line here (lists need it); Ctrl+Enter sends.
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing) {
+    e.preventDefault();
+    $('composer').requestSubmit();
+  }
+});
+// Only plain text comes in from outside, so what is sent is what Zalo can draw.
+rich.addEventListener('paste', (e) => {
+  const files = [...((e.clipboardData && e.clipboardData.files) || [])];
+  e.preventDefault();
+  if (files.length) {
+    sendFiles(files);
+    return;
+  }
+  const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+  if (text) document.execCommand('insertText', false, text);
+});
+rich.addEventListener('drop', (e) => {
+  if (carriesFiles(e)) return;
+  e.preventDefault();
+  const text = e.dataTransfer ? e.dataTransfer.getData('text/plain') : '';
+  if (text) document.execCommand('insertText', false, text);
+});
+
+// --------------------------------------------------------------- marks
+//
+// "!" marks the next message as important or urgent ("Đánh dấu tin nhắn").
+
+const mark = { level: 0 };
+
+function setMark(level) {
+  mark.level = level;
+  const btn = $('mark-btn');
+  btn.dataset.level = String(level);
+  btn.classList.toggle('on', level > 0);
+  const chip = $('mark-chip');
+  chip.hidden = !level;
+  chip.textContent = level ? `${URGENCY_TEXT[level]} ×` : '';
+  chip.classList.toggle('urgent', level === 2);
+}
+
+$('mark-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  openMenu($('mark-btn'), [
+    ['Thường', () => setMark(0)],
+    ['Quan trọng', () => setMark(1), null, 'Người nhận thấy nhãn "Quan trọng"'],
+    ['Khẩn cấp', () => setMark(2), 'danger', 'Người nhận thấy nhãn "Khẩn cấp"'],
+  ], 'Đánh dấu tin nhắn');
+});
+$('mark-chip').addEventListener('click', () => {
+  setMark(0);
+  focusComposer();
+});
+
 /** An empty box turns the send button into a quick 👍, as in Zalo. */
 function updateSendButton() {
-  const empty = !input.value.trim();
+  const empty = !composerText().trim();
   const send = $('send');
   send.classList.toggle('like', empty);
   send.textContent = empty ? '👍' : 'Gửi';
@@ -2204,12 +2627,17 @@ input.addEventListener('keydown', (e) => {
 
 $('composer').addEventListener('submit', async (e) => {
   e.preventDefault();
-  let text = input.value.trim();
+  const formatted = format.on;
+  const drawn = formatted ? richValue() : { text: input.value.trim(), styles: [] };
+  let text = drawn.text;
   // The 👍 button sends a thumbs up; Enter in an empty box sends nothing.
   if (!text && e.submitter === $('send')) text = '👍';
   const id = state.current;
   if (!text || !id) return;
-  input.value = '';
+  // Kept to put back if the send fails.
+  const saved = formatted ? [...rich.childNodes].map((n) => n.cloneNode(true)) : null;
+  if (formatted) rich.replaceChildren();
+  else input.value = '';
   autosize();
   updateSendButton();
   $('send').disabled = true;
@@ -2218,20 +2646,28 @@ $('composer').addEventListener('submit', async (e) => {
   if (replyTo && replyTo.thread_id === id) body.reply_to = replyTo.seq;
   const named = draftMentions(text);
   if (named.length) body.mentions = named;
+  if (drawn.styles.length && text === drawn.text) body.styles = drawn.styles;
+  const level = mark.level;
+  if (level) body.urgency = level;
   closeMentionBox();
   try {
     const message = await api(`/threads/${encodeURIComponent(id)}/messages`, { json: body });
     state.mentions = [];
     if (state.replyTo === replyTo) cancelReply();
+    if (mark.level === level) setMark(0);
     onMessage({ message, thread: null });
   } catch (err) {
-    if (text !== '👍' || input.value) input.value = text;
+    if (formatted) {
+      if (!rich.childNodes.length && format.on) rich.replaceChildren(...saved);
+    } else if (text !== '👍' || input.value) {
+      input.value = text;
+    }
     autosize();
     updateSendButton();
     handleError(err, 'Không gửi được: ');
   } finally {
     $('send').disabled = false;
-    input.focus();
+    focusComposer();
   }
 });
 
@@ -2318,6 +2754,12 @@ function togglePanel(kind) {
 
 /** Put text where the cursor is in the message box. */
 function insertAtCursor(text) {
+  if (format.on) {
+    focusComposer();
+    document.execCommand('insertText', false, text);
+    updateSendButton();
+    return;
+  }
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? input.value.length;
   input.setRangeText(text, start, end, 'end');
@@ -2920,6 +3362,7 @@ function notify(t, m) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   let title = t.kind === 'group' ? `${threadName(t)} · ${m.sender_name || 'Thành viên'}` : threadName(t);
   if (mentionsMe(m)) title += ' nhắc đến bạn';
+  if (m.urgency) title = `[${URGENCY_TEXT[m.urgency]}] ${title}`;
   const n = new Notification(title, { body: displayText(m.text), tag: m.thread_id, icon: '/icon.svg' });
   n.onclick = () => {
     window.focus();

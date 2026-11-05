@@ -139,6 +139,8 @@ Theo ctdozlite (chép từ Zalo PC), host là `sticker` trong bảng dịch vụ
 
 Chuyển tiếp: `POST {file}/api/message/mforward` (nhóm: `{file}/api/group/mforward`) như zca-js `forwardMessage`, với `toIds: [{ clientId, toUid, ttl }]` và `imei` (nhóm: `grids: [{ clientId, grid, ttl }]`, không có `imei`), `ttl`, `msgType` (chuỗi), `totalIds`, `msgInfo` (chuỗi JSON `{ message }`) và `decorLog: "null"`. Kết quả gồm `success: [{ clientId, msgId }]` và `fail: [{ clientId, error_code }]`. Đã thử vào Cloud: tin chữ đi được. Với ảnh (`msgType` 32) và tệp (46), đưa nội dung gốc của tin vào `msgInfo` thì Zalo trả mã 114 "Tham số không hợp lệ". Vì vậy gateway gửi lại ảnh, video, tin nhắn thoại và tệp từ bản nó giữ (đã thử với một ảnh 6 MB) và gửi lại nhãn dán theo id.
 
+Xóa ở phía mình trên thiết bị khác (điện thoại): Zalo đẩy về một tin `msgType` `chat.delete`, `content` là danh sách `[{ globalDelMsgId, clientDelMsgId, destId, uidFrom, uidTo, type, actionType }]` (đã thấy thật). Gateway xóa các tin đó và không lưu `chat.delete` như một tin (bản cũ có lưu, nên hiện thành dòng "[chat.delete]"; schema v9 dọn chúng).
+
 Xóa ở phía mình: `POST {chat}/api/message/delete` (nhóm: `{group}/api/group/deletemsg`) với `toid` hoặc `grid`, `cliMsgId` mới, `msgs: [{ cliMsgId, globalMsgId, ownerId, destId }]`, `onlyMe: 1`; chat 1-1 thêm `imei`. Đã thử trong Cloud: Zalo nhận, tin không quay lại.
 
 ## 8i. Lần truy cập cuối (gọi được, chưa thấy thời gian thật)
@@ -168,6 +170,12 @@ Tên gợi nhớ nằm ở dịch vụ `alias` (`tt-alias-wpa.api.zaloapp.com` t
 Chat 1-1 với người chưa kết bạn không có tên trong danh sách bạn bè. Gateway lấy tên và ảnh của họ qua `social/group/members` (mục 8e), và đặt tên "Cloud của tôi" cho hội thoại `send2me_id`. Đã kiểm chứng: cả 7 chat 1-1 của tài khoản thử đều có tên.
 
 Đổi tên nhóm: `POST {group}/api/group/updateinfo` với `{ grid, gname, imei }` (zca-js `changeGroupName`). Chưa thử, vì mọi thành viên sẽ thấy tên mới.
+
+## 8n. Chữ có định dạng, tin quan trọng và khẩn cấp (đã kiểm chứng)
+
+Gửi: thêm vào tham số của `message/sms`, `group/sendmsg`, `group/mention` hay `/quote` hai trường, như Zalo Web và zca-js. `textProperties` là chuỗi JSON `{ "styles": [{ "start", "len", "st" }], "ver": 0 }`, vị trí theo UTF-16; mã `st` xem mục `/threads/{id}/messages` trong `docs/API.md`, trong đó thụt lề là `ind_<n>0`. `metaData: { "urgency": 1 | 2 }` đánh dấu tin quan trọng hay khẩn cấp.
+
+Nhận (đã thấy thật, gửi vào Cloud): tin có định dạng vẫn là `webchat`, nhưng `content` là một object `{ action: "rtf", title: <chữ>, params: <chuỗi JSON { styles, ver }> }`. Mức quan trọng nằm ở trường `specialMsgType` của tin: 1 là quan trọng, 2 là khẩn cấp. Gateway lưu hai thứ này (schema v9, cột `styles`, `urgency`). Khi trả lời một tin có định dạng, gateway trích nó như chữ thường.
 
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 

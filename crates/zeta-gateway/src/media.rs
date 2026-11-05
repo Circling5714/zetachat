@@ -121,6 +121,66 @@ pub fn extract_quote(message: &Value) -> Option<Quote> {
     })
 }
 
+/// How a styled text is drawn. Seen live (November 2026): Zalo sends it as
+/// `webchat` with `content` an object whose `action` is `rtf`, `title` the
+/// text and `params` the JSON text of `{ styles: [{ start, len, st }], ver }`.
+/// Unknown codes are dropped.
+pub fn extract_styles(message: &Value) -> Vec<zeta_zalo::api::TextStyle> {
+    let content = message.get("content");
+    if content
+        .and_then(|c| c.get("action"))
+        .and_then(Value::as_str)
+        != Some("rtf")
+    {
+        return Vec::new();
+    }
+    let p = params(content);
+    let Some(list) = p.get("styles").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|s| {
+            let st = s.get("st").and_then(Value::as_str)?.trim().to_string();
+            let start = u32::try_from(number(s, &["start"])).ok()?;
+            let len = u32::try_from(number(s, &["len"])).ok()?;
+            let known = zeta_zalo::api::known_style(&st);
+            (len > 0 && known).then_some(zeta_zalo::api::TextStyle { start, len, st })
+        })
+        .take(500)
+        .collect()
+}
+
+/// How much a message matters: its `specialMsgType`, 1 important and 2
+/// urgent (seen live, November 2026), else 0.
+pub fn extract_urgency(message: &Value) -> u8 {
+    match number(message, &["specialMsgType"]) {
+        1 => 1,
+        2 => 2,
+        _ => 0,
+    }
+}
+
+/// Messages a `chat.delete` says this account deleted for itself (on another
+/// device): `(Zalo id, client id)` of each, from `content`, a list of `{
+/// globalDelMsgId, clientDelMsgId, … }` (seen live).
+pub fn deleted_ids(content: Option<&Value>) -> Vec<(String, String)> {
+    let Some(list) = content.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let id = |v: &Value, key: &str| match v.get(key) {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.trim().to_string(),
+        _ => String::new(),
+    };
+    list.iter()
+        .map(|d| (id(d, "globalDelMsgId"), id(d, "clientDelMsgId")))
+        .filter(|(remote, client)| {
+            let known = |s: &str| !s.is_empty() && s != "0";
+            known(remote) || known(client)
+        })
+        .collect()
+}
+
 /// People named in a message: its `mentions`, `[{ uid, pos, len, type }]`
 /// as zca-js describes them (`uid` "-1" is everyone).
 pub fn extract_mentions(message: &Value) -> Vec<zeta_zalo::api::Mention> {
@@ -501,6 +561,47 @@ mod tests {
             Some(("7000000001".to_string(), "123".to_string()))
         );
         assert_eq!(recalled_ids(Some(&json!({}))), None);
+    }
+
+    #[test]
+    fn styled_and_marked_texts() {
+        // As seen live on a message sent from here with styles and urgency 1.
+        let message = json!({
+            "msgType": "webchat",
+            "specialMsgType": 1,
+            "content": {
+                "action": "rtf", "title": "Thu dinh dang", "href": "", "description": "",
+                "params": "{\"styles\":[{\"len\":3,\"st\":\"b\",\"start\":0},{\"len\":2,\"st\":\"c_db342e\",\"start\":4},{\"len\":1,\"st\":\"bogus\",\"start\":0}],\"ver\":0}"
+            }
+        });
+        let styles = extract_styles(&message);
+        assert_eq!(styles.len(), 2, "unknown codes are dropped");
+        assert_eq!((styles[1].start, styles[1].len), (4, 2));
+        assert_eq!(styles[1].st, "c_db342e");
+        assert_eq!(extract_urgency(&message), 1);
+        assert_eq!(
+            summarize("webchat", message.get("content")),
+            "Thu dinh dang"
+        );
+        assert!(extract("webchat", message.get("content")).is_none());
+        let plain = json!({ "msgType": "webchat", "content": "chào" });
+        assert!(extract_styles(&plain).is_empty());
+        assert_eq!(extract_urgency(&plain), 0);
+        assert_eq!(extract_urgency(&json!({ "specialMsgType": 9 })), 0);
+    }
+
+    #[test]
+    fn deletions_on_other_devices() {
+        let content = json!([
+            { "actionType": 0, "clientDelMsgId": 17, "destId": 5, "globalDelMsgId": 900,
+              "type": 0, "uidFrom": 1, "uidTo": 2 },
+            { "globalDelMsgId": 0, "clientDelMsgId": 0 }
+        ]);
+        assert_eq!(
+            deleted_ids(Some(&content)),
+            [("900".to_string(), "17".to_string())]
+        );
+        assert!(deleted_ids(Some(&json!({}))).is_empty());
     }
 
     #[test]

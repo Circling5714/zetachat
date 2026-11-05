@@ -78,6 +78,7 @@
         <div id="panel" class="panel" hidden></div>
         <div id="mention-box" class="mention-box" role="listbox" aria-label="Nhắc tên" hidden></div>
         <form id="composer" class="composer">
+          <div class="composer-tools" role="toolbar" aria-label="Công cụ soạn tin">
           <button id="open-stickers" class="attach-btn" type="button" title="Nhãn dán" aria-label="Nhãn dán">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M20.5 13.5V6.5a3 3 0 0 0-3-3h-11a3 3 0 0 0-3 3v11a3 3 0 0 0 3 3h7l7-7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M13.5 20.5v-4a3 3 0 0 1 3-3h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="9" cy="10" r="1.3" fill="currentColor"/><circle cx="15" cy="10" r="1.3" fill="currentColor"/><path d="M8.5 14.5c1 1 2.2 1.5 3.5 1.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
           </button>
@@ -87,15 +88,50 @@
           <button id="attach" class="attach-btn" type="button" title="Đính kèm tệp, tối đa 1 GB (có thể kéo thả)" aria-label="Đính kèm tệp">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M8.5 12.5l6.4-6.4a3 3 0 0 1 4.2 4.2l-8.1 8.1a5 5 0 0 1-7.1-7.1L11.6 3.6M10.6 15.2l6.3-6.3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
+          <button id="format-btn" class="attach-btn" type="button" title="Định dạng văn bản" aria-label="Định dạng văn bản" aria-pressed="false">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M3.5 18.5 8.5 5.5h1l5 13M5.3 14h7.4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15.5 13.2c.7-.8 1.6-1.2 2.7-1.2 1.6 0 2.6.9 2.6 2.5v4M20.8 16.3c-.8-.4-1.6-.5-2.5-.5-1.6 0-2.7.7-2.7 1.6 0 .9.8 1.4 1.8 1.4 1.3 0 2.6-.8 3.4-2.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button id="mark-btn" class="attach-btn" type="button" title="Đánh dấu tin nhắn: quan trọng, khẩn cấp" aria-label="Đánh dấu tin nhắn" data-level="0">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v6.2" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><circle cx="12" cy="16.6" r="1.4" fill="currentColor"/></svg>
+          </button>
+          <button id="mark-chip" class="mark-chip" type="button" title="Bỏ đánh dấu" hidden></button>
+          </div>
+          <div id="format-bar" class="format-bar" role="toolbar" aria-label="Định dạng văn bản" hidden>
+            <button type="button" data-cmd="bold" title="In đậm (Ctrl+B)" aria-label="In đậm"><b>B</b></button>
+            <button type="button" data-cmd="italic" title="In nghiêng (Ctrl+I)" aria-label="In nghiêng"><i>I</i></button>
+            <button type="button" data-cmd="underline" title="Gạch chân (Ctrl+U)" aria-label="Gạch chân"><u>U</u></button>
+            <button type="button" data-cmd="strikeThrough" title="Gạch ngang" aria-label="Gạch ngang"><s>S</s></button>
+            <span class="fmt-sep" aria-hidden="true"></span>
+            <button type="button" class="swatch red" data-color="#db342e" title="Chữ đỏ" aria-label="Chữ đỏ"></button>
+            <button type="button" class="swatch orange" data-color="#f27806" title="Chữ cam" aria-label="Chữ cam"></button>
+            <button type="button" class="swatch yellow" data-color="#f7b503" title="Chữ vàng" aria-label="Chữ vàng"></button>
+            <button type="button" class="swatch green" data-color="#15a85f" title="Chữ xanh lá" aria-label="Chữ xanh lá"></button>
+            <button type="button" class="swatch plain" data-color="" title="Màu chữ mặc định" aria-label="Màu chữ mặc định"></button>
+            <span class="fmt-sep" aria-hidden="true"></span>
+            <button type="button" data-size="2" class="size small" title="Chữ nhỏ" aria-label="Chữ nhỏ">A</button>
+            <button type="button" data-size="3" class="size" title="Cỡ chữ thường" aria-label="Cỡ chữ thường">A</button>
+            <button type="button" data-size="5" class="size big" title="Chữ lớn" aria-label="Chữ lớn">A</button>
+            <span class="fmt-sep" aria-hidden="true"></span>
+            <button type="button" data-cmd="insertUnorderedList" title="Danh sách dấu chấm" aria-label="Danh sách dấu chấm">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="5" cy="7" r="1.6" fill="currentColor"/><circle cx="5" cy="12" r="1.6" fill="currentColor"/><circle cx="5" cy="17" r="1.6" fill="currentColor"/><path d="M9.5 7h10M9.5 12h10M9.5 17h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </button>
+            <button type="button" data-cmd="insertOrderedList" title="Danh sách số" aria-label="Danh sách số">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 5.5h1.5v4M3.8 9.5h3.2M3.8 14.3c.3-.6.9-.9 1.6-.9.8 0 1.4.5 1.4 1.2 0 1.1-1.6 1.6-3 3.4h3.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 7.5h10M10 12h10M10 16.5h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </button>
+            <span class="fmt-hint">Ctrl+Enter để gửi</span>
+          </div>
+          <div class="composer-row">
           <input id="photo-input" type="file" accept="image/*" multiple hidden>
           <input id="file-input" type="file" multiple hidden>
           <div class="input-wrap">
             <textarea id="input" rows="1" placeholder="Nhập tin nhắn…" aria-label="Tin nhắn"></textarea>
+            <div id="rich" class="rich-input" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Tin nhắn có định dạng" data-placeholder="Nhập tin nhắn, chọn chữ rồi bấm định dạng…" spellcheck="true" hidden></div>
             <button id="open-emoji" class="emoji-btn" type="button" title="Biểu tượng cảm xúc" aria-label="Biểu tượng cảm xúc">
               <svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="10" r="1.3" fill="currentColor"/><circle cx="15" cy="10" r="1.3" fill="currentColor"/><path d="M8 14.2c1 1.5 2.4 2.3 4 2.3s3-.8 4-2.3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
             </button>
           </div>
           <button id="send" class="btn like" type="submit" title="Gửi 👍">👍</button>
+          </div>
         </form>
       </section>
     </main>

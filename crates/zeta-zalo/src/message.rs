@@ -12,7 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::api::{first_str, mention_info, Mention, Recipient, SentMessage};
+use crate::api::{first_str, mention_info, Mention, Recipient, SentMessage, TextExtras};
 use crate::client::ZaloClient;
 use crate::domains::Service;
 use crate::error::{Error, Result};
@@ -150,20 +150,24 @@ impl ZaloClient {
         text: &str,
         quote: &QuotedMessage,
     ) -> Result<SentMessage> {
-        self.send_reply_with(to, text, quote, &[]).await
+        self.send_reply_with(to, text, quote, &TextExtras::default())
+            .await
     }
 
-    /// [`Self::send_reply`] naming people (groups only).
+    /// [`Self::send_reply`] with extras: people named (groups only), styled
+    /// runs, urgency.
     pub async fn send_reply_with(
         &self,
         to: Recipient<'_>,
         text: &str,
         quote: &QuotedMessage,
-        mentions: &[Mention],
+        extras: &TextExtras,
     ) -> Result<SentMessage> {
         let key = self.session_key()?;
         let client_id = now_millis();
-        let params = reply_params(to, text, quote, client_id, &self.device().imei, mentions);
+        let imei = &self.device().imei;
+        let mut params = reply_params(to, text, quote, client_id, imei, &extras.mentions);
+        extras.apply(&mut params);
         let (service, path) = match to {
             Recipient::User(_) => (Service::Chat, "/api/message/quote"),
             Recipient::Group(_) => (Service::Group, "/api/group/quote"),

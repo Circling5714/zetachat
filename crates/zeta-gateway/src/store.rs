@@ -133,7 +133,56 @@ WHERE id = ?1 AND kind = 'user' AND (name = '' OR avatar = '')";
 /// Most messages a search looks through, newest first.
 const SEARCH_SCAN: i64 = 200_000;
 const MESSAGE_COLUMNS: &str = "seq, thread_id, remote_id, client_id, sender_id, sender_name, \
-    outgoing, kind, text, sent_at, media, quote, status, mentions";
+    outgoing, kind, text, sent_at, media, quote, status, mentions, styles, urgency";
+
+/// Version 9: how a text is drawn (JSON) and how much it matters, from the
+/// message's Zalo JSON.
+const SCHEMA_V9: &str = "
+ALTER TABLE messages ADD COLUMN styles TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN urgency INTEGER NOT NULL DEFAULT 0;
+";
+
+/// The styles (JSON, empty for none) and urgency of a message's Zalo JSON.
+fn extras_of_raw(raw: &str) -> (String, u8) {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return (String::new(), 0);
+    };
+    let styles = media::extract_styles(&value);
+    let styles = if styles.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&styles).unwrap_or_default()
+    };
+    (styles, media::extract_urgency(&value))
+}
+
+/// Earlier versions stored `chat.delete` echoes (a message deleted for this
+/// account on another device) as messages: apply them, and drop them.
+fn apply_stored_deletions(tx: &rusqlite::Transaction<'_>) -> Result<usize> {
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT seq, thread_id, raw FROM messages WHERE kind = 'chat.delete'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<_>>()?
+    };
+    let mut deleted = 0;
+    for (seq, thread_id, raw) in &rows {
+        let value: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+        for (remote_id, client_id) in media::deleted_ids(value.get("content")) {
+            tx.execute(
+                "DELETE FROM reactions WHERE thread_id = ?1 AND message_id = ?2",
+                params![thread_id, remote_id],
+            )?;
+            deleted += tx.execute(
+                "DELETE FROM messages WHERE thread_id = ?1 AND kind <> 'chat.delete'
+                 AND (remote_id = ?2 OR (?3 NOT IN ('', '0') AND client_id = ?3))",
+                params![thread_id, remote_id, client_id],
+            )?;
+        }
+        tx.execute("DELETE FROM messages WHERE seq = ?1", params![seq])?;
+    }
+    Ok(deleted)
+}
 
 /// Version 7: people named in a message (JSON), from its Zalo JSON.
 const SCHEMA_V7: &str = "ALTER TABLE messages ADD COLUMN mentions TEXT NOT NULL DEFAULT '';";
@@ -189,25 +238,7 @@ fn person_from_row(row: &Row<'_>) -> Result<Person> {
 /// Lower case without Vietnamese marks, so "dang" finds "Đặng" (the web
 /// client folds the same way).
 pub fn fold(s: &str) -> String {
-    s.chars()
-        .flat_map(char::to_lowercase)
-        .map(|c| match c {
-            'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ' | 'ắ'
-            | 'ặ' | 'ẳ' | 'ẵ' => 'a',
-            'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
-                'e'
-            }
-            'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
-            'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ' | 'ớ'
-            | 'ợ' | 'ở' | 'ỡ' => 'o',
-            'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
-                'u'
-            }
-            'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
-            'đ' => 'd',
-            other => other,
-        })
-        .collect()
+    zeta_zalo::fold(s)
 }
 
 fn message_from_row(row: &Row<'_>) -> Result<Message> {
@@ -227,6 +258,8 @@ fn message_from_row(row: &Row<'_>) -> Result<Message> {
         reactions: Vec::new(),
         status: row.get(12)?,
         mentions: from_json(&row.get::<_, String>(13)?).unwrap_or_default(),
+        styles: from_json(&row.get::<_, String>(14)?).unwrap_or_default(),
+        urgency: row.get(15)?,
     })
 }
 
@@ -539,6 +572,31 @@ impl Store {
             tx.pragma_update(None, "user_version", 8)?;
             tx.commit()?;
         }
+        if version < 9 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V9)?;
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT seq, raw FROM messages
+                     WHERE raw LIKE '%\"rtf\"%' OR raw LIKE '%specialMsgType%'",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_>>()?
+            };
+            for (seq, raw) in rows {
+                let (styles, urgency) = extras_of_raw(&raw);
+                tx.execute(
+                    "UPDATE messages SET styles = ?2, urgency = ?3 WHERE seq = ?1",
+                    params![seq, styles, urgency],
+                )?;
+            }
+            let deleted = apply_stored_deletions(&tx)?;
+            tx.pragma_update(None, "user_version", 9)?;
+            tx.commit()?;
+            if deleted > 0 {
+                tracing::info!(count = deleted, "messages deleted on other devices removed");
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -809,11 +867,12 @@ impl Store {
             }
         }
         let mentions = mentions_of_raw(&m.raw);
+        let (styles, urgency) = extras_of_raw(&m.raw);
         tx.execute(
             "INSERT INTO messages
                 (thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text,
-                 sent_at, raw, media, quote, mentions)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 sent_at, raw, media, quote, mentions, styles, urgency)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 m.thread_id,
                 m.remote_id,
@@ -827,7 +886,9 @@ impl Store {
                 m.raw,
                 to_json(m.media.as_ref()),
                 to_json(m.quote.as_ref()),
-                mentions
+                mentions,
+                styles,
+                urgency
             ],
         )?;
         let seq = tx.last_insert_rowid();
@@ -857,6 +918,8 @@ impl Store {
             reactions: Vec::new(),
             status: 0,
             mentions: from_json(&mentions).unwrap_or_default(),
+            styles: from_json(&styles).unwrap_or_default(),
+            urgency,
         }))
     }
 
@@ -1009,6 +1072,43 @@ impl Store {
             params![thread_id, left],
         )?;
         Ok(Some(left))
+    }
+
+    /// Remove the message with Zalo id `remote_id` (or, failing that, the one
+    /// with `client_id` in `thread_id`), as when it was deleted on another
+    /// device; returns what it was.
+    pub fn delete_by_ids(
+        &self,
+        thread_id: &str,
+        remote_id: &str,
+        client_id: &str,
+    ) -> Result<Option<Message>> {
+        let seq: Option<i64> = {
+            let conn = self.conn();
+            let by_remote = conn
+                .query_row(
+                    "SELECT seq FROM messages WHERE remote_id = ?1 AND ?1 NOT IN ('', '0')
+                     AND kind <> 'chat.delete' ORDER BY seq LIMIT 1",
+                    params![remote_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match by_remote {
+                Some(seq) => Some(seq),
+                None => conn
+                    .query_row(
+                        "SELECT seq FROM messages WHERE thread_id = ?1 AND client_id = ?2
+                         AND ?2 NOT IN ('', '0') ORDER BY seq LIMIT 1",
+                        params![thread_id, client_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?,
+            }
+        };
+        match seq {
+            Some(seq) => self.delete_message(seq),
+            None => Ok(None),
+        }
     }
 
     /// Remove a message (and its reactions) for good; returns what it was.
@@ -1464,11 +1564,26 @@ mod tests {
             "msgType": "chat.undo",
             "content": { "globalMsgId": 900, "cliMsgId": 901, "deleteMsg": 1 }
         });
+        let styled = serde_json::json!({
+            "msgType": "webchat", "specialMsgType": 2,
+            "content": {
+                "action": "rtf", "title": "gấp",
+                "params": r#"{"styles":[{"start":0,"len":3,"st":"b"}],"ver":0}"#
+            }
+        });
+        let deleted = serde_json::json!({ "msgType": "webchat", "content": "xóa đi" });
+        let deletion = serde_json::json!({
+            "msgType": "chat.delete",
+            "content": [{ "globalDelMsgId": 950, "clientDelMsgId": 0, "uidFrom": 0 }]
+        });
         for (remote, kind, raw) in [
             ("m1", "chat.photo", photo),
             ("m2", "webchat", reply),
             ("900", "webchat", recalled),
             ("m4", "chat.undo", notice),
+            ("m5", "webchat", styled),
+            ("950", "webchat", deleted),
+            ("m7", "chat.delete", deletion),
         ] {
             conn.execute(
                 "INSERT INTO messages (thread_id, remote_id, outgoing, kind, text, sent_at, raw)
@@ -1479,8 +1594,11 @@ mod tests {
         }
         let s = Store::init(conn).unwrap();
         let messages = s.messages("zalo:u:1", None, 10).unwrap();
-        // The recall notice was applied to its message and dropped.
-        assert_eq!(messages.len(), 3);
+        // The recall notice was applied to its message and dropped, as was the
+        // deletion made on another device (version 9).
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[3].styles.len(), 1);
+        assert_eq!((messages[3].text.as_str(), messages[3].urgency), ("gấp", 2));
         let media = messages[0].media.as_ref().unwrap();
         assert_eq!(
             (media.kind.as_str(), media.width, media.height),
@@ -1500,7 +1618,7 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         // Version 5 added people and group sizes, version 6 message status.
         assert!(s
             .messages("zalo:u:1", None, 10)
