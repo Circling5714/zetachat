@@ -89,6 +89,9 @@
           <button id="attach" class="attach-btn" type="button" title="Đính kèm tệp, tối đa 1 GB (có thể kéo thả)" aria-label="Đính kèm tệp">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M8.5 12.5l6.4-6.4a3 3 0 0 1 4.2 4.2l-8.1 8.1a5 5 0 0 1-7.1-7.1L11.6 3.6M10.6 15.2l6.3-6.3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
+          <button id="shot-btn" class="attach-btn" type="button" title="Chụp màn hình (hoặc Win+Shift+S rồi dán vào ô soạn tin)" aria-label="Chụp màn hình">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+          </button>
           <button id="card-btn" class="attach-btn" type="button" title="Gửi danh thiếp" aria-label="Gửi danh thiếp">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8.5" cy="10.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M5.2 16.2c.6-1.6 1.8-2.4 3.3-2.4s2.7.8 3.3 2.4M14.5 10h4.5M14.5 13.5h3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
           </button>
@@ -280,6 +283,32 @@
       <div class="row">
         <button id="add-close" class="btn secondary" type="button">Đóng</button>
       </div>
+    </div>
+  </div>
+
+  <div id="shot" class="viewer shot" role="dialog" aria-modal="true" aria-label="Sửa ảnh chụp màn hình" hidden>
+    <div class="shot-tools" role="toolbar" aria-label="Công cụ">
+      <button type="button" data-tool="crop" class="on" title="Chọn vùng (kéo để cắt)">Cắt</button>
+      <button type="button" data-tool="pen" title="Vẽ tự do">Bút</button>
+      <button type="button" data-tool="rect" title="Khung chữ nhật">Khung</button>
+      <button type="button" data-tool="arrow" title="Mũi tên">Mũi tên</button>
+      <button type="button" data-tool="text" title="Thêm chữ (bấm vào ảnh)">Chữ</button>
+      <span class="fmt-sep" aria-hidden="true"></span>
+      <button type="button" class="swatch red on" data-ink="#e11d48" title="Đỏ" aria-label="Màu đỏ"></button>
+      <button type="button" class="swatch yellow" data-ink="#f7b503" title="Vàng" aria-label="Màu vàng"></button>
+      <button type="button" class="swatch green" data-ink="#15a85f" title="Xanh lá" aria-label="Màu xanh lá"></button>
+      <button type="button" class="swatch blue" data-ink="#2563eb" title="Xanh dương" aria-label="Màu xanh dương"></button>
+      <button type="button" class="swatch black" data-ink="#111827" title="Đen" aria-label="Màu đen"></button>
+      <span class="fmt-sep" aria-hidden="true"></span>
+      <button type="button" id="shot-undo" title="Hoàn tác (Ctrl+Z)">Hoàn tác</button>
+    </div>
+    <div id="shot-stage" class="viewer-stage shot-stage"><canvas id="shot-canvas"></canvas></div>
+    <div class="row shot-actions">
+      <span id="shot-size" class="muted small"></span>
+      <button id="shot-cancel" class="btn secondary" type="button">Hủy</button>
+      <button id="shot-save" class="btn secondary" type="button">Tải về</button>
+      <button id="shot-copy" class="btn secondary" type="button">Sao chép</button>
+      <button id="shot-send" class="btn" type="button">Gửi (Enter)</button>
     </div>
   </div>
 

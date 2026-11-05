@@ -3067,6 +3067,10 @@ rich.addEventListener('keydown', (e) => {
 rich.addEventListener('paste', (e) => {
   const files = [...((e.clipboardData && e.clipboardData.files) || [])];
   e.preventDefault();
+  if (files.length === 1 && /^image\/(png|jpeg|webp|bmp)$/.test(files[0].type)) {
+    openShotFile(files[0]);
+    return;
+  }
   if (files.length) {
     sendFiles(files);
     return;
@@ -4045,13 +4049,322 @@ $('file-input').addEventListener('change', (e) => {
   sendFiles(files, true);
 });
 
-// Pasting a screenshot sends it.
+// Pasting a screenshot opens it in the editor (crop, draw), then it is sent;
+// several files at once are sent as they are.
 input.addEventListener('paste', (e) => {
   const files = [...((e.clipboardData && e.clipboardData.files) || [])];
   if (!files.length) return;
   e.preventDefault();
-  sendFiles(files);
+  if (files.length === 1 && /^image\/(png|jpeg|webp|bmp)$/.test(files[0].type)) openShotFile(files[0]);
+  else sendFiles(files);
 });
+
+// ------------------------------------------------------------- screenshots
+//
+// "Chụp màn hình": a frame of a screen, window or tab the browser lets the
+// user pick (it needs HTTPS), then cut, drawn on and sent as a photo. A
+// pasted picture opens in the same editor.
+
+const shot = {
+  image: null, // the picture being edited (canvas)
+  marks: [], // drawings, in picture pixels: { tool, ink, points | from,to | at,text }
+  crop: null, // { x, y, w, h } in picture pixels, or null for all of it
+  tool: 'crop',
+  ink: '#e11d48',
+  drag: null, // what the pointer is drawing now
+  scale: 1,
+};
+
+/** A frame of a screen, window or tab, as a canvas. */
+async function captureScreen() {
+  const stream = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: 'never' }, audio: false });
+  try {
+    const video = document.createElement('video');
+    video.muted = true;
+    video.srcObject = stream;
+    await video.play();
+    // Give the first frame a moment to arrive.
+    await new Promise((r) => setTimeout(r, 250));
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    video.pause();
+    return canvas;
+  } finally {
+    for (const track of stream.getTracks()) track.stop();
+  }
+}
+
+async function startScreenshot() {
+  if (!state.current) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    toast(window.isSecureContext
+      ? 'Trình duyệt này không chụp màn hình được. Hãy dùng Win+Shift+S rồi dán (Ctrl+V) vào ô soạn tin.'
+      : 'Chụp màn hình cần mở zetachat qua HTTPS. Tạm thời dùng Win+Shift+S rồi dán (Ctrl+V) vào ô soạn tin.');
+    return;
+  }
+  try {
+    openShot(await captureScreen());
+  } catch (err) {
+    if (err && err.name === 'NotAllowedError') return; // the user said no
+    handleError(err, 'Không chụp được màn hình: ');
+  }
+}
+
+/** Open a picture file (a pasted screenshot) in the editor. */
+async function openShotFile(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0);
+    openShot(canvas);
+  } catch (_) {
+    sendFiles([file]);
+  }
+}
+
+function openShot(canvas) {
+  shot.image = canvas;
+  shot.marks = [];
+  shot.crop = null;
+  shot.drag = null;
+  $('shot').hidden = false;
+  fitShot();
+  $('shot-send').focus();
+}
+
+function closeShot() {
+  $('shot').hidden = true;
+  shot.image = null;
+  shot.marks = [];
+  focusComposer();
+}
+
+/** Size the canvas to the stage, keeping the picture's proportions. */
+function fitShot() {
+  if (!shot.image) return;
+  const stage = $('shot-stage');
+  const box = stage.getBoundingClientRect();
+  const w = shot.image.width;
+  const h = shot.image.height;
+  shot.scale = Math.min(1, (box.width || w) / w, (box.height || h) / h);
+  const canvas = $('shot-canvas');
+  canvas.width = Math.max(1, Math.round(w * shot.scale));
+  canvas.height = Math.max(1, Math.round(h * shot.scale));
+  drawShot();
+}
+
+function drawArrow(ctx, from, to, width) {
+  const angle = Math.atan2(to.y - from.y, to.x - from.x);
+  const head = Math.max(12, width * 4);
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(to.x, to.y);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(to.x, to.y);
+  ctx.lineTo(to.x - head * Math.cos(angle - Math.PI / 7), to.y - head * Math.sin(angle - Math.PI / 7));
+  ctx.lineTo(to.x - head * Math.cos(angle + Math.PI / 7), to.y - head * Math.sin(angle + Math.PI / 7));
+  ctx.closePath();
+  ctx.fill();
+}
+
+/** Draw the marks on `ctx`, whose units are picture pixels. */
+function drawMarks(ctx, marks) {
+  const width = Math.max(3, Math.round(Math.max(shot.image.width, shot.image.height) / 400));
+  for (const m of marks) {
+    ctx.strokeStyle = m.ink;
+    ctx.fillStyle = m.ink;
+    ctx.lineWidth = width;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    if (m.tool === 'pen' && m.points.length) {
+      ctx.beginPath();
+      ctx.moveTo(m.points[0].x, m.points[0].y);
+      for (const p of m.points.slice(1)) ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    } else if (m.tool === 'rect') {
+      ctx.strokeRect(Math.min(m.from.x, m.to.x), Math.min(m.from.y, m.to.y), Math.abs(m.to.x - m.from.x), Math.abs(m.to.y - m.from.y));
+    } else if (m.tool === 'arrow') {
+      drawArrow(ctx, m.from, m.to, width);
+    } else if (m.tool === 'text') {
+      ctx.font = `bold ${width * 7}px system-ui, sans-serif`;
+      ctx.textBaseline = 'top';
+      ctx.lineWidth = Math.max(2, width);
+      ctx.strokeStyle = m.ink === '#111827' ? '#ffffff' : '#111827';
+      ctx.strokeText(m.text, m.at.x, m.at.y);
+      ctx.fillText(m.text, m.at.x, m.at.y);
+    }
+  }
+}
+
+function drawShot() {
+  const canvas = $('shot-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(shot.scale, 0, 0, shot.scale, 0, 0);
+  ctx.drawImage(shot.image, 0, 0);
+  const marks = shot.drag && shot.drag.tool !== 'crop' ? shot.marks.concat([shot.drag]) : shot.marks;
+  drawMarks(ctx, marks);
+  const crop = shot.drag && shot.drag.tool === 'crop' ? rectOf(shot.drag.from, shot.drag.to) : shot.crop;
+  if (crop) {
+    // Dim what is cut away.
+    ctx.fillStyle = 'rgb(2 6 23 / 0.55)';
+    const W = shot.image.width;
+    const H = shot.image.height;
+    ctx.fillRect(0, 0, W, crop.y);
+    ctx.fillRect(0, crop.y + crop.h, W, H - crop.y - crop.h);
+    ctx.fillRect(0, crop.y, crop.x, crop.h);
+    ctx.fillRect(crop.x + crop.w, crop.y, W - crop.x - crop.w, crop.h);
+    ctx.strokeStyle = '#f8fafc';
+    ctx.lineWidth = 2 / shot.scale;
+    ctx.setLineDash([6 / shot.scale, 4 / shot.scale]);
+    ctx.strokeRect(crop.x, crop.y, crop.w, crop.h);
+    ctx.setLineDash([]);
+  }
+  const size = crop || { w: shot.image.width, h: shot.image.height };
+  $('shot-size').textContent = `${Math.round(size.w)} × ${Math.round(size.h)}`;
+}
+
+function rectOf(a, b) {
+  return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(b.x - a.x), h: Math.abs(b.y - a.y) };
+}
+
+/** Where a pointer event falls on the picture, in picture pixels. */
+function shotPoint(e) {
+  const r = $('shot-canvas').getBoundingClientRect();
+  const x = ((e.clientX - r.left) / r.width) * shot.image.width;
+  const y = ((e.clientY - r.top) / r.height) * shot.image.height;
+  return { x: Math.max(0, Math.min(shot.image.width, x)), y: Math.max(0, Math.min(shot.image.height, y)) };
+}
+
+$('shot-canvas').addEventListener('pointerdown', (e) => {
+  if (!shot.image) return;
+  const p = shotPoint(e);
+  if (shot.tool === 'text') {
+    const text = window.prompt('Chữ thêm vào ảnh:');
+    if (text && text.trim()) shot.marks.push({ tool: 'text', ink: shot.ink, at: p, text: text.trim().slice(0, 200) });
+    drawShot();
+    return;
+  }
+  try {
+    e.currentTarget.setPointerCapture(e.pointerId);
+  } catch (_) { /* a pointer the page did not see start */ }
+  shot.drag = shot.tool === 'pen' ? { tool: 'pen', ink: shot.ink, points: [p] } : { tool: shot.tool, ink: shot.ink, from: p, to: p };
+  drawShot();
+});
+$('shot-canvas').addEventListener('pointermove', (e) => {
+  if (!shot.drag) return;
+  const p = shotPoint(e);
+  if (shot.drag.tool === 'pen') shot.drag.points.push(p);
+  else shot.drag.to = p;
+  drawShot();
+});
+$('shot-canvas').addEventListener('pointerup', () => {
+  const d = shot.drag;
+  shot.drag = null;
+  if (!d) return;
+  if (d.tool === 'crop') {
+    const r = rectOf(d.from, d.to);
+    // A click without a drag takes the whole picture again.
+    shot.crop = r.w > 8 && r.h > 8 ? r : null;
+  } else if (d.tool === 'pen' ? d.points.length > 1 : Math.hypot(d.to.x - d.from.x, d.to.y - d.from.y) > 4) {
+    shot.marks.push(d);
+  }
+  drawShot();
+});
+
+/** The picture as it will be sent: cut, with the drawings. */
+function shotBlob() {
+  const crop = shot.crop || { x: 0, y: 0, w: shot.image.width, h: shot.image.height };
+  const out = document.createElement('canvas');
+  out.width = Math.max(1, Math.round(crop.w));
+  out.height = Math.max(1, Math.round(crop.h));
+  const ctx = out.getContext('2d');
+  ctx.translate(-crop.x, -crop.y);
+  ctx.drawImage(shot.image, 0, 0);
+  drawMarks(ctx, shot.marks);
+  return new Promise((resolve) => out.toBlob(resolve, 'image/png'));
+}
+
+function shotName() {
+  const d = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  return `chup-man-hinh-${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}.png`;
+}
+
+async function sendShot() {
+  if (!shot.image) return;
+  const blob = await shotBlob();
+  if (!blob) return;
+  sendFiles([new File([blob], shotName(), { type: 'image/png' })]);
+  closeShot();
+}
+
+async function copyShot() {
+  const blob = await shotBlob();
+  try {
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    toast('Đã sao chép ảnh');
+  } catch (_) {
+    toast('Trình duyệt không cho sao chép ảnh ở đây (cần HTTPS); hãy dùng Tải về');
+  }
+}
+
+async function saveShot() {
+  const blob = await shotBlob();
+  const a = el('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = shotName();
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+for (const b of document.querySelectorAll('#shot [data-tool]')) {
+  b.addEventListener('click', () => {
+    shot.tool = b.dataset.tool;
+    for (const o of document.querySelectorAll('#shot [data-tool]')) o.classList.toggle('on', o === b);
+  });
+}
+for (const b of document.querySelectorAll('#shot [data-ink]')) {
+  b.addEventListener('click', () => {
+    shot.ink = b.dataset.ink;
+    for (const o of document.querySelectorAll('#shot [data-ink]')) o.classList.toggle('on', o === b);
+  });
+}
+$('shot-undo').addEventListener('click', () => {
+  if (shot.marks.length) shot.marks.pop();
+  else shot.crop = null;
+  drawShot();
+});
+$('shot-btn').addEventListener('click', startScreenshot);
+$('shot-cancel').addEventListener('click', closeShot);
+$('shot-send').addEventListener('click', sendShot);
+$('shot-copy').addEventListener('click', copyShot);
+$('shot-save').addEventListener('click', saveShot);
+window.addEventListener('resize', () => {
+  if (!$('shot').hidden) fitShot();
+});
+document.addEventListener('keydown', (e) => {
+  if ($('shot').hidden) return;
+  if (e.key === 'Enter' && !e.isComposing) {
+    e.preventDefault();
+    sendShot();
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    $('shot-undo').click();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    closeShot();
+  }
+}, true);
 
 // Dropping files on the conversation sends them.
 const dropZone = $('conversation');

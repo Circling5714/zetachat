@@ -691,6 +691,32 @@ a.btn { display: inline-block; text-decoration: none; }
   background: rgb(2 6 23 / 0.92);
 }
 .viewer-stage { display: grid; place-items: center; min-height: 0; }
+.shot { grid-template-rows: auto minmax(0, 1fr) auto; z-index: 16; }
+.shot-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 4px; }
+.shot-tools button {
+  min-width: 34px;
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.12);
+  color: #f8fafc;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.shot-tools button.on { background: #2563eb; }
+.shot-tools .swatch { min-width: 24px; width: 24px; height: 24px; padding: 0; border-radius: 50%; box-shadow: 0 0 0 2px rgb(255 255 255 / 0.25); }
+.shot-tools .swatch.on { box-shadow: 0 0 0 3px #f8fafc; background-clip: padding-box; }
+.shot-tools .swatch.red { background: #e11d48; }
+.shot-tools .swatch.yellow { background: #f7b503; }
+.shot-tools .swatch.green { background: #15a85f; }
+.shot-tools .swatch.blue { background: #2563eb; }
+.shot-tools .swatch.black { background: #111827; }
+.shot-tools .fmt-sep { background: rgb(255 255 255 / 0.25); }
+.shot-stage canvas { max-width: 100%; max-height: 100%; touch-action: none; cursor: crosshair; border-radius: 4px; }
+.shot-actions { justify-content: flex-end; flex-wrap: wrap; }
+.shot-actions #shot-size { margin-right: auto; color: #cbd5e1; }
 .viewer-stage img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; }
 
 .composer {
