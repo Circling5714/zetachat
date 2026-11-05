@@ -88,6 +88,9 @@
           <button id="attach" class="attach-btn" type="button" title="Đính kèm tệp, tối đa 1 GB (có thể kéo thả)" aria-label="Đính kèm tệp">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M8.5 12.5l6.4-6.4a3 3 0 0 1 4.2 4.2l-8.1 8.1a5 5 0 0 1-7.1-7.1L11.6 3.6M10.6 15.2l6.3-6.3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
+          <button id="card-btn" class="attach-btn" type="button" title="Gửi danh thiếp" aria-label="Gửi danh thiếp">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8.5" cy="10.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M5.2 16.2c.6-1.6 1.8-2.4 3.3-2.4s2.7.8 3.3 2.4M14.5 10h4.5M14.5 13.5h3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
           <button id="format-btn" class="attach-btn" type="button" title="Định dạng văn bản" aria-label="Định dạng văn bản" aria-pressed="false">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M3.5 18.5 8.5 5.5h1l5 13M5.3 14h7.4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15.5 13.2c.7-.8 1.6-1.2 2.7-1.2 1.6 0 2.6.9 2.6 2.5v4M20.8 16.3c-.8-.4-1.6-.5-2.5-.5-1.6 0-2.7.7-2.7 1.6 0 .9.8 1.4 1.8 1.4 1.3 0 2.6-.8 3.4-2.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
@@ -171,6 +174,18 @@
       <div class="row">
         <button id="forward-cancel" class="btn secondary" type="button">Hủy</button>
         <button id="forward-send" class="btn" type="button" disabled>Chuyển tiếp</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="card-pick" class="modal" hidden>
+    <div class="card forward-card" role="dialog" aria-modal="true" aria-labelledby="card-pick-title">
+      <h2 id="card-pick-title">Gửi danh thiếp</h2>
+      <input id="card-search" class="field" type="search" placeholder="Tìm bạn bè" autocomplete="off">
+      <ul id="card-list" class="forward-list"></ul>
+      <div class="row">
+        <button id="card-cancel" class="btn secondary" type="button">Hủy</button>
+        <button id="card-send" class="btn" type="button" disabled>Gửi danh thiếp</button>
       </div>
     </div>
   </div>

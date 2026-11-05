@@ -19,7 +19,8 @@ use crate::stickers::StickerQuery;
 use crate::store::{fold, Store};
 use crate::uploads::UploadJob;
 use crate::zalo::{
-    Attachment, FriendAction, LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus,
+    Attachment, CardAction, FriendAction, LoginState, SessionState, ZaloCommand, ZaloHandle,
+    ZaloStatus,
 };
 
 /// Sample pictures are inline SVG, so the demo needs no network at all.
@@ -524,6 +525,21 @@ fn seed(store: &Store) {
                 "Lan Anh",
                 "Đi cà phê nhé, 5 giờ chỗ cũ ☕",
             ),
+            share(
+                false,
+                "Lan Anh",
+                "chat.recommended",
+                "[Danh thiếp] Minh Tuấn",
+                84,
+                Media {
+                    kind: "contact".into(),
+                    uid: "1002".into(),
+                    name: "Minh Tuấn".into(),
+                    thumb: picture_of("1002"),
+                    description: "0901 234 567".into(),
+                    ..Media::default()
+                },
+            ),
         ],
     );
     add_thread(
@@ -728,6 +744,36 @@ fn store_and_publish(
     let snapshot = store.thread(&message.thread_id).ok().flatten();
     let _ = bus.publish("message", json!({ "message": message, "thread": snapshot }));
     Some(message)
+}
+
+/// Cards in the demo: a contact's card is "sent" at once.
+fn demo_cards(store: &Store, bus: &EventBus, action: CardAction) -> Result<Value, String> {
+    match action {
+        CardAction::SendContact {
+            kind,
+            remote_id,
+            uid,
+        } => {
+            let person = store
+                .people(std::slice::from_ref(&uid))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "demo: không biết người này".to_string())?;
+            let (media, raw) = crate::zalo::contact_card(&person, "");
+            let text = format!("[Danh thiếp] {}", media.name);
+            let content = Content {
+                kind: "chat.recommended",
+                text: &text,
+                media: Some(media),
+                quote: None,
+                raw: raw.to_string(),
+            };
+            store_and_publish(store, bus, kind, &remote_id, true, "", content)
+                .map(|m| json!(m))
+                .ok_or_else(|| "demo: không lưu được tin".to_string())
+        }
+    }
 }
 
 fn text(text: &str) -> Content<'_> {
@@ -1097,6 +1143,9 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     };
                     let sent = store_and_publish(&store, &bus, kind, &remote_id, true, "", content);
                     let _ = reply.send(sent.ok_or_else(|| "demo: không lưu được tin".to_string()));
+                }
+                ZaloCommand::Cards { action, reply } => {
+                    let _ = reply.send(demo_cards(&store, &bus, action));
                 }
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {

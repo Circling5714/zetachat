@@ -38,8 +38,8 @@ use crate::stickers::StickerQuery;
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
 use crate::zalo::{
-    photo_type, Attachment, FriendAction, LoginState, ReplyTo, SessionState, ZaloCommand,
-    ZaloHandle,
+    photo_type, Attachment, CardAction, FriendAction, LoginState, ReplyTo, SessionState,
+    ZaloCommand, ZaloHandle,
 };
 
 /// Shared state of the HTTP handlers.
@@ -139,6 +139,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stickers/search", get(search_stickers))
         .route("/api/v1/stickers/motion", get(sticker_motion))
         .route("/api/v1/threads/{id}/stickers", post(send_sticker))
+        .route("/api/v1/threads/{id}/contact-card", post(send_contact_card))
         .route("/api/v1/threads/{id}/members", get(group_members))
         .route("/api/v1/threads/{id}/presence", get(presence))
         .route("/api/v1/users/find", get(find_user))
@@ -746,6 +747,45 @@ async fn ask_send_sticker(
 }
 
 #[derive(Deserialize)]
+struct ContactCardBody {
+    uid: String,
+}
+
+/// Ask the connector for something about cards; answers its JSON.
+async fn ask_cards(st: &AppState, action: CardAction) -> Result<Value, ApiError> {
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Cards { action, reply })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)
+}
+
+/// Send someone's contact card ("danh thiếp"); answers the stored message.
+async fn send_contact_card(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Json(body): Json<ContactCardBody>,
+) -> ApiResult<Value> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let uid = body.uid.trim();
+    if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiError::bad_request("uid is not a Zalo user id"));
+    }
+    let action = CardAction::SendContact {
+        kind,
+        remote_id: remote_id.to_string(),
+        uid: uid.to_string(),
+    };
+    Ok(Json(ask_cards(&st, action).await?))
+}
+
+#[derive(Deserialize)]
 struct MessageQuery {
     before: Option<i64>,
     limit: Option<i64>,
@@ -989,6 +1029,8 @@ enum Forwardable {
     /// A text, or the address of a shared link: Zalo's own forward.
     Text(String),
     Sticker(Sticker),
+    /// A contact card: sent again for the same person.
+    Contact(String),
     /// A photo, video, voice message or file: sent again from the gateway's
     /// copy (Zalo's forward refuses them as zca-js would send them).
     File {
@@ -1036,6 +1078,7 @@ fn forwardable(m: &Message, raw: &Value) -> Option<Forwardable> {
     match md.kind.as_str() {
         "link" if md.url.starts_with("http") => Some(Forwardable::Text(md.url.clone())),
         "sticker" => sticker_in(raw, &md.url).map(Forwardable::Sticker),
+        "contact" if !md.uid.is_empty() => Some(Forwardable::Contact(md.uid.clone())),
         "image" | "gif" | "video" | "audio" | "file" if !md.url.is_empty() => {
             Some(Forwardable::File {
                 url: md.url.clone(),
@@ -1210,6 +1253,16 @@ async fn forward_message(
             (Forwardable::Text(text), _) => forward_text(&st, kind, remote_id, text)
                 .await
                 .map(|m| json!({ "message": m })),
+            (Forwardable::Contact(uid), _) => {
+                let action = CardAction::SendContact {
+                    kind,
+                    remote_id: remote_id.to_string(),
+                    uid: uid.clone(),
+                };
+                ask_cards(&st, action)
+                    .await
+                    .map(|m| json!({ "message": m }))
+            }
             (Forwardable::Sticker(sticker), _) => ask_send_sticker(&st, kind, remote_id, *sticker)
                 .await
                 .map(|m| json!({ "message": m })),

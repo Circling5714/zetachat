@@ -177,6 +177,12 @@ Gửi: thêm vào tham số của `message/sms`, `group/sendmsg`, `group/mention
 
 Nhận (đã thấy thật, gửi vào Cloud): tin có định dạng vẫn là `webchat`, nhưng `content` là một object `{ action: "rtf", title: <chữ>, params: <chuỗi JSON { styles, ver }> }`. Mức quan trọng nằm ở trường `specialMsgType` của tin: 1 là quan trọng, 2 là khẩn cấp. Gateway lưu hai thứ này (schema v9, cột `styles`, `urgency`). Khi trả lời một tin có định dạng, gateway trích nó như chữ thường.
 
+## 8o. Danh thiếp (đã kiểm chứng)
+
+Gửi, như zca-js `sendCard`: hỏi `POST {friend}/api/friend/mget-qr` với `{ fids: [uid] }`, được `{ "<uid>": "<ảnh QR trên qr-talk.zdn.vn>" }`. Rồi gửi `POST {file}/api/message/forward` (nhóm: `{file}/api/group/forward`) với `msgType` 6, `clientId`, `ttl: 0` và `msgInfo` là chuỗi JSON `{ contactUid, qrCodeUrl, phone? }`. Chat 1-1 thêm `toId` (chữ I hoa) và `imei`, nhóm thêm `grid` và `visibility: 0`. Kết quả có `msgId`.
+
+Nhận (đã thấy thật, gửi danh thiếp của chính tài khoản vào Cloud): `msgType` `chat.recommended`. `content` là `{ action: "recommened.user" (Zalo viết sai như vậy), title: <tên>, thumb: <ảnh đại diện>, params: <uid>, href: "www.zaloapp.com", description: <chuỗi JSON { qrCodeUrl, gUid, phone? }> }`. Liên kết chia sẻ cũng là `chat.recommended`, nhưng `action` khác. Bản cũ hiện danh thiếp thành "[Liên kết]"; schema v10 đọc lại chúng.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

@@ -39,6 +39,11 @@ pub struct Media {
     /// stickers stored before it was kept).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub sticker_id: u64,
+    /// A contact card's person (`contact`): `name` is theirs, `thumb` their
+    /// picture, `url` their profile QR, `description` a phone number if the
+    /// sender added one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -268,6 +273,9 @@ pub fn summarize(msg_type: &str, content: Option<&Value>) -> String {
         "share.file" => with_caption("[Tập tin]", get_str(content, "title")),
         "chat.location.new" => "[Vị trí]".into(),
         "chat.undo" => RECALLED_TEXT.into(),
+        "chat.recommended" if contact_card(content) => {
+            with_caption("[Danh thiếp]", get_str(content, "title"))
+        }
         "chat.recommended" | "chat.link" => {
             let caption = ["title", "description", "href"]
                 .into_iter()
@@ -317,10 +325,56 @@ fn sticker_url(content: Option<&Value>) -> String {
     }
 }
 
+/// A `chat.recommended` that shares a person (a contact card) rather than a
+/// link: its `action` is `recommened.user` (sic, seen live).
+fn contact_card(content: Option<&Value>) -> bool {
+    matches!(
+        get_str(content, "action"),
+        "recommened.user" | "recommended.user"
+    )
+}
+
+/// A contact card: the person's id is `params`, `description` the JSON text
+/// of `{ qrCodeUrl, gUid, phone? }` (seen live, November 2026).
+fn contact_media(content: Option<&Value>) -> Option<Media> {
+    let uid = match content.and_then(|c| c.get("params")) {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let details: Value =
+        serde_json::from_str(get_str(content, "description")).unwrap_or(Value::Null);
+    let phone = match details.get("phone") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    Some(Media {
+        kind: "contact".into(),
+        url: http_url(
+            details
+                .get("qrCodeUrl")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ),
+        thumb: http_url(get_str(content, "thumb")),
+        name: get_str(content, "title").trim().to_string(),
+        description: phone,
+        uid,
+        ..Media::default()
+    })
+}
+
 /// Media carried by a message, if any.
 pub fn extract(msg_type: &str, content: Option<&Value>) -> Option<Media> {
     if !matches!(content, Some(Value::Object(_))) {
         return None;
+    }
+    if msg_type == "chat.recommended" && contact_card(content) {
+        return contact_media(content);
     }
     let p = params(content);
     let href = http_url(get_str(content, "href"));
@@ -588,6 +642,36 @@ mod tests {
         assert!(extract_styles(&plain).is_empty());
         assert_eq!(extract_urgency(&plain), 0);
         assert_eq!(extract_urgency(&json!({ "specialMsgType": 9 })), 0);
+    }
+
+    #[test]
+    fn contact_cards() {
+        // As seen live (ids and addresses changed).
+        let card = json!({
+            "action": "recommened.user", "childnumber": 0, "href": "www.zaloapp.com",
+            "params": "1234567", "thumb": "https://s120-ava-talk.zadn.vn/a/b.jpg", "title": "Lan",
+            "description": "{\"qrCodeUrl\":\"https:\\/\\/qr-talk.zdn.vn\\/1\\/2\\/c.jpg\",\"gUid\":\"G\",\"phone\":\"0901\"}",
+            "type": ""
+        });
+        let m = extract("chat.recommended", Some(&card)).unwrap();
+        assert_eq!(
+            (m.kind.as_str(), m.uid.as_str(), m.name.as_str()),
+            ("contact", "1234567", "Lan")
+        );
+        assert_eq!(m.url, "https://qr-talk.zdn.vn/1/2/c.jpg");
+        assert_eq!(m.description, "0901");
+        assert_eq!(
+            summarize("chat.recommended", Some(&card)),
+            "[Danh thiếp] Lan"
+        );
+        // A link shared the same way stays a link.
+        let link = json!({ "action": "recommened.link", "href": "https://x.vn", "title": "X" });
+        assert_eq!(
+            extract("chat.recommended", Some(&link)).unwrap().kind,
+            "link"
+        );
+        let broken = json!({ "action": "recommened.user", "params": "abc" });
+        assert!(extract("chat.recommended", Some(&broken)).is_none());
     }
 
     #[test]

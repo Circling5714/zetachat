@@ -551,7 +551,8 @@ async fn card(args: &[String]) -> Result<()> {
         other => other.to_string(),
     };
     let phone = args.get(4).map(String::as_str).unwrap_or("");
-    match client.send_contact_card(to, &uid, phone).await {
+    let qr = client.profile_qr(&uid).await.unwrap_or_default();
+    match client.send_contact_card(to, &uid, phone, &qr).await {
         Ok(sent) => println!(
             "CARD SENT msgId {} clientId={}",
             if sent.msg_id.is_empty() {

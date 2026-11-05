@@ -337,6 +337,48 @@ fn fake_connector(
                         .unwrap();
                     let _ = reply.send(Ok(message));
                 }
+                ZaloCommand::Cards { action, reply } => match action {
+                    zeta_gateway::zalo::CardAction::SendContact {
+                        kind,
+                        remote_id,
+                        uid,
+                    } => {
+                        let person = zeta_gateway::model::Person {
+                            uid,
+                            name: "Lan".into(),
+                            ..Default::default()
+                        };
+                        let (media, raw) = zeta_gateway::zalo::contact_card(
+                            &person,
+                            "https://qr-talk.zdn.vn/q.jpg",
+                        );
+                        let thread = ThreadUpsert {
+                            kind,
+                            remote_id,
+                            name: String::new(),
+                            avatar: String::new(),
+                        };
+                        store.upsert_thread(&thread, false).unwrap();
+                        let message = store
+                            .insert_message(&NewMessage {
+                                thread_id: thread.id(),
+                                remote_id: format!("srv-{sent}"),
+                                client_id: format!("{sent}"),
+                                sender_id: "me".into(),
+                                sender_name: String::new(),
+                                outgoing: true,
+                                kind: "chat.recommended".into(),
+                                text: "[Danh thiếp] Lan".into(),
+                                media: Some(media),
+                                quote: None,
+                                sent_at: 10,
+                                raw: raw.to_string(),
+                            })
+                            .unwrap()
+                            .unwrap();
+                        let _ = reply.send(Ok(json!(message)));
+                    }
+                },
                 // Zalo knows everyone but the users whose id starts with 9.
                 ZaloCommand::LookupPeople { uids, reply } => {
                     asked.lock().unwrap().push(uids.clone());
@@ -1390,6 +1432,34 @@ async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
     )
     .await;
     assert_eq!(sent["mentions"], json!([]));
+}
+
+#[tokio::test]
+async fn contact_cards_are_sent_for_user_ids_only() {
+    let f = fixture();
+    let user = thread_id(ThreadKind::User, "70");
+    let uri = format!("/api/v1/threads/{user}/contact-card");
+    let (status, sent) = call(&f, "POST", &uri, Some(json!({ "uid": " 5 " })), true).await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["kind"], "chat.recommended");
+    assert_eq!(sent["media"]["kind"], "contact");
+    assert_eq!(sent["media"]["uid"], "5");
+    assert_eq!(sent["media"]["url"], "https://qr-talk.zdn.vn/q.jpg");
+    let (status, _) = call(&f, "POST", &uri, Some(json!({ "uid": "5; drop" })), true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A sent card can be forwarded: it is sent again for the same person.
+    let seq = sent["seq"].as_i64().unwrap();
+    let group = thread_id(ThreadKind::Group, "71");
+    let (status, out) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/messages/{seq}/forward"),
+        Some(json!({ "to": [group] })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["results"][0]["message"]["media"]["uid"], "5");
 }
 
 #[tokio::test]

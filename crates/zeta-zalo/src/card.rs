@@ -7,8 +7,10 @@
 //!   answers `{ "<uid>": "<QR picture URL>" }`. The card goes through
 //!   `POST {file}/api/message/forward` (1-1: `toId`, `imei`) or
 //!   `{file}/api/group/forward` (`grid`, `visibility` 0) with `msgType` 6 and
-//!   `msgInfo` the JSON text of `{ contactUid, qrCodeUrl, phone? }`; it arrives
-//!   as a `chat.recommended` message.
+//!   `msgInfo` the JSON text of `{ contactUid, qrCodeUrl, phone? }`. Seen live: it
+//!   arrives as a `chat.recommended` message whose `content` is `{ action:
+//!   "recommened.user", title: <name>, thumb: <avatar>, params: <uid>,
+//!   description: JSON text of { qrCodeUrl, gUid, phone? } }`.
 //! - Banks Zalo knows: `GET {zimsg}/api/transfer/conf` with `{}` answers
 //!   `{ banks: [{ bin, logo, name, name_eng, short_name, search_key_word }] }`.
 //! - Saved accounts: `GET {zimsg}/api/transfer/list` with `{ page, limit }`
@@ -174,24 +176,17 @@ impl ZaloClient {
         Ok(qr_of(&data, uid))
     }
 
-    /// Send `uid`'s contact card ("danh thiếp"); `phone` is shown on it when
-    /// given.
+    /// Send `uid`'s contact card ("danh thiếp") with its profile QR (see
+    /// [`Self::profile_qr`]; the official clients show the card without one
+    /// too); `phone` is shown on it when given.
     pub async fn send_contact_card(
         &self,
         to: Recipient<'_>,
         uid: &str,
         phone: &str,
+        qr: &str,
     ) -> Result<SentMessage> {
         let key = self.session_key()?;
-        // The card shows the contact's QR; without it the official clients
-        // still show the card, so a failed lookup does not stop the send.
-        let qr = match self.profile_qr(uid).await {
-            Ok(url) => url,
-            Err(e) => {
-                tracing::debug!(error = %e, "no QR for a contact card");
-                String::new()
-            }
-        };
         let mut info = json!({ "contactUid": uid, "qrCodeUrl": qr });
         if !phone.trim().is_empty() {
             info["phone"] = json!(phone.trim());

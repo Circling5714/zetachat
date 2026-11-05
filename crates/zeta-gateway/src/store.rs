@@ -142,6 +142,40 @@ ALTER TABLE messages ADD COLUMN styles TEXT NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN urgency INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// The version `init` brings every database to.
+pub const SCHEMA_VERSION: i64 = 10;
+
+/// Version 10: contact cards, stored as links before, are parsed again.
+const REPARSED_IN_V10: [&str; 1] = ["chat.recommended"];
+
+/// Parse again the text and media of stored messages of these kinds, from
+/// their Zalo JSON (after parsing learnt something about them).
+fn reparse_kinds(tx: &rusqlite::Transaction<'_>, kinds: &[&str]) -> Result<usize> {
+    let mut updated = 0;
+    for kind in kinds {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare("SELECT seq, raw FROM messages WHERE kind = ?1")?;
+            let rows = stmt.query_map(params![kind], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_>>()?
+        };
+        for (seq, raw) in rows {
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let content = value.get("content");
+            updated += tx.execute(
+                "UPDATE messages SET text = ?2, media = ?3 WHERE seq = ?1",
+                params![
+                    seq,
+                    media::summarize(kind, content),
+                    to_json(media::extract(kind, content).as_ref())
+                ],
+            )?;
+        }
+    }
+    Ok(updated)
+}
+
 /// The styles (JSON, empty for none) and urgency of a message's Zalo JSON.
 fn extras_of_raw(raw: &str) -> (String, u8) {
     let Ok(value) = serde_json::from_str::<Value>(raw) else {
@@ -595,6 +629,15 @@ impl Store {
             tx.commit()?;
             if deleted > 0 {
                 tracing::info!(count = deleted, "messages deleted on other devices removed");
+            }
+        }
+        if version < 10 {
+            let tx = conn.transaction()?;
+            let reparsed = reparse_kinds(&tx, &REPARSED_IN_V10)?;
+            tx.pragma_update(None, "user_version", 10)?;
+            tx.commit()?;
+            if reparsed > 0 {
+                tracing::info!(count = reparsed, "contact cards parsed again");
             }
         }
         Ok(Self {
@@ -1618,7 +1661,7 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
         // Version 5 added people and group sizes, version 6 message status.
         assert!(s
             .messages("zalo:u:1", None, 10)

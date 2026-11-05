@@ -30,6 +30,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/stickers/search?q=` | Nhãn dán theo từ khóa ("haha", "cảm ơn", "yêu"…), như Zalo gợi ý; cùng dạng như trên |
 | GET | `/stickers/motion?ids=` | Nhãn dán động ra sao, tối đa 50 id: `{ "<id>": { "sprite", "frames", "duration_ms", "ext" } }`. `sprite` thường là dải `frames` khung xếp ngang trên CDN của Zalo, mỗi khung hiện `duration_ms`. `frames` bằng 0 nghĩa là Zalo để sprite tự nói: một hình 130×130 (nhãn tĩnh) hoặc, với `ext` 2, một ảnh WebP động. `null` khi nhãn không có sprite. Id mà Zalo không trả lời được thì vắng mặt, để client hỏi lại. Gateway giữ kết quả, vì nhãn dán không đổi |
 | POST | `/threads/{id}/stickers` | Gửi nhãn dán `{ "id", "cate_id", "type" }` lấy từ các đường dẫn trên; trả về tin đã lưu (`kind` là `chat.sticker`) |
+| POST | `/threads/{id}/contact-card` | Gửi danh thiếp `{ "uid" }` (của bạn bè, hay của chính tài khoản); trả về tin đã lưu (`kind` là `chat.recommended`, `media.kind` là `contact`). Chuyển tiếp một danh thiếp cũng gửi lại danh thiếp đó |
 | GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu. Thêm `"reply_to": <seq>` để trả lời một tin: tin mới mang `quote` của tin đó. Trong nhóm, `"mentions": [{ "uid", "pos", "len" }]` nhắc tên: vị trí và độ dài tính theo đơn vị UTF-16 của `text` (như chuỗi JavaScript), `uid` "-1" là cả nhóm. Gateway điều chỉnh vị trí khi cắt khoảng trắng đầu và bỏ những mục nằm ngoài chữ. `"styles": [{ "start", "len", "st" }]` định dạng từng đoạn chữ (vị trí cũng theo UTF-16), `st` là mã của Zalo: `b` đậm, `i` nghiêng, `u` gạch chân, `s` gạch ngang, `c_db342e` / `c_f27806` / `c_f7b503` / `c_15a85f` chữ đỏ, cam, vàng, xanh lá, `f_13` / `f_18` chữ nhỏ, lớn, `lst_1` / `lst_2` dòng thuộc danh sách dấu chấm hoặc danh sách số, `ind_10`, `ind_20`… thụt lề; mã lạ bị bỏ. `"urgency": 1` đánh dấu tin "Quan trọng", `2` là "Khẩn cấp" |
@@ -61,13 +62,14 @@ Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, 
 
 | Trường | Ý nghĩa |
 |---|---|
-| `kind` | `image`, `gif`, `video`, `sticker`, `audio` (tin nhắn thoại), `file` hoặc `link` |
+| `kind` | `image`, `gif`, `video`, `sticker`, `audio` (tin nhắn thoại), `file`, `link` hoặc `contact` (danh thiếp) |
 | `url` | Tệp gốc trên CDN của Zalo; với `link` là trang được chia sẻ |
 | `thumb` | Ảnh xem trước: ảnh thu nhỏ, ảnh bìa video, ảnh của thẻ liên kết |
 | `width`, `height` | Kích thước ảnh hoặc video (0 khi không rõ), để giữ chỗ trước khi tải |
 | `name`, `description` | Tên tệp hoặc tiêu đề liên kết; chú thích ảnh hoặc mô tả liên kết |
 | `size`, `duration_ms` | Dung lượng (byte) và độ dài video hay tin nhắn thoại, 0 khi không rõ |
 | `sticker_id` | Id của nhãn dán (chỉ với `sticker`), để hỏi `/stickers/motion` |
+| `uid` | Người trên danh thiếp (chỉ với `contact`); khi đó `name` là tên họ, `thumb` là ảnh đại diện, `url` là ảnh mã QR của họ, `description` là số điện thoại nếu người gửi kèm theo |
 
 Client tải `url` và `thumb` qua `/media?u=…`, không gọi thẳng CDN của Zalo: thiết bị không cần ra Internet, và gateway giữ một bản trên đĩa. Gateway tự tải trước ảnh, sticker, tin nhắn thoại và video (đến 100 MB) của tin mới ngay khi tin đến, nên mở ra là có ngay và vẫn còn khi link của Zalo hết hạn. Tệp đính kèm chỉ được tải khi có người mở. Tệp lớn hơn 256 MB không đi qua gateway (`413`).
 

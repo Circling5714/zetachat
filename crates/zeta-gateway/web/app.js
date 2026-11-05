@@ -1057,6 +1057,40 @@ function linkNode(md) {
   return card;
 }
 
+/** A contact card ("danh thiếp"): who, and buttons to chat, see their QR, add them. */
+function contactNode(md) {
+  const card = el('div', 'contact-card');
+  const name = md.name || 'Người dùng Zalo';
+  const head = el('div', 'contact-head');
+  const known = state.people.get(md.uid);
+  head.append(avatarBox(`zalo:u:${md.uid}`, name, md.thumb || (known && known.avatar)));
+  const who = el('div', 'contact-who');
+  who.append(el('div', 'contact-name', name), el('div', 'contact-sub', md.description || 'Danh thiếp Zalo'));
+  head.append(who);
+  card.append(head);
+  const actions = el('div', 'contact-actions');
+  const action = (label, run) => {
+    const b = el('button', null, label);
+    b.type = 'button';
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      run();
+    });
+    actions.append(b);
+  };
+  const me = state.status && state.status.uid;
+  if (md.uid !== me) action('Nhắn tin', () => openPerson({ uid: md.uid, name, avatar: md.thumb }));
+  if (md.url) action('Mã QR', () => openViewer({ url: md.url, description: `Mã QR của ${name}` }));
+  if (md.uid !== me && !(known && known.friend)) {
+    action('Kết bạn', () => {
+      openAddFriend();
+      renderFound({ uid: md.uid, name, avatar: md.thumb, friendship: 'none' });
+    });
+  }
+  if (actions.childElementCount) card.append(actions);
+  return card;
+}
+
 /** Renderer and bubble style per media kind. */
 const MEDIA = {
   image: [imageNode, 'media'],
@@ -1066,6 +1100,7 @@ const MEDIA = {
   audio: [audioNode, 'card'],
   file: [fileNode, 'card'],
   link: [linkNode, 'card'],
+  contact: [contactNode, 'card'],
 };
 
 // ----------------------------------------------------------- picture viewer
@@ -1452,6 +1487,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!$('rename').hidden) closeRename();
   else if (!$('forward').hidden) closeForward();
+  else if (!$('card-pick').hidden) closeCardPick();
   else if (!$('new-group').hidden) closeNewGroup();
   else if (!$('add-friend').hidden) closeAddFriend();
   else if (picker) closePicker();
@@ -1513,7 +1549,7 @@ $('reply-cancel').addEventListener('click', cancelReply);
 // ------------------------------------------------- forwarding and deleting
 
 /** Media the gateway can forward (texts and links through Zalo, the rest sent again). */
-const FORWARDABLE = ['link', 'sticker', 'image', 'gif', 'video', 'audio', 'file'];
+const FORWARDABLE = ['link', 'sticker', 'image', 'gif', 'video', 'audio', 'file', 'contact'];
 
 function canForward(m) {
   if (!canReact(m)) return false;
@@ -1618,6 +1654,82 @@ $('forward-cancel').addEventListener('click', closeForward);
 $('forward-send').addEventListener('click', sendForward);
 $('forward').addEventListener('click', (e) => {
   if (e.target === $('forward')) closeForward();
+});
+
+// ------------------------------------------------------------ contact cards
+
+const cardPick = { uid: null };
+
+function openCardPick() {
+  if (!state.current) return;
+  cardPick.uid = null;
+  $('card-search').value = '';
+  renderCardList();
+  $('card-pick').hidden = false;
+  $('card-search').focus();
+}
+
+function closeCardPick() {
+  $('card-pick').hidden = true;
+}
+
+/** This account first, then friends; the one chosen is sent. */
+function renderCardList() {
+  const q = fold($('card-search').value.trim());
+  const ul = $('card-list');
+  ul.replaceChildren();
+  const me = state.status && state.status.uid;
+  const people = [];
+  if (me) {
+    const self = state.people.get(me) || {};
+    people.push({ uid: me, name: state.status.display_name || personName(self), avatar: self.avatar || '', sub: 'Danh thiếp của bạn' });
+  }
+  for (const p of friendList()) {
+    if (p.uid !== me) people.push({ uid: p.uid, name: personName(p), avatar: p.avatar || '', sub: '' });
+  }
+  const shown = people.filter((p) => !q || fold(p.name).includes(q)).slice(0, 300);
+  if (!shown.length) ul.append(el('li', 'list-empty', 'Không tìm thấy bạn bè'));
+  for (const p of shown) {
+    const chosen = cardPick.uid === p.uid;
+    const li = el('li', chosen ? 'forward-item chosen' : 'forward-item');
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(chosen));
+    const body = el('div', 'body');
+    body.append(el('div', 'name', p.name));
+    if (p.sub) body.append(el('div', 'preview', p.sub));
+    li.append(avatarBox(`zalo:u:${p.uid}`, p.name, p.avatar), body);
+    li.addEventListener('click', () => {
+      cardPick.uid = p.uid;
+      renderCardList();
+    });
+    li.addEventListener('dblclick', sendCard);
+    ul.append(li);
+  }
+  $('card-send').disabled = !cardPick.uid;
+}
+
+async function sendCard() {
+  const id = state.current;
+  const uid = cardPick.uid;
+  if (!id || !uid) return;
+  const button = $('card-send');
+  button.disabled = true;
+  try {
+    const message = await api(`/threads/${encodeURIComponent(id)}/contact-card`, { json: { uid } });
+    closeCardPick();
+    onMessage({ message, thread: null });
+  } catch (err) {
+    button.disabled = false;
+    handleError(err, 'Không gửi được danh thiếp: ');
+  }
+}
+
+$('card-btn').addEventListener('click', openCardPick);
+$('card-search').addEventListener('input', renderCardList);
+$('card-cancel').addEventListener('click', closeCardPick);
+$('card-send').addEventListener('click', sendCard);
+$('card-pick').addEventListener('click', (e) => {
+  if (e.target === $('card-pick')) closeCardPick();
 });
 
 async function deleteForMe(m) {

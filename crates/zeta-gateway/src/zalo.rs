@@ -225,8 +225,24 @@ pub enum ZaloCommand {
         action: FriendAction,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// Cards: a contact's to send (JSON for clients).
+    Cards {
+        action: CardAction,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
+    },
+}
+
+/// What to do with cards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardAction {
+    /// Send `uid`'s card ("danh thiếp") to a chat: answers the stored message.
+    SendContact {
+        kind: ThreadKind,
+        remote_id: String,
+        uid: String,
     },
 }
 
@@ -1287,6 +1303,17 @@ impl Connector {
                     let _ = reply.send(result);
                 });
             }
+            ZaloCommand::Cards { action, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                let self_uid = self.self_uid.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(card_action(&client, &store, &bus, &self_uid, action).await);
+                });
+            }
             ZaloCommand::StartLogin { reply } => {
                 if self.login_running {
                     let current = self
@@ -1967,6 +1994,93 @@ async fn lookup_people(
         .touch_people(&asked, now_ms())
         .and_then(|()| store.people(&asked))
         .map_err(|e| e.to_string())
+}
+
+/// The media of a contact card sent from here, and the Zalo JSON it is kept
+/// with (shaped like a received card, so both read the same).
+pub fn contact_card(person: &Person, qr: &str) -> (Media, Value) {
+    let name = person_name(person);
+    let media = Media {
+        kind: "contact".into(),
+        url: qr.to_string(),
+        thumb: person.avatar.clone(),
+        name: name.clone(),
+        uid: person.uid.clone(),
+        ..Media::default()
+    };
+    let raw = json!({
+        "msgType": "chat.recommended",
+        "content": {
+            "action": "recommened.user",
+            "title": name,
+            "thumb": person.avatar,
+            "params": person.uid,
+            "href": "www.zaloapp.com",
+            "description": json!({ "qrCodeUrl": qr }).to_string(),
+        },
+    });
+    (media, raw)
+}
+
+/// The name shown for someone: the account's alias, else theirs.
+fn person_name(p: &Person) -> String {
+    [&p.alias, &p.name, &p.zalo_name]
+        .into_iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or("Người dùng Zalo")
+        .to_string()
+}
+
+async fn card_action(
+    client: &ZaloClient,
+    store: &Store,
+    bus: &EventBus,
+    self_uid: &str,
+    action: CardAction,
+) -> Result<Value, String> {
+    match action {
+        CardAction::SendContact {
+            kind,
+            remote_id,
+            uid,
+        } => {
+            let person = store
+                .people(std::slice::from_ref(&uid))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .unwrap_or(Person {
+                    uid: uid.clone(),
+                    ..Person::default()
+                });
+            // Without the QR the card still shows, as on the official clients.
+            let qr = match client.profile_qr(&uid).await {
+                Ok(url) => url,
+                Err(e) => {
+                    tracing::debug!(error = %e, "no QR for a contact card");
+                    String::new()
+                }
+            };
+            let to = recipient(kind, &remote_id);
+            let sent = client
+                .send_contact_card(to, &uid, "", &qr)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (media, raw) = contact_card(&person, &qr);
+            let sent = Sent {
+                msg_id: sent.msg_id,
+                client_id: sent.client_id,
+                msg_type: "chat.recommended",
+                text: format!("[Danh thiếp] {}", media.name),
+                media: Some(media),
+                quote: None,
+                raw: Some(raw),
+            };
+            let message = store_sent(store, bus, self_uid, kind, &remote_id, sent)?;
+            Ok(json!(message))
+        }
+    }
 }
 
 fn recipient(kind: ThreadKind, remote_id: &str) -> Recipient<'_> {
