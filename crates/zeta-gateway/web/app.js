@@ -897,6 +897,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (picker) closePicker();
   else if (panelKind) closePanel();
+  else if (info.thread && $('viewer').hidden) closeInfo();
   else if (state.replyTo && document.activeElement === input) cancelReply();
 });
 $('messages').addEventListener('scroll', closePicker, { passive: true });
@@ -1021,6 +1022,7 @@ async function openThread(id, focusSeq) {
   if (state.replyTo && state.replyTo.thread_id !== id) state.replyTo = null;
   renderReply();
   if (panelKind === 'emoji') closePanel();
+  if (info.thread && info.thread !== id) openInfo();
   try {
     let list = await fetchMessages(id);
     let full = list.length === 50;
@@ -1081,9 +1083,248 @@ async function markRead(id) {
 }
 
 $('back').addEventListener('click', () => {
+  closeInfo();
   $('app').classList.remove('show-chat');
   state.current = null;
   renderThreads();
+});
+
+// -------------------------------------------------------- conversation info
+//
+// The panel next to a conversation: the group's members, and the photos,
+// videos, files and links shared in it (from the gateway's store).
+
+const ROLE_TEXT = { owner: 'Trưởng nhóm', admin: 'Phó nhóm' };
+
+const info = {
+  thread: null, // conversation shown, null when closed
+  members: null, // { total, members } of a group, or { error }
+  shared: {}, // type -> messages, missing while loading
+  allMembers: false,
+};
+
+function openInfo() {
+  const t = state.threads.get(state.current);
+  if (!t) return;
+  info.thread = t.id;
+  info.members = null;
+  info.shared = {};
+  info.allMembers = false;
+  $('app').classList.add('with-info');
+  $('info').hidden = false;
+  $('info-toggle').classList.add('on');
+  renderInfo();
+  loadInfo(t);
+}
+
+function closeInfo() {
+  info.thread = null;
+  $('app').classList.remove('with-info');
+  $('info').hidden = true;
+  $('info').replaceChildren();
+  $('info-toggle').classList.remove('on');
+}
+
+async function loadInfo(t) {
+  const id = t.id;
+  const path = `/threads/${encodeURIComponent(id)}`;
+  const jobs = ['media', 'file', 'link'].map(async (type) => {
+    let list = [];
+    try {
+      list = await api(`${path}/shared?type=${type}&limit=${type === 'media' ? 12 : 6}`);
+    } catch (err) {
+      if (err instanceof Unauthorized) handleError(err);
+    }
+    if (info.thread !== id) return;
+    info.shared[type] = list;
+    renderInfo();
+  });
+  if (t.kind === 'group') {
+    try {
+      const data = await api(`${path}/members`);
+      if (info.thread !== id) return;
+      info.members = data;
+      t.members = data.total;
+      for (const m of data.members) {
+        if (m.name || m.avatar) {
+          state.people.set(m.uid, { ...(state.people.get(m.uid) || {}), uid: m.uid, name: m.name, avatar: m.avatar, friend: m.friend });
+        }
+      }
+      if (id === state.current) renderChatSub();
+    } catch (err) {
+      if (info.thread === id) info.members = { error: err.message || 'lỗi không rõ' };
+    }
+    if (info.thread === id) renderInfo();
+  }
+  await Promise.all(jobs);
+}
+
+function infoSection(title, count) {
+  const section = el('section', 'info-section');
+  const h = el('h3', 'info-section-title', title);
+  if (count) h.append(el('span', 'muted', ` · ${count}`));
+  section.append(h);
+  return section;
+}
+
+function renderInfo() {
+  const box = $('info');
+  const t = state.threads.get(info.thread);
+  if (!t) return;
+  const scroll = box.scrollTop;
+  box.replaceChildren();
+  const head = el('div', 'info-head');
+  const close = el('button', 'upload-cancel', '×');
+  close.type = 'button';
+  close.title = 'Đóng';
+  close.setAttribute('aria-label', 'Đóng');
+  close.addEventListener('click', closeInfo);
+  head.append(el('div', 'info-title', t.kind === 'group' ? 'Thông tin nhóm' : 'Thông tin hội thoại'), close);
+  const profile = el('div', 'info-profile');
+  const picture = avatar(t);
+  picture.classList.add('info-avatar');
+  profile.append(picture, el('div', 'info-name', threadName(t)));
+  if (t.kind === 'group') profile.append(el('div', 'muted small', membersText(t)));
+  box.append(head, profile);
+  if (t.kind === 'group') box.append(membersSection());
+  box.append(sharedMediaSection(), sharedListSection('file', 'Tệp', 'Chưa có tệp nào.'), sharedListSection('link', 'Liên kết', 'Chưa có liên kết nào.'));
+  box.scrollTop = scroll;
+}
+
+function membersSection() {
+  const data = info.members;
+  const section = infoSection('Thành viên', data && !data.error ? data.total : 0);
+  if (!data) {
+    section.append(el('div', 'list-note', 'Đang tải…'));
+    return section;
+  }
+  if (data.error) {
+    section.append(el('div', 'list-note', `Không tải được: ${data.error}`));
+    return section;
+  }
+  const me = state.status && state.status.uid;
+  const ul = el('ul', 'member-list');
+  for (const m of info.allMembers ? data.members : data.members.slice(0, 20)) {
+    const li = el('li', 'member');
+    const body = el('div', 'body');
+    const name = m.name || `Người dùng ${m.uid}`;
+    body.append(el('div', 'name', m.uid === me ? `${name} (bạn)` : name));
+    if (ROLE_TEXT[m.role]) body.append(el('div', 'member-role', ROLE_TEXT[m.role]));
+    li.append(avatarBox(`zalo:u:${m.uid}`, m.name, m.avatar), body);
+    if (m.uid !== me) {
+      li.classList.add('clickable');
+      li.title = `Nhắn tin cho ${name}`;
+      li.addEventListener('click', () => {
+        closeInfo();
+        openPerson({ uid: m.uid, name: m.name, avatar: m.avatar });
+      });
+    }
+    ul.append(li);
+  }
+  section.append(ul);
+  if (!info.allMembers && data.members.length > 20) {
+    const more = el('button', 'btn secondary info-more', `Xem cả ${data.members.length} thành viên`);
+    more.type = 'button';
+    more.addEventListener('click', () => {
+      info.allMembers = true;
+      renderInfo();
+    });
+    section.append(more);
+  }
+  if (data.total > data.members.length) {
+    section.append(el('div', 'list-note', `Zalo liệt kê ${data.members.length} trong ${data.total} thành viên.`));
+  }
+  return section;
+}
+
+/** Bring a shared message into view (from the info panel). */
+function jumpTo(m) {
+  if (window.matchMedia('(max-width: 760px)').matches) closeInfo();
+  if (document.querySelector(`#messages .msg[data-seq="${m.seq}"]`)) showMessage(m.seq);
+  else openThread(m.thread_id, m.seq);
+}
+
+function sharedMediaSection() {
+  const list = info.shared.media;
+  const section = infoSection('Ảnh, video');
+  if (!list) {
+    section.append(el('div', 'list-note', 'Đang tải…'));
+    return section;
+  }
+  if (!list.length) {
+    section.append(el('div', 'list-note', 'Chưa có ảnh hay video nào.'));
+    return section;
+  }
+  const grid = el('div', 'shared-grid');
+  for (const m of list) {
+    const md = m.media || {};
+    const cell = el('button', 'shared-cell');
+    cell.type = 'button';
+    cell.title = fmtListTime(m.sent_at);
+    const src = md.thumb || (md.kind === 'image' ? md.url : '');
+    if (src) {
+      const img = new Image();
+      img.alt = '';
+      img.loading = 'lazy';
+      img.src = mediaSrc(src);
+      img.addEventListener('error', () => img.remove());
+      cell.append(img);
+    }
+    if (md.kind === 'video') cell.append(el('span', 'shared-badge', md.duration_ms ? fmtDuration(md.duration_ms) : '▶'));
+    cell.addEventListener('click', () => (md.kind === 'image' ? openViewer(md) : jumpTo(m)));
+    grid.append(cell);
+  }
+  section.append(grid);
+  return section;
+}
+
+function sharedListSection(type, title, emptyText) {
+  const list = info.shared[type];
+  const section = infoSection(title);
+  if (!list) {
+    section.append(el('div', 'list-note', 'Đang tải…'));
+    return section;
+  }
+  if (!list.length) {
+    section.append(el('div', 'list-note', emptyText));
+    return section;
+  }
+  const ul = el('ul', 'shared-list');
+  for (const m of list) {
+    const md = m.media || {};
+    const a = el('a');
+    const lines = el('div', 'shared-lines');
+    if (type === 'file') {
+      if (md.size > GATEWAY_MAX_FILE && isWebUrl(md.url)) {
+        a.href = md.url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+      } else {
+        a.href = mediaSrc(md.url);
+        a.download = md.name || '';
+      }
+      const size = fmtSize(md.size);
+      lines.append(el('div', 'file-name', md.name || 'Tập tin'), el('div', 'file-size', [size, fmtListTime(m.sent_at)].filter(Boolean).join(' · ')));
+      a.append(el('div', 'file-icon', extOf(md.name) || 'TỆP'), lines);
+    } else {
+      if (!isWebUrl(md.url)) continue;
+      a.href = md.url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      lines.append(el('div', 'file-name', md.name || md.url), el('div', 'file-size', hostOf(md.url)));
+      a.append(el('div', 'file-icon link-icon', '🔗'), lines);
+    }
+    const li = el('li', 'shared-item');
+    li.append(a);
+    ul.append(li);
+  }
+  section.append(ul);
+  return section;
+}
+
+$('info-toggle').addEventListener('click', () => (info.thread ? closeInfo() : openInfo()));
+document.querySelector('.chat-head').addEventListener('click', (e) => {
+  if (e.target.closest('#chat-avatar, .chat-title') && !info.thread) openInfo();
 });
 
 // ------------------------------------------------------------------- typing

@@ -784,6 +784,36 @@ impl Store {
         Ok(out)
     }
 
+    /// Messages of a thread whose `kind` (Zalo's `msgType`) is one of `kinds`,
+    /// older than `seq = before`, newest first.
+    pub fn messages_of_kinds(
+        &self,
+        thread_id: &str,
+        kinds: &[&str],
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<Message>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 4)).collect();
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE thread_id = ?1 AND seq < ?2 AND kind IN ({})
+             ORDER BY seq DESC LIMIT ?3",
+            marks.join(", ")
+        ))?;
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            thread_id.to_string().into(),
+            before.unwrap_or(i64::MAX).into(),
+            limit.into(),
+        ];
+        values.extend(kinds.iter().map(|k| (*k).to_string().into()));
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), message_from_row)?;
+        rows.collect()
+    }
+
     /// One message, with its reactions.
     pub fn message(&self, seq: i64) -> Result<Option<Message>> {
         let conn = self.conn();

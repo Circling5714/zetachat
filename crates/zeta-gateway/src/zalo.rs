@@ -25,8 +25,8 @@ use crate::events::EventBus;
 use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
-    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Person, Quote, ThreadKind,
-    ThreadUpsert,
+    now_ms, thread_id, GroupMembers, Media, Member, Message, NewMessage, NewReaction, Person,
+    Quote, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
 };
 use crate::stickers::{StickerCache, StickerQuery};
 use crate::store::Store;
@@ -170,6 +170,11 @@ pub enum ZaloCommand {
         remote_id: String,
         sticker: Sticker,
         reply: oneshot::Sender<Result<Message, String>>,
+    },
+    /// Who is in a group, asked of Zalo now.
+    GroupMembers {
+        group_id: String,
+        reply: oneshot::Sender<Result<GroupMembers, String>>,
     },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
@@ -917,6 +922,16 @@ impl Connector {
                     let _ = reply.send(lookup_people(&client, &store, &uids).await);
                 });
             }
+            ZaloCommand::GroupMembers { group_id, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let store = self.store.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(group_members(&client, &store, &group_id).await);
+                });
+            }
             ZaloCommand::Stickers { query, reply } => {
                 let Some(client) = self.client.clone() else {
                     let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
@@ -1266,6 +1281,83 @@ impl Connector {
             }
         }
     }
+}
+
+/// Members of a group listed at most (Zalo PC pages through larger groups).
+const MEMBERS_SHOWN: usize = 300;
+
+/// Who is in a group: Zalo's member list now, with names and pictures from the
+/// store, members it does not know looked up first. The group's thread is
+/// refreshed on the way.
+async fn group_members(
+    client: &ZaloClient,
+    store: &Store,
+    group_id: &str,
+) -> Result<GroupMembers, String> {
+    let group = client
+        .group_info(&[group_id.to_string()])
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Zalo không trả thông tin nhóm".to_string())?;
+    let thread = ThreadUpsert {
+        kind: ThreadKind::Group,
+        remote_id: group.id.clone(),
+        name: group.name.clone(),
+        avatar: group.avatar.clone(),
+    };
+    store
+        .upsert_thread(&thread, true)
+        .and_then(|()| store.set_members(&thread.id(), group.member_count))
+        .map_err(|e| e.to_string())?;
+    let shown: Vec<String> = group
+        .member_ids
+        .iter()
+        .take(MEMBERS_SHOWN)
+        .cloned()
+        .collect();
+    let known = store.people(&shown).map_err(|e| e.to_string())?;
+    let now = now_ms();
+    let unknown: Vec<String> = shown
+        .iter()
+        .filter(|uid| {
+            !known.iter().any(|p| {
+                &p.uid == *uid && !p.name.is_empty() && now - p.updated_at < PEOPLE_FRESH_MS
+            })
+        })
+        .cloned()
+        .collect();
+    for chunk in unknown.chunks(50) {
+        if let Err(e) = lookup_people(client, store, chunk).await {
+            tracing::debug!(error = %e, "group members not looked up");
+            break;
+        }
+    }
+    let people = store.people(&shown).map_err(|e| e.to_string())?;
+    let members = shown
+        .iter()
+        .map(|uid| {
+            let person = people.iter().find(|p| &p.uid == uid);
+            Member {
+                uid: uid.clone(),
+                name: person.map(|p| p.name.clone()).unwrap_or_default(),
+                avatar: person.map(|p| p.avatar.clone()).unwrap_or_default(),
+                friend: person.is_some_and(|p| p.friend),
+                role: if *uid == group.creator_id {
+                    "owner"
+                } else if group.admin_ids.contains(uid) {
+                    "admin"
+                } else {
+                    "member"
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(GroupMembers {
+        total: group.member_count.max(members.len() as u64),
+        members,
+    })
 }
 
 /// The media of a sticker message, as parsed from Zalo's own messages.

@@ -29,7 +29,10 @@ use zeta_zalo::sticker::Sticker;
 use crate::auth::AuthDevice;
 use crate::events::EventBus;
 use crate::media_cache::{self, FetchError, MediaCache};
-use crate::model::{now_ms, split_thread_id, Message, Person, StoredEvent, Thread};
+use crate::model::{
+    now_ms, split_thread_id, GroupMembers, Message, Person, StoredEvent, Thread, ThreadKind,
+    PEOPLE_FRESH_MS,
+};
 use crate::stickers::StickerQuery;
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
@@ -125,6 +128,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stickers/packs/{id}", get(pack_stickers))
         .route("/api/v1/stickers/search", get(search_stickers))
         .route("/api/v1/threads/{id}/stickers", post(send_sticker))
+        .route("/api/v1/threads/{id}/members", get(group_members))
+        .route("/api/v1/threads/{id}/shared", get(shared))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
         .route("/api/v1/media", get(media))
@@ -250,9 +255,6 @@ async fn list_threads(
     Ok(Json(threads))
 }
 
-/// How long what Zalo said about a user is trusted before asking again.
-const PEOPLE_FRESH_MS: i64 = 3 * 24 * 3600 * 1000;
-
 #[derive(Deserialize)]
 struct PeopleQuery {
     /// User ids, separated by commas; at most 100 are read.
@@ -339,6 +341,66 @@ async fn search(
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "messages": messages })))
+}
+
+/// Who is in a group, asked of Zalo now: `{ total, members: [{ uid, name,
+/// avatar, friend, role }] }`, owner and admins first. Members the gateway does
+/// not know yet are looked up (up to 300 are listed).
+async fn group_members(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+) -> ApiResult<GroupMembers> {
+    let Some((ThreadKind::Group, group_id)) = split_thread_id(&id) else {
+        return Err(ApiError::not_found("group"));
+    };
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::GroupMembers {
+            group_id: group_id.to_string(),
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let members = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(members))
+}
+
+#[derive(Deserialize)]
+struct SharedQuery {
+    /// `media` (photos, videos, GIFs), `file` or `link`.
+    #[serde(rename = "type")]
+    kind: String,
+    before: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// What was shared in a conversation, newest first: the messages carrying
+/// photos and videos, files, or links.
+async fn shared(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Query(q): Query<SharedQuery>,
+) -> ApiResult<Vec<Message>> {
+    if split_thread_id(&id).is_none() {
+        return Err(ApiError::not_found("thread"));
+    }
+    let kinds: &[&str] = match q.kind.as_str() {
+        "media" => &["chat.photo", "chat.video.msg", "chat.gif"],
+        "file" => &["share.file"],
+        "link" => &["chat.recommended", "chat.link"],
+        _ => return Err(ApiError::bad_request("type is media, file or link")),
+    };
+    let messages = st
+        .store
+        .messages_of_kinds(&id, kinds, q.before, clamp(q.limit, 30))
+        .map_err(ApiError::internal)?;
+    Ok(Json(messages))
 }
 
 /// Ask the connector's sticker store.

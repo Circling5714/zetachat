@@ -295,8 +295,15 @@ impl ZaloClient {
 
     /// Groups with name, avatar and size (`getlg/v4`, then `getmg-v2` in batches).
     pub async fn groups(&self) -> Result<Vec<Group>> {
-        let key = self.session_key()?;
         let ids = self.group_ids().await?;
+        self.group_info(&ids).await
+    }
+
+    /// Details of the groups `ids` (`getmg-v2`, 50 at a time): name, avatar,
+    /// size, members, creator, admins. A version of 0 makes Zalo answer for
+    /// every group asked.
+    pub async fn group_info(&self, ids: &[String]) -> Result<Vec<Group>> {
+        let key = self.session_key()?;
         let url = format!(
             "{}/api/group/getmg-v2?{}",
             self.domains().primary(Service::Group),

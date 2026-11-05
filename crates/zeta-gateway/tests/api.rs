@@ -13,7 +13,8 @@ use zeta_gateway::api::{self, AppState};
 use zeta_gateway::events::EventBus;
 use zeta_gateway::media_cache::MediaCache;
 use zeta_gateway::model::{
-    thread_id, Media, NewMessage, NewReaction, Person, ThreadKind, ThreadUpsert,
+    thread_id, GroupMembers, Media, Member, NewMessage, NewReaction, Person, ThreadKind,
+    ThreadUpsert,
 };
 use zeta_gateway::store::Store;
 use zeta_gateway::uploads::Uploads;
@@ -185,6 +186,20 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog, asked: AskedL
                     seen.lock().unwrap().push((remote_id, ids));
                 }
                 ZaloCommand::Typing { .. } => {}
+                // Every group has its owner and one member.
+                ZaloCommand::GroupMembers { group_id, reply } => {
+                    let member = |uid: &str, role| Member {
+                        uid: uid.into(),
+                        name: format!("Người {uid}"),
+                        avatar: String::new(),
+                        friend: false,
+                        role,
+                    };
+                    let _ = reply.send(Ok(GroupMembers {
+                        total: 12,
+                        members: vec![member(&group_id, "owner"), member("2", "member")],
+                    }));
+                }
                 // The store's answer says what was asked.
                 ZaloCommand::Stickers { query, reply } => {
                     let _ = reply.send(Ok(json!({ "asked": format!("{query:?}") })));
@@ -903,5 +918,98 @@ async fn stickers_are_listed_searched_and_sent() {
         true,
     )
     .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn group_members_and_shared_media() {
+    let f = fixture();
+    let group = thread_id(ThreadKind::Group, "55");
+    let (status, body) = call(
+        &f,
+        "GET",
+        &format!("/api/v1/threads/{group}/members"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 12);
+    assert_eq!(body["members"][0]["role"], "owner");
+    assert_eq!(body["members"][1]["name"], "Người 2");
+    // A 1-1 chat has no members to list.
+    let user = thread_id(ThreadKind::User, "55");
+    let (status, _) = call(
+        &f,
+        "GET",
+        &format!("/api/v1/threads/{user}/members"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let lan = ThreadUpsert {
+        kind: ThreadKind::User,
+        remote_id: "55".into(),
+        name: "Lan".into(),
+        avatar: String::new(),
+    };
+    f.store.upsert_thread(&lan, true).unwrap();
+    let shares = [
+        ("webchat", "chào", None),
+        ("chat.photo", "[Hình ảnh]", Some("image")),
+        ("share.file", "[Tập tin] a.pdf", Some("file")),
+        ("chat.video.msg", "[Video]", Some("video")),
+        ("chat.recommended", "[Liên kết] Ví dụ", Some("link")),
+    ];
+    for (i, (kind, text, media)) in shares.iter().enumerate() {
+        f.store
+            .insert_message(&NewMessage {
+                thread_id: user.clone(),
+                remote_id: format!("s{i}"),
+                client_id: String::new(),
+                sender_id: "55".into(),
+                sender_name: "Lan".into(),
+                outgoing: false,
+                kind: (*kind).into(),
+                text: (*text).into(),
+                media: media.map(|k| Media {
+                    kind: k.into(),
+                    url: format!("https://f.zdn.vn/{i}"),
+                    ..Media::default()
+                }),
+                quote: None,
+                sent_at: i as i64,
+                raw: "{}".into(),
+            })
+            .unwrap();
+    }
+    let kinds = |body: &Value| -> Vec<String> {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let shared = format!("/api/v1/threads/{user}/shared");
+    let (status, media) = call(&f, "GET", &format!("{shared}?type=media"), None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(kinds(&media), ["chat.video.msg", "chat.photo"]);
+    let (_, files) = call(&f, "GET", &format!("{shared}?type=file"), None, true).await;
+    assert_eq!(kinds(&files), ["share.file"]);
+    let (_, links) = call(&f, "GET", &format!("{shared}?type=link"), None, true).await;
+    assert_eq!(kinds(&links), ["chat.recommended"]);
+    let before = media[0]["seq"].as_i64().unwrap();
+    let (_, older) = call(
+        &f,
+        "GET",
+        &format!("{shared}?type=media&before={before}"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(kinds(&older), ["chat.photo"]);
+    let (status, _) = call(&f, "GET", &format!("{shared}?type=all"), None, true).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

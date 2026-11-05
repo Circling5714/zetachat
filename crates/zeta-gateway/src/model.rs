@@ -71,6 +71,29 @@ pub struct Thread {
     pub members: i64,
 }
 
+/// How long what Zalo said about a user is trusted before asking again (ms).
+pub const PEOPLE_FRESH_MS: i64 = 3 * 24 * 3600 * 1000;
+
+/// A member of a group, for clients.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Member {
+    pub uid: String,
+    /// Empty when Zalo would not say.
+    pub name: String,
+    pub avatar: String,
+    pub friend: bool,
+    /// `owner` (who made the group), `admin` or `member`.
+    pub role: &'static str,
+}
+
+/// Who is in a group: as many members as Zalo lists, owner and admins first.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GroupMembers {
+    /// Size of the group, which can be more than the members listed.
+    pub total: u64,
+    pub members: Vec<Member>,
+}
+
 /// A Zalo user: a friend, a group member, this account.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Person {

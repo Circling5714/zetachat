@@ -112,7 +112,7 @@ Thu hồi tin của mình: `POST {chat}/api/message/undo` (nhóm: `{group}/api/g
 
 `getmg-v2` (thông tin nhóm) có `memVerList`: danh sách `"<uid>_<phiên bản>"` của mọi thành viên, kèm `creatorId` và `adminIds`. Thử trên 4 nhóm 10 đến 28 người: Zalo liệt kê đủ id của tất cả thành viên.
 
-Tên và ảnh của người không phải bạn bè: `POST {profile}/api/social/group/members` với `friend_pversion_map: ["<uid>_0", …]`, đúng như Zalo PC làm với thành viên nhóm nó chưa biết. Kết quả nằm trong `profiles`, là object theo uid: `{ displayName, zaloName, avatar, … }`. Đã thử hỏi 45 người một lần: Zalo trả đủ 45 hồ sơ, người nào cũng có tên và ảnh. Theo ctdozlite, `getminiprofiles` trả mã 114 nếu đưa uid trần. Gateway hỏi mỗi người tối đa 3 ngày một lần.
+Tên và ảnh của người không phải bạn bè: `POST {profile}/api/social/group/members` với `friend_pversion_map: ["<uid>_0", …]`, đúng như Zalo PC làm với thành viên nhóm nó chưa biết. Kết quả nằm trong `profiles`, là object theo uid: `{ displayName, zaloName, avatar, … }`. Đã thử hỏi 45 người một lần: Zalo trả đủ 45 hồ sơ, người nào cũng có tên và ảnh. Theo ctdozlite, `getminiprofiles` trả mã 114 nếu đưa uid trần. Gateway hỏi mỗi người tối đa 3 ngày một lần. Khi mở thông tin nhóm, gateway gọi `getmg-v2` cho riêng nhóm đó rồi hỏi tên của những thành viên chưa biết. Đã thử trên cả 4 nhóm: tất cả thành viên đều có tên, ảnh và đúng vai trò (`creatorId` là trưởng nhóm, `adminIds` là phó nhóm).
 
 ## 8f. Nhãn dán (đã kiểm chứng)
 

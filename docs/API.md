@@ -15,6 +15,8 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè và nhóm chưa từng nhắn tin. Mỗi hội thoại có `members`: số thành viên của nhóm (0 khi chưa biết, và với chat 1-1) |
 | GET | `/friends` | Danh sách bạn bè: `[{ "uid", "name", "zalo_name", "avatar", "friend": true, "updated_at" }]`, đồng bộ mỗi khi phiên Zalo khởi động |
 | GET | `/people?ids=<uid>,<uid>…` | Tên và ảnh đại diện của người dùng (người gửi tin trong nhóm, thành viên nhóm), tối đa 100 id. Người gateway chưa biết, hoặc đã hơn 3 ngày chưa hỏi lại, được hỏi Zalo trước (50 người mỗi lần). Trả về những người gateway biết, theo thứ tự đã hỏi; người Zalo không trả lời có `name` rỗng |
+| GET | `/threads/{id}/members` | Thành viên của nhóm, hỏi Zalo ngay lúc gọi: `{ "total", "members": [{ "uid", "name", "avatar", "friend", "role" }] }`, `role` là `owner` (trưởng nhóm), `admin` (phó nhóm) hoặc `member`; trưởng và phó nhóm đứng trước. Người gateway chưa biết được hỏi tên và ảnh trước. Liệt kê tối đa 300 người. `404` với chat 1-1 |
+| GET | `/threads/{id}/shared?type=&before=&limit=` | Những gì đã chia sẻ trong hội thoại, mới nhất trước: `type=media` (ảnh, video, GIF), `file` hoặc `link`. Trả về các tin nhắn mang chúng |
 | GET | `/stickers/packs` | Các gói nhãn dán trong kho của Zalo, mới nhất trước: `[{ "id", "name", "icon", "count" }]`. Gateway giữ danh sách 12 giờ |
 | GET | `/stickers/packs/{id}` | Nhãn dán của một gói: `[{ "id", "cate_id", "type", "url" }]`; `url` là ảnh trên CDN của Zalo, tải qua `/media` |
 | GET | `/stickers/search?q=` | Nhãn dán theo từ khóa ("haha", "cảm ơn", "yêu"…), như Zalo gợi ý; cùng dạng như trên |

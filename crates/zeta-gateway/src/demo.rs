@@ -12,8 +12,8 @@ use crate::events::EventBus;
 use crate::media::RECALLED_TEXT;
 use crate::media_cache::{MediaCache, LOCAL_URL_PREFIX};
 use crate::model::{
-    now_ms, thread_id, Media, Message, NewMessage, NewReaction, Person, Quote, ThreadKind,
-    ThreadUpsert,
+    now_ms, thread_id, GroupMembers, Media, Member, Message, NewMessage, NewReaction, Person,
+    Quote, ThreadKind, ThreadUpsert,
 };
 use crate::stickers::StickerQuery;
 use crate::store::{fold, Store};
@@ -125,6 +125,61 @@ fn demo_sticker_answer(query: &StickerQuery) -> Value {
             )
         }
     }
+}
+
+/// Who is in the sample groups: size, and the members listed with their role.
+fn demo_members(store: &Store, group_id: &str) -> Result<GroupMembers, String> {
+    let (total, list): (u64, &[(&str, &'static str)]) = match group_id {
+        "2001" => (
+            5,
+            &[
+                ("3001", "owner"),
+                ("3003", "admin"),
+                ("3002", "member"),
+                (ME, "member"),
+                ("1004", "member"),
+            ],
+        ),
+        "2002" => (
+            38,
+            &[
+                ("1007", "owner"),
+                ("1005", "member"),
+                ("1006", "member"),
+                (ME, "member"),
+                ("1001", "member"),
+            ],
+        ),
+        "2003" => (
+            7,
+            &[
+                ("1006", "owner"),
+                ("1004", "admin"),
+                (ME, "member"),
+                ("1002", "member"),
+                ("1003", "member"),
+                ("1005", "member"),
+                ("1001", "member"),
+            ],
+        ),
+        _ => return Err("demo: không có nhóm này".into()),
+    };
+    let uids: Vec<String> = list.iter().map(|(uid, _)| (*uid).to_string()).collect();
+    let people = store.people(&uids).map_err(|e| e.to_string())?;
+    let members = list
+        .iter()
+        .map(|&(uid, role)| {
+            let person = people.iter().find(|p| p.uid == uid);
+            Member {
+                uid: uid.to_string(),
+                name: person.map(|p| p.name.clone()).unwrap_or_default(),
+                avatar: person.map(|p| p.avatar.clone()).unwrap_or_default(),
+                friend: person.is_some_and(|p| p.friend),
+                role,
+            }
+        })
+        .collect();
+    Ok(GroupMembers { total, members })
 }
 
 /// This account in the demo.
@@ -754,6 +809,9 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 }
                 ZaloCommand::Stickers { query, reply } => {
                     let _ = reply.send(Ok(demo_sticker_answer(&query)));
+                }
+                ZaloCommand::GroupMembers { group_id, reply } => {
+                    let _ = reply.send(demo_members(&store, &group_id));
                 }
                 ZaloCommand::SendSticker {
                     kind,
