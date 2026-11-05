@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use md5::{Digest, Md5};
 use serde::Serialize;
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::events::EventBus;
@@ -363,6 +363,52 @@ impl Uploads {
             file.write_all(&chunk).await.map_err(SpoolError::Io)?;
         }
         file.flush().await.map_err(SpoolError::Io)?;
+        if spooled.size == 0 {
+            return Err(SpoolError::Empty);
+        }
+        spooled.md5 = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Ok(spooled)
+    }
+
+    /// Copy a file the gateway already has (a cached photo to forward…) to
+    /// the spool, as if a device had sent it; at most `limit` bytes.
+    pub async fn spool_copy(&self, src: &Path, limit: u64) -> Result<Spooled, SpoolError> {
+        let mut input = tokio::fs::File::open(src).await.map_err(SpoolError::Io)?;
+        let size = input.metadata().await.map_err(SpoolError::Io)?.len();
+        if size > limit {
+            return Err(SpoolError::TooLarge(limit));
+        }
+        let path = self.dir.join(format!("{}.part", random_id()));
+        let mut spooled = Spooled {
+            path: Some(path.clone()),
+            size: 0,
+            md5: String::new(),
+            head: Vec::new(),
+        };
+        let mut output = tokio::fs::File::create(&path)
+            .await
+            .map_err(SpoolError::Io)?;
+        let mut hasher = Md5::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = input.read(&mut buf).await.map_err(SpoolError::Io)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            spooled.size += n as u64;
+            if spooled.head.len() < HEAD_BYTES {
+                let take = (HEAD_BYTES - spooled.head.len()).min(n);
+                spooled.head.extend_from_slice(&chunk[..take]);
+            }
+            hasher.update(chunk);
+            output.write_all(chunk).await.map_err(SpoolError::Io)?;
+        }
+        output.flush().await.map_err(SpoolError::Io)?;
         if spooled.size == 0 {
             return Err(SpoolError::Empty);
         }

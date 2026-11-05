@@ -15,7 +15,7 @@ use serde_json::{json, Map, Value};
 use crate::api::{first_str, Recipient, SentMessage};
 use crate::client::ZaloClient;
 use crate::domains::Service;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::now_millis;
 
 /// The message a reply quotes.
@@ -111,6 +111,33 @@ fn reply_params(
     p
 }
 
+/// What `mforward` answered for our one recipient: `success: [{ clientId,
+/// msgId }]` or `fail: [{ clientId, error_code }]`.
+fn forward_answer(data: &Value, client_id: u64) -> Result<SentMessage> {
+    let list = |key: &str| {
+        data.get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    if let Some(failed) = list("fail").first() {
+        let code = match failed.get("error_code") {
+            Some(Value::Number(n)) => n.as_i64().unwrap_or(-1),
+            Some(Value::String(s)) => s.trim().parse().unwrap_or(-1),
+            _ => -1,
+        };
+        return Err(Error::from_code(
+            code,
+            "Zalo không chuyển tiếp được tin này",
+        ));
+    }
+    let msg_id = list("success")
+        .first()
+        .map(|s| first_str(s, &["msgId"]))
+        .unwrap_or_default();
+    Ok(SentMessage { msg_id, client_id })
+}
+
 impl ZaloClient {
     /// Send `text` as a reply to `quote`.
     pub async fn send_reply(
@@ -137,6 +164,98 @@ impl ZaloClient {
             msg_id: first_str(&data, &["msgId"]),
             client_id,
         })
+    }
+
+    /// Forward a message to one conversation: `POST {file}/api/message/mforward`
+    /// or `{file}/api/group/mforward`, as zca-js `forwardMessage`. `msg_type`
+    /// numbers kinds as for quotes ([`client_message_type`]); `msg_info` is
+    /// `{ "message": text }` for text.
+    pub async fn forward(
+        &self,
+        to: Recipient<'_>,
+        msg_type: i64,
+        msg_info: &Value,
+    ) -> Result<SentMessage> {
+        let key = self.session_key()?;
+        let client_id = now_millis();
+        let mut p = Map::new();
+        let path = match to {
+            Recipient::User(uid) => {
+                p.insert(
+                    "toIds".into(),
+                    json!([{ "clientId": client_id.to_string(), "toUid": uid, "ttl": 0 }]),
+                );
+                p.insert("imei".into(), json!(self.device().imei));
+                "/api/message/mforward"
+            }
+            Recipient::Group(grid) => {
+                p.insert(
+                    "grids".into(),
+                    json!([{ "clientId": client_id.to_string(), "grid": grid, "ttl": 0 }]),
+                );
+                "/api/group/mforward"
+            }
+        };
+        p.insert("ttl".into(), json!(0));
+        p.insert("msgType".into(), json!(msg_type.to_string()));
+        p.insert("totalIds".into(), json!(1));
+        p.insert("msgInfo".into(), json!(msg_info.to_string()));
+        p.insert("decorLog".into(), json!("null"));
+        let form = format!("params={}", self.encrypt_params(&Value::Object(p))?);
+        let data = self
+            .post_service(Service::File, path, form, Some(key))
+            .await?;
+        forward_answer(&data, client_id)
+    }
+
+    /// Delete a message for this account only, as zca-js `deleteMessage` with
+    /// `onlyMe`: `POST {chat}/api/message/delete` or `{group}/api/group/deletemsg`.
+    /// `owner_id` is who sent it (this account's uid for its own messages).
+    pub async fn delete_for_me(
+        &self,
+        to: Recipient<'_>,
+        msg_id: &str,
+        cli_msg_id: &str,
+        owner_id: &str,
+    ) -> Result<()> {
+        let key = self.session_key()?;
+        let dest = match to {
+            Recipient::User(uid) => uid,
+            Recipient::Group(grid) => grid,
+        };
+        let mut p = Map::new();
+        let (service, path) = match to {
+            Recipient::User(uid) => {
+                p.insert("toid".into(), json!(uid));
+                (Service::Chat, "/api/message/delete")
+            }
+            Recipient::Group(grid) => {
+                p.insert("grid".into(), json!(grid));
+                (Service::Group, "/api/group/deletemsg")
+            }
+        };
+        p.insert("cliMsgId".into(), json!(now_millis()));
+        p.insert(
+            "msgs".into(),
+            json!([{
+                "cliMsgId": cli_msg_id,
+                "globalMsgId": msg_id,
+                "ownerId": owner_id,
+                "destId": dest,
+            }]),
+        );
+        p.insert("onlyMe".into(), json!(1));
+        if matches!(to, Recipient::User(_)) {
+            p.insert("imei".into(), json!(self.device().imei));
+        }
+        let url = format!(
+            "{}{path}?{}",
+            self.domains().primary(service),
+            Self::common_params()
+        );
+        let form = format!("params={}", self.encrypt_params(&Value::Object(p))?);
+        self.post_form(&url, form, Some(key)).await?;
+        Ok(())
     }
 
     /// Recall one of this account's messages, for everyone in the chat.
@@ -221,6 +340,18 @@ mod tests {
         assert_eq!(attach["thumbUrl"], "https://p.zdn.vn/t.jpg");
         assert_eq!(attach["normalUrl"], "https://p.zdn.vn/a.jpg");
         assert!(p.get("imei").is_none());
+    }
+
+    #[test]
+    fn forward_answers() {
+        let ok = json!({ "success": [{ "clientId": "5", "msgId": "900" }], "fail": [] });
+        assert_eq!(forward_answer(&ok, 5).unwrap().msg_id, "900");
+        let failed = json!({ "success": [], "fail": [{ "clientId": "5", "error_code": "114" }] });
+        assert!(matches!(
+            forward_answer(&failed, 5),
+            Err(Error::Server { code: 114, .. })
+        ));
+        assert_eq!(forward_answer(&json!({}), 5).unwrap().msg_id, "");
     }
 
     #[test]

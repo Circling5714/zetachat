@@ -878,6 +878,27 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 ZaloCommand::GroupMembers { group_id, reply } => {
                     let _ = reply.send(demo_members(&store, &group_id));
                 }
+                ZaloCommand::Forward {
+                    kind,
+                    remote_id,
+                    text,
+                    reply,
+                } => {
+                    let sent = store_and_publish(
+                        &store,
+                        &bus,
+                        kind,
+                        &remote_id,
+                        true,
+                        "",
+                        self::text(&text),
+                    );
+                    let _ = reply.send(sent.ok_or_else(|| "demo: không lưu được tin".to_string()));
+                }
+                // Nothing to delete elsewhere in the demo.
+                ZaloCommand::DeleteForMe { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
                 ZaloCommand::Friends { action, reply } => {
                     let _ = reply.send(Ok(demo_friends(&store, &bus, action, &mut answered)));
                 }

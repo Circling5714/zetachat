@@ -784,6 +784,28 @@ impl Store {
         Ok(out)
     }
 
+    /// Remove a message (and its reactions) for good; returns what it was.
+    pub fn delete_message(&self, seq: i64) -> Result<Option<Message>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let found = tx
+            .query_row(
+                &format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq = ?1"),
+                params![seq],
+                message_from_row,
+            )
+            .optional()?;
+        if let Some(m) = &found {
+            tx.execute(
+                "DELETE FROM reactions WHERE thread_id = ?1 AND message_id = ?2",
+                params![m.thread_id, m.remote_id],
+            )?;
+            tx.execute("DELETE FROM messages WHERE seq = ?1", params![seq])?;
+        }
+        tx.commit()?;
+        Ok(found)
+    }
+
     /// Messages of a thread whose `kind` (Zalo's `msgType`) is one of `kinds`,
     /// older than `seq = before`, newest first.
     pub fn messages_of_kinds(
@@ -1296,6 +1318,39 @@ mod tests {
         // Touching keeps names.
         s.touch_people(&["3".to_string()], 99).unwrap();
         assert_eq!(s.people(&["3".to_string()]).unwrap()[0].name, "Bố");
+    }
+
+    #[test]
+    fn deleted_messages_take_their_reactions_with_them() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "Lan"), true).unwrap();
+        let first = s
+            .insert_message(&msg("zalo:u:1", "a", "", false, 1))
+            .unwrap()
+            .unwrap();
+        s.insert_message(&msg("zalo:u:1", "b", "", false, 2))
+            .unwrap();
+        s.add_reaction(&NewReaction {
+            thread_id: "zalo:u:1".into(),
+            action_id: "r1".into(),
+            client_id: String::new(),
+            targets: vec![("a".into(), String::new())],
+            user_id: "1".into(),
+            mine: false,
+            icon: "/-heart".into(),
+            sent_at: 3,
+        })
+        .unwrap();
+        let gone = s.delete_message(first.seq).unwrap().unwrap();
+        assert_eq!(gone.remote_id, "a");
+        assert!(s.delete_message(first.seq).unwrap().is_none());
+        let left = s.messages("zalo:u:1", None, 10).unwrap();
+        assert_eq!(left.len(), 1);
+        let reactions: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reactions, 0);
     }
 
     #[test]

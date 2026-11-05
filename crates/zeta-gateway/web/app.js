@@ -1042,8 +1042,12 @@ function openPicker(m, anchor) {
   }
   const actions = el('div', 'menu-actions');
   actions.append(menuButton('Trả lời', () => startReply(m)));
+  if (canForward(m)) actions.append(menuButton('Chuyển tiếp', () => openForward(m)));
   if (!m.media && m.text) actions.append(menuButton('Sao chép', () => copyText(m.text)));
   if (m.outgoing) actions.append(menuButton('Thu hồi', () => recallMessage(m), 'danger'));
+  const remove = menuButton('Xóa', () => deleteForMe(m), 'danger');
+  remove.title = 'Xóa ở phía bạn (người khác vẫn thấy)';
+  actions.append(remove);
   box.append(row, actions);
   document.body.append(box);
   const at = anchor.getBoundingClientRect();
@@ -1061,7 +1065,8 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  if (!$('add-friend').hidden) closeAddFriend();
+  if (!$('forward').hidden) closeForward();
+  else if (!$('add-friend').hidden) closeAddFriend();
   else if (picker) closePicker();
   else if (panelKind) closePanel();
   else if (info.thread && $('viewer').hidden) closeInfo();
@@ -1117,6 +1122,143 @@ async function recallMessage(m) {
 }
 
 $('reply-cancel').addEventListener('click', cancelReply);
+
+// ------------------------------------------------- forwarding and deleting
+
+/** Media the gateway can forward (texts and links through Zalo, the rest sent again). */
+const FORWARDABLE = ['link', 'sticker', 'image', 'gif', 'video', 'audio', 'file'];
+
+function canForward(m) {
+  if (!canReact(m)) return false;
+  return m.media ? FORWARDABLE.includes(m.media.kind) : m.kind === 'webchat';
+}
+
+const forwarding = { message: null, chosen: new Set() };
+const FORWARD_MAX = 20;
+
+/** Where a message can go: recent conversations, then friends, then groups. */
+function forwardTargets() {
+  const out = [];
+  const seen = new Set();
+  const add = (id, name, picture, sub) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    out.push({ id, name, picture, sub });
+  };
+  const recent = [...state.threads.values()]
+    .filter((t) => t.last_message_at > 0)
+    .sort((a, b) => b.last_message_at - a.last_message_at);
+  for (const t of recent) add(t.id, threadName(t), t.avatar, t.kind === 'group' ? membersText(t) : '');
+  for (const p of friendList()) add(`zalo:u:${p.uid}`, personName(p), p.avatar, 'Bạn bè');
+  for (const t of groupList()) add(t.id, threadName(t), t.avatar, membersText(t));
+  return out;
+}
+
+function openForward(m) {
+  forwarding.message = m;
+  forwarding.chosen = new Set();
+  $('forward-search').value = '';
+  $('forward-preview').textContent = m.media ? m.text : displayText(m.text);
+  renderForwardList();
+  $('forward').hidden = false;
+  $('forward-search').focus();
+}
+
+function closeForward() {
+  $('forward').hidden = true;
+  forwarding.message = null;
+}
+
+function renderForwardList() {
+  const q = fold($('forward-search').value.trim());
+  const ul = $('forward-list');
+  ul.replaceChildren();
+  const list = forwardTargets().filter((x) => !q || fold(x.name).includes(q)).slice(0, 300);
+  if (!list.length) ul.append(el('li', 'list-empty', 'Không tìm thấy hội thoại'));
+  const full = forwarding.chosen.size >= FORWARD_MAX;
+  for (const x of list) {
+    const chosen = forwarding.chosen.has(x.id);
+    const li = el('li', chosen ? 'forward-item chosen' : 'forward-item');
+    const box = el('input');
+    box.type = 'checkbox';
+    box.checked = chosen;
+    box.disabled = full && !chosen;
+    box.tabIndex = -1;
+    box.setAttribute('aria-label', x.name);
+    const body = el('div', 'body');
+    body.append(el('div', 'name', x.name));
+    if (x.sub) body.append(el('div', 'preview', x.sub));
+    li.append(box, avatarBox(x.id, x.name, x.picture), body);
+    li.addEventListener('click', () => {
+      if (forwarding.chosen.has(x.id)) forwarding.chosen.delete(x.id);
+      else if (!full) forwarding.chosen.add(x.id);
+      renderForwardList();
+    });
+    ul.append(li);
+  }
+  const n = forwarding.chosen.size;
+  const send = $('forward-send');
+  send.disabled = !n;
+  send.textContent = n ? `Chuyển tiếp (${n})` : 'Chuyển tiếp';
+}
+
+async function sendForward() {
+  const m = forwarding.message;
+  if (!m || !forwarding.chosen.size) return;
+  const send = $('forward-send');
+  send.disabled = true;
+  try {
+    const data = await api(`/threads/${encodeURIComponent(m.thread_id)}/messages/${m.seq}/forward`, {
+      json: { to: [...forwarding.chosen] },
+    });
+    const results = data.results || [];
+    for (const r of results) {
+      if (r.message) onMessage({ message: r.message, thread: null });
+      if (r.upload) adoptUpload(r.upload);
+    }
+    closeForward();
+    const failed = results.filter((r) => r.error);
+    if (!failed.length) toast(`Đã chuyển tiếp tới ${results.length} hội thoại`);
+    else toast(`Chuyển tiếp được ${results.length - failed.length}/${results.length}: ${failed[0].error}`);
+  } catch (err) {
+    send.disabled = false;
+    handleError(err, 'Không chuyển tiếp được: ');
+  }
+}
+
+$('forward-search').addEventListener('input', renderForwardList);
+$('forward-cancel').addEventListener('click', closeForward);
+$('forward-send').addEventListener('click', sendForward);
+$('forward').addEventListener('click', (e) => {
+  if (e.target === $('forward')) closeForward();
+});
+
+async function deleteForMe(m) {
+  if (!window.confirm('Xóa tin nhắn này ở phía bạn? Người khác trong cuộc trò chuyện vẫn thấy tin.')) return;
+  try {
+    await api(`/threads/${encodeURIComponent(m.thread_id)}/messages/${m.seq}`, { method: 'DELETE' });
+    removeMessage(m.thread_id, m.seq, null);
+  } catch (err) {
+    handleError(err, 'Không xóa được: ');
+  }
+}
+
+/** A message deleted for this account: gone from the list and the preview. */
+function removeMessage(threadId, seq, thread) {
+  if (thread) {
+    const t = state.threads.get(threadId);
+    state.threads.set(threadId, Object.assign(t || {}, thread));
+  }
+  if (threadId === state.current) {
+    const i = state.messages.findIndex((x) => x.seq === seq);
+    if (i >= 0) {
+      state.messages.splice(i, 1);
+      renderMessages(false);
+    }
+  }
+  if (state.replyTo && state.replyTo.seq === seq) cancelReply();
+  renderThreads();
+}
 
 async function react(m, icon) {
   try {
@@ -2165,10 +2307,24 @@ async function cancelUpload(entry) {
   scheduleUploads();
 }
 
+/** Follow an upload this page did not start (a forwarded file, another tab). */
+function adoptUpload(u) {
+  serverUploads.set(u.id, newerUpload(serverUploads.get(u.id), u));
+  const tracked = [...uploads.values()].some((entry) => entry.id === u.id);
+  if (!tracked && (UPLOAD_RANK[u.state] ?? 3) < 3) {
+    uploads.set(u.id, {
+      key: u.id, id: u.id, thread_id: u.thread_id, name: u.name, size: u.size,
+      phase: 'server', loaded: u.size, xhr: null, localError: '',
+    });
+  }
+  scheduleUploads();
+}
+
 /** An `upload` event from the gateway. */
 function onUpload(payload) {
   const u = payload && payload.upload;
   if (!u) return;
+  if (![...uploads.values()].some((entry) => entry.id === u.id)) adoptUpload(u);
   serverUploads.set(u.id, newerUpload(serverUploads.get(u.id), u));
   for (const entry of uploads.values()) {
     if (entry.id === u.id) settleUpload(entry);
@@ -2375,6 +2531,11 @@ function openStream() {
   state.stream = es;
   es.addEventListener('message', (e) => { track(e); onMessage(JSON.parse(e.data)); });
   es.addEventListener('message_updated', (e) => { track(e); onMessageUpdated(JSON.parse(e.data)); });
+  es.addEventListener('message_deleted', (e) => {
+    track(e);
+    const p = JSON.parse(e.data);
+    removeMessage(p.thread_id, p.seq, p.thread);
+  });
   es.addEventListener('status', (e) => { track(e); onStatus(JSON.parse(e.data)); });
   // Upload progress and typing: not in the event log, so no id to track.
   es.addEventListener('upload', (e) => onUpload(JSON.parse(e.data)));

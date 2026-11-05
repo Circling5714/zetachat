@@ -25,6 +25,8 @@ use zeta_zalo::upload::FileLimits;
 type SeenLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
 /// Users the connector was asked to look up, per request.
 type AskedLog = Arc<Mutex<Vec<Vec<String>>>>;
+/// Messages deleted for this account: (message id, owner id).
+type DeletedLog = Arc<Mutex<Vec<(String, String)>>>;
 
 struct Fixture {
     app: Router,
@@ -34,11 +36,19 @@ struct Fixture {
     seen: SeenLog,
     /// Users the connector was asked to look up.
     asked: AskedLog,
+    deleted: DeletedLog,
+    media: Arc<MediaCache>,
     status: Arc<std::sync::RwLock<ZaloStatus>>,
 }
 
 /// A connector that "sends" by storing the message, like the real one does.
-fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog, asked: AskedLog) -> ZaloHandle {
+fn fake_connector(
+    store: Arc<Store>,
+    bus: EventBus,
+    seen: SeenLog,
+    asked: AskedLog,
+    deleted: DeletedLog,
+) -> ZaloHandle {
     let (commands, mut rx) = mpsc::channel(8);
     let handle = ZaloHandle::new(commands);
     // Small limits, so the tests can go over them.
@@ -186,6 +196,47 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog, asked: AskedL
                     seen.lock().unwrap().push((remote_id, ids));
                 }
                 ZaloCommand::Typing { .. } => {}
+                ZaloCommand::Forward {
+                    kind,
+                    remote_id,
+                    text,
+                    reply,
+                } => {
+                    let thread = ThreadUpsert {
+                        kind,
+                        remote_id,
+                        name: String::new(),
+                        avatar: String::new(),
+                    };
+                    store.upsert_thread(&thread, false).unwrap();
+                    let message = store
+                        .insert_message(&NewMessage {
+                            thread_id: thread.id(),
+                            remote_id: format!("srv-{sent}"),
+                            client_id: format!("{sent}"),
+                            sender_id: "me".into(),
+                            sender_name: String::new(),
+                            outgoing: true,
+                            kind: "webchat".into(),
+                            text,
+                            media: None,
+                            quote: None,
+                            sent_at: 10,
+                            raw: "{}".into(),
+                        })
+                        .unwrap()
+                        .unwrap();
+                    let _ = reply.send(Ok(message));
+                }
+                ZaloCommand::DeleteForMe {
+                    message_id,
+                    owner_id,
+                    reply,
+                    ..
+                } => {
+                    deleted.lock().unwrap().push((message_id, owner_id));
+                    let _ = reply.send(Ok(()));
+                }
                 // The answer says what was asked.
                 ZaloCommand::Friends { action, reply } => {
                     let _ = reply.send(Ok(json!({ "action": format!("{action:?}") })));
@@ -290,16 +341,24 @@ fn fixture() -> Fixture {
     let bus = EventBus::new(store.clone());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let asked = Arc::new(Mutex::new(Vec::new()));
-    let zalo = fake_connector(store.clone(), bus.clone(), seen.clone(), asked.clone());
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let zalo = fake_connector(
+        store.clone(),
+        bus.clone(),
+        seen.clone(),
+        asked.clone(),
+        deleted.clone(),
+    );
     let status = zalo.status.clone();
     let (_, token) = store.add_device("test").unwrap();
     let dir = std::env::temp_dir().join(format!("zetachat-api-{:016x}", rand::random::<u64>()));
     let uploads = Arc::new(Uploads::new(dir.join("uploads"), bus.clone()).unwrap());
+    let media = Arc::new(MediaCache::new(dir.join("media")).unwrap());
     let app = api::router(AppState {
         store: store.clone(),
         bus,
         zalo,
-        media: Arc::new(MediaCache::new(dir.join("media")).unwrap()),
+        media: media.clone(),
         uploads,
     });
     Fixture {
@@ -308,6 +367,8 @@ fn fixture() -> Fixture {
         token,
         seen,
         asked,
+        deleted,
+        media,
         status,
     }
 }
@@ -1065,4 +1126,142 @@ async fn friends_side_is_checked_then_handed_to_the_connector() {
     assert_eq!(rejected["action"], "Reject(\"34\")");
     let (status, _) = call(&f, "POST", "/api/v1/friends/requests/x/accept", None, true).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn messages_are_forwarded_and_deleted_for_me() {
+    let f = fixture();
+    let lan = ThreadUpsert {
+        kind: ThreadKind::User,
+        remote_id: "61".into(),
+        name: "Lan".into(),
+        avatar: String::new(),
+    };
+    f.store.upsert_thread(&lan, true).unwrap();
+    let from = lan.id();
+    let add = |remote: &str, kind: &str, text: &str, media: Option<Media>, raw: &str| {
+        f.store
+            .insert_message(&NewMessage {
+                thread_id: from.clone(),
+                remote_id: remote.into(),
+                client_id: format!("c-{remote}"),
+                sender_id: "61".into(),
+                sender_name: "Lan".into(),
+                outgoing: false,
+                kind: kind.into(),
+                text: text.into(),
+                media,
+                quote: None,
+                sent_at: 1,
+                raw: raw.into(),
+            })
+            .unwrap()
+            .unwrap()
+            .seq
+    };
+    let group = thread_id(ThreadKind::Group, "62");
+    let other = thread_id(ThreadKind::User, "63");
+    let forward = |seq: i64| format!("/api/v1/threads/{from}/messages/{seq}/forward");
+
+    let text = add("m1", "webchat", "chào nhé", None, "{}");
+    let to = json!({ "to": [group, other, group, "nowhere"] });
+    let (status, body) = call(&f, "POST", &forward(text), Some(to), true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["to"], group);
+    assert_eq!(results[0]["message"]["text"], "chào nhé");
+    assert_eq!(results[1]["message"]["thread_id"], other);
+
+    let sticker = add(
+        "m2",
+        "chat.sticker",
+        "[Nhãn dán]",
+        Some(Media {
+            kind: "sticker".into(),
+            url: "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=21300&size=130".into(),
+            ..Media::default()
+        }),
+        r#"{"content":{"id":21300,"catId":10,"type":7}}"#,
+    );
+    let (_, body) = call(
+        &f,
+        "POST",
+        &forward(sticker),
+        Some(json!({ "to": [group] })),
+        true,
+    )
+    .await;
+    assert_eq!(body["results"][0]["message"]["kind"], "chat.sticker");
+
+    let url = "https://f.zdn.vn/bao-cao.pdf";
+    f.media
+        .insert(url, b"%PDF-1.4 tiny", "application/pdf")
+        .await
+        .unwrap();
+    let file = add(
+        "m3",
+        "share.file",
+        "[Tập tin] bao-cao.pdf",
+        Some(Media {
+            kind: "file".into(),
+            url: url.into(),
+            name: "bao-cao.pdf".into(),
+            size: 13,
+            ..Media::default()
+        }),
+        "{}",
+    );
+    let (status, body) = call(
+        &f,
+        "POST",
+        &forward(file),
+        Some(json!({ "to": [group] })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let upload = &body["results"][0]["upload"];
+    assert_eq!(
+        (upload["name"].as_str(), upload["kind"].as_str()),
+        (Some("bao-cao.pdf"), Some("file"))
+    );
+    assert_eq!(upload["thread_id"], group);
+
+    let place = add("m4", "chat.location.new", "[Vị trí]", None, "{}");
+    let (status, _) = call(
+        &f,
+        "POST",
+        &forward(place),
+        Some(json!({ "to": [group] })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(&f, "POST", &forward(text), Some(json!({ "to": [] })), true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Deleted for me: gone here, and Zalo was told whose message it was.
+    let uri = format!("/api/v1/threads/{from}/messages/{text}");
+    let (status, _) = call(&f, "DELETE", &uri, None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(f.store.message(text).unwrap().is_none());
+    assert_eq!(
+        *f.deleted.lock().unwrap(),
+        [("m1".to_string(), "61".to_string())]
+    );
+    let (status, _) = call(&f, "DELETE", &uri, None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // A message Zalo never confirmed is only deleted here.
+    let local = add("local:9", "webchat", "chưa gửi", None, "{}");
+    let (status, _) = call(
+        &f,
+        "DELETE",
+        &format!("/api/v1/threads/{from}/messages/{local}"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f.deleted.lock().unwrap().len(), 1);
 }

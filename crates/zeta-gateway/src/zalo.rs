@@ -171,6 +171,24 @@ pub enum ZaloCommand {
         sticker: Sticker,
         reply: oneshot::Sender<Result<Message, String>>,
     },
+    /// Forward a text (or a link) to a conversation; answers with the stored
+    /// message.
+    Forward {
+        kind: ThreadKind,
+        remote_id: String,
+        text: String,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
+    /// Delete a message for this account only (on every device of it).
+    DeleteForMe {
+        kind: ThreadKind,
+        remote_id: String,
+        message_id: String,
+        message_client_id: String,
+        /// Who sent it: this account's uid for its own messages.
+        owner_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Who is in a group, asked of Zalo now.
     GroupMembers {
         group_id: String,
@@ -943,6 +961,68 @@ impl Connector {
                     let _ = reply.send(lookup_people(&client, &store, &uids).await);
                 });
             }
+            ZaloCommand::Forward {
+                kind,
+                remote_id,
+                text,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                let self_uid = self.self_uid.clone();
+                tokio::spawn(async move {
+                    let info = json!({ "message": text });
+                    let result = match client.forward(recipient(kind, &remote_id), 1, &info).await {
+                        Ok(sent) => {
+                            let sent = Sent {
+                                msg_id: sent.msg_id,
+                                client_id: sent.client_id,
+                                msg_type: "webchat",
+                                text,
+                                media: None,
+                                quote: None,
+                                raw: None,
+                            };
+                            store_sent(&store, &bus, &self_uid, kind, &remote_id, sent)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = reply.send(result);
+                });
+            }
+            ZaloCommand::DeleteForMe {
+                kind,
+                remote_id,
+                message_id,
+                message_client_id,
+                owner_id,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let owner = if owner_id.is_empty() {
+                    self.self_uid.clone()
+                } else {
+                    owner_id
+                };
+                tokio::spawn(async move {
+                    let result = client
+                        .delete_for_me(
+                            recipient(kind, &remote_id),
+                            &message_id,
+                            &message_client_id,
+                            &owner,
+                        )
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = reply.send(result);
+                });
+            }
             ZaloCommand::GroupMembers { group_id, reply } => {
                 let Some(client) = self.client.clone() else {
                     let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
@@ -1003,6 +1083,14 @@ impl Connector {
                                 text: "[Nhãn dán]".into(),
                                 media: found,
                                 quote: None,
+                                raw: Some(json!({
+                                    "msgType": "chat.sticker",
+                                    "content": {
+                                        "id": sticker.id,
+                                        "catId": sticker.cate_id,
+                                        "type": sticker.kind,
+                                    },
+                                })),
                             };
                             store_sent(&store, &bus, &self_uid, kind, &remote_id, sent)
                         }
@@ -1552,6 +1640,9 @@ struct Sent {
     text: String,
     media: Option<Media>,
     quote: Option<Quote>,
+    /// Zalo-shaped JSON of what was sent, when worth keeping (a sticker's
+    /// ids, so it can be forwarded).
+    raw: Option<Value>,
 }
 
 /// This account, as a sender.
@@ -1595,7 +1686,7 @@ fn store_sent(
         media: sent.media,
         quote: sent.quote,
         sent_at: now_ms(),
-        raw: "{}".into(),
+        raw: sent.raw.map_or_else(|| "{}".to_string(), |v| v.to_string()),
     };
     store
         .upsert_thread(&thread, false)
@@ -1649,6 +1740,7 @@ async fn send_and_store(
         text: text.to_string(),
         media: None,
         quote,
+        raw: None,
     };
     store_sent(store, bus, &me.uid, kind, remote_id, sent)
 }
@@ -1753,6 +1845,7 @@ impl AttachmentSender {
                     ..Media::default()
                 }),
                 quote: None,
+                raw: None,
             }
         } else {
             let uploaded = self
@@ -1790,6 +1883,7 @@ impl AttachmentSender {
                     ..Media::default()
                 }),
                 quote: None,
+                raw: None,
             }
         };
         store_sent(

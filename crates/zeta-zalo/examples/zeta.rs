@@ -30,6 +30,7 @@ Cách dùng:
   zeta people  <session.json>                    hỏi tên, ảnh của thành viên nhóm không phải bạn bè (chỉ in số đếm)
   zeta stickers <session.json> [packs | pack <id> | search <từ khóa>]   kho nhãn dán của Zalo
   zeta friend  <session.json> [requests | status [uid] | find <số>]     lời mời kết bạn, quan hệ, tìm theo số (chỉ đọc)
+  zeta forward <session.json> user|group <id> <msgType> <msgInfo JSON | @tệp>   chuyển tiếp qua mforward
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
   zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
         Some("people") => people(rest).await,
         Some("stickers") => stickers(rest).await,
         Some("friend") => friend(rest).await,
+        Some("forward") => forward(rest).await,
         Some("recent") => recent(rest).await,
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
@@ -164,6 +166,40 @@ async fn groups(args: &[String]) -> Result<()> {
         for g in &list {
             println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
         }
+    }
+    Ok(())
+}
+
+/// Forward through `mforward`: `msgInfo` is JSON given inline or read from a
+/// file (`@path`). Prints whether Zalo took it, not the content.
+async fn forward(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let (kind, id) = (
+        args.get(1).context("thiếu user|group")?,
+        args.get(2).context("thiếu id")?,
+    );
+    let to = match kind.as_str() {
+        "user" => Recipient::User(id),
+        "group" => Recipient::Group(id),
+        other => bail!("không hiểu \"{other}\": user | group"),
+    };
+    let msg_type: i64 = args.get(3).context("thiếu msgType")?.parse()?;
+    let info = args.get(4).context("thiếu msgInfo")?;
+    let info = match info.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => info.clone(),
+    };
+    let info: serde_json::Value = serde_json::from_str(&info)?;
+    match client.forward(to, msg_type, &info).await {
+        Ok(sent) => println!(
+            "Zalo nhận: msgId {}",
+            if sent.msg_id.is_empty() {
+                "trống"
+            } else {
+                "có"
+            }
+        ),
+        Err(e) => println!("Zalo không nhận: {e}"),
     }
     Ok(())
 }

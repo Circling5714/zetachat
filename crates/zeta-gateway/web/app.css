@@ -120,6 +120,36 @@ a.btn { display: inline-block; text-decoration: none; }
 .request-actions { display: flex; gap: 6px; margin-top: 6px; }
 .small-btn { padding: 4px 12px; border-radius: 8px; font-size: 13px; }
 .add-card { width: min(400px, 100%); display: grid; gap: 12px; }
+.forward-card {
+  width: min(440px, 100%);
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.forward-card h2 { margin: 0; text-align: center; }
+.forward-card .row { justify-content: flex-end; }
+.forward-preview {
+  padding: 8px 10px;
+  border-left: 3px solid var(--primary);
+  border-radius: 8px;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.forward-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; min-height: 120px; flex: 1; }
+.forward-item { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 10px; cursor: pointer; }
+.forward-item:hover { background: var(--hover); }
+.forward-item.chosen { background: var(--active); }
+.forward-item input { flex: none; width: 18px; height: 18px; pointer-events: none; }
+.forward-item .avatar { width: 36px; height: 36px; font-size: 13px; }
+.forward-item .body { flex: 1; min-width: 0; }
+.forward-item .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.forward-item .preview { font-size: 12px; color: var(--muted); }
 .add-card h2 { margin: 0; text-align: center; }
 .find-row { display: flex; gap: 8px; }
 .find-none { margin: 0; text-align: center; font-size: 14px; }
@@ -408,7 +438,7 @@ a.btn { display: inline-block; text-decoration: none; }
 .react-row button:hover, .react-row button:focus-visible { transform: scale(1.25); background: var(--hover); outline: none; }
 .react-row .remove { font-size: 13px; color: var(--muted); padding: 6px 9px; border-radius: 999px; }
 .react-row .remove:hover { transform: none; color: var(--danger); }
-.menu-actions { display: flex; gap: 2px; border-top: 1px solid var(--border); padding-top: 4px; }
+.menu-actions { display: flex; flex-wrap: wrap; gap: 2px; border-top: 1px solid var(--border); padding-top: 4px; max-width: 320px; }
 .menu-actions button {
   border: 0;
   border-radius: 8px;

@@ -133,6 +133,12 @@ Theo ctdozlite (chép từ Zalo PC), host là `sticker` trong bảng dịch vụ
 - Lời mời đang chờ: `GET /api/friend/recommendsv2/list` với `{ imei }`. Lời mời là các mục có `dataInfo.recommType` bằng 2 (1 là gợi ý kết bạn), lời nhắn ở `dataInfo.recommInfo.message`. Đã gọi được, nhưng tài khoản thử chưa có lời mời nào, nên chưa thấy dữ liệu thật.
 - Gửi lời mời `POST /api/friend/sendreq` (`{ toid, msg, reqsrc: 30, imei, language }`), đồng ý `POST /api/friend/accept` (`{ fid, language }`), từ chối `POST /api/friend/reject` (`{ fid, imei }`): chưa thử, vì sẽ tác động tới người thật.
 
+## 8h. Chuyển tiếp và xóa ở phía mình (đã kiểm chứng)
+
+Chuyển tiếp: `POST {file}/api/message/mforward` (nhóm: `{file}/api/group/mforward`) như zca-js `forwardMessage`, với `toIds: [{ clientId, toUid, ttl }]` và `imei` (nhóm: `grids: [{ clientId, grid, ttl }]`, không có `imei`), `ttl`, `msgType` (chuỗi), `totalIds`, `msgInfo` (chuỗi JSON `{ message }`) và `decorLog: "null"`. Kết quả gồm `success: [{ clientId, msgId }]` và `fail: [{ clientId, error_code }]`. Đã thử vào Cloud: tin chữ đi được. Với ảnh (`msgType` 32) và tệp (46), đưa nội dung gốc của tin vào `msgInfo` thì Zalo trả mã 114 "Tham số không hợp lệ". Vì vậy gateway gửi lại ảnh, video, tin nhắn thoại và tệp từ bản nó giữ (đã thử với một ảnh 6 MB) và gửi lại nhãn dán theo id.
+
+Xóa ở phía mình: `POST {chat}/api/message/delete` (nhóm: `{group}/api/group/deletemsg`) với `toid` hoặc `grid`, `cliMsgId` mới, `msgs: [{ cliMsgId, globalMsgId, ownerId, destId }]`, `onlyMe: 1`; chat 1-1 thêm `imei`. Đã thử trong Cloud: Zalo nhận, tin không quay lại.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

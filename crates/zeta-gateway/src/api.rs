@@ -28,7 +28,7 @@ use zeta_zalo::sticker::Sticker;
 
 use crate::auth::AuthDevice;
 use crate::events::EventBus;
-use crate::media_cache::{self, FetchError, MediaCache};
+use crate::media_cache::{self, CachedFile, FetchError, MediaCache};
 use crate::model::{
     now_ms, split_thread_id, GroupMembers, Message, Person, StoredEvent, Thread, ThreadKind,
     PEOPLE_FRESH_MS,
@@ -118,6 +118,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/threads/{id}/messages/{seq}/reactions", post(react))
         .route("/api/v1/threads/{id}/messages/{seq}/recall", post(recall))
+        .route(
+            "/api/v1/threads/{id}/messages/{seq}/forward",
+            post(forward_message),
+        )
+        .route(
+            "/api/v1/threads/{id}/messages/{seq}",
+            delete(delete_message),
+        )
         .route("/api/v1/uploads", get(list_uploads))
         .route("/api/v1/uploads/{id}", delete(cancel_upload))
         .route("/api/v1/threads/{id}/read", post(mark_read))
@@ -563,6 +571,15 @@ async fn send_sticker(
     if sticker.id == 0 {
         return Err(ApiError::bad_request("sticker id is missing"));
     }
+    Ok(Json(ask_send_sticker(&st, kind, remote_id, sticker).await?))
+}
+
+async fn ask_send_sticker(
+    st: &AppState,
+    kind: ThreadKind,
+    remote_id: &str,
+    sticker: Sticker,
+) -> Result<Message, ApiError> {
     let (reply, answer) = oneshot::channel();
     st.zalo
         .commands
@@ -578,7 +595,7 @@ async fn send_sticker(
         .await
         .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
         .map_err(ApiError::bad_gateway)?;
-    Ok(Json(message))
+    Ok(message)
 }
 
 #[derive(Deserialize)]
@@ -753,6 +770,315 @@ async fn recall(
         .map_err(ApiError::bad_gateway)?;
     let now = st.store.message(seq).map_err(ApiError::internal)?;
     Ok(Json(now.unwrap_or(message)))
+}
+
+/// What forwarding a message takes.
+enum Forwardable {
+    /// A text, or the address of a shared link: Zalo's own forward.
+    Text(String),
+    Sticker(Sticker),
+    /// A photo, video, voice message or file: sent again from the gateway's
+    /// copy (Zalo's forward refuses them as zca-js would send them).
+    File {
+        url: String,
+        name: String,
+        kind: String,
+        width: u32,
+        height: u32,
+    },
+}
+
+/// The sticker of a message: from its Zalo JSON, else from its picture's
+/// address (stickers sent before their ids were kept).
+fn sticker_in(raw: &Value, url: &str) -> Option<Sticker> {
+    let content = raw.get("content");
+    let number = |key: &str| {
+        content
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
+    };
+    if let Some(id) = number("id").filter(|id| *id > 0) {
+        return Some(Sticker {
+            id,
+            cate_id: number("catId").unwrap_or(0),
+            kind: number("type")
+                .and_then(|t| u32::try_from(t).ok())
+                .filter(|t| *t > 0)
+                .unwrap_or(7),
+        });
+    }
+    let id = url.split("eid=").nth(1)?.split('&').next()?.parse().ok()?;
+    Some(Sticker {
+        id,
+        cate_id: 0,
+        kind: 7,
+    })
+}
+
+fn forwardable(m: &Message, raw: &Value) -> Option<Forwardable> {
+    let Some(md) = &m.media else {
+        let text = m.text.trim();
+        return (m.kind == "webchat" && !text.is_empty())
+            .then(|| Forwardable::Text(text.to_string()));
+    };
+    match md.kind.as_str() {
+        "link" if md.url.starts_with("http") => Some(Forwardable::Text(md.url.clone())),
+        "sticker" => sticker_in(raw, &md.url).map(Forwardable::Sticker),
+        "image" | "gif" | "video" | "audio" | "file" if !md.url.is_empty() => {
+            Some(Forwardable::File {
+                url: md.url.clone(),
+                name: md.name.trim().to_string(),
+                kind: md.kind.clone(),
+                width: md.width,
+                height: md.height,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A file name for media that came without one.
+fn forward_name(name: &str, kind: &str, content_type: &str) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    let ext = match content_type {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "video/mp4" => "mp4",
+        t if t.starts_with("audio/") => "aac",
+        t if t.starts_with("image/") => "jpg",
+        t if t.starts_with("video/") => "mp4",
+        _ => "bin",
+    };
+    let stem = match kind {
+        "image" | "gif" => "anh",
+        "video" => "video",
+        "audio" => "ghi-am",
+        _ => "tep",
+    };
+    format!("{stem}-zetachat.{ext}")
+}
+
+async fn forward_text(
+    st: &AppState,
+    kind: ThreadKind,
+    remote_id: &str,
+    text: &str,
+) -> Result<Message, ApiError> {
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Forward {
+            kind,
+            remote_id: remote_id.to_string(),
+            text: text.to_string(),
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)
+}
+
+/// Send a file the gateway has as a new upload to a conversation.
+async fn forward_file(
+    st: &AppState,
+    (kind, remote_id, thread): (ThreadKind, &str, &str),
+    src: &CachedFile,
+    name: &str,
+    image: bool,
+    (width, height): (u32, u32),
+) -> Result<Upload, ApiError> {
+    if st.uploads.pending() >= MAX_PENDING {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "đang có nhiều tệp chờ gửi, hãy đợi một chút",
+        ));
+    }
+    let limits = st.zalo.limits();
+    let file = st
+        .uploads
+        .spool_copy(&src.path, limits.max_file_bytes)
+        .await
+        .map_err(|e| match e {
+            SpoolError::TooLarge(limit) => too_large(limit),
+            SpoolError::Empty => ApiError::bad_request("file is empty"),
+            other => ApiError::internal(other),
+        })?;
+    let mime = src.content_type.to_string();
+    let photo = image && photo_type(&mime) && file.size <= limits.max_photo_bytes;
+    let (size, md5) = (file.size, file.md5.clone());
+    let job = st.uploads.register(file, thread, name, photo);
+    let attachment = Attachment {
+        name: name.to_string(),
+        mime,
+        path: job.path().to_path_buf(),
+        size,
+        md5,
+        width,
+        height,
+        caption: String::new(),
+        photo,
+    };
+    let command = ZaloCommand::SendAttachment {
+        kind,
+        remote_id: remote_id.to_string(),
+        attachment,
+        job: job.clone(),
+    };
+    if st.zalo.commands.send(command).await.is_err() {
+        job.finish(Err("Zalo connector is not running".into()));
+        job.remove_file().await;
+        return Err(ApiError::unavailable("Zalo connector is not running"));
+    }
+    Ok(job.snapshot())
+}
+
+#[derive(Deserialize)]
+struct ForwardBody {
+    /// Conversations to forward to (at most 20).
+    to: Vec<String>,
+}
+
+/// Forward a message to conversations: `{ "results": [{ "to", "message" |
+/// "upload" | "error" }] }`, one per conversation. Texts and links go through
+/// Zalo's forward, stickers are sent again; photos, videos, voice messages and
+/// files are sent again from the gateway's copy, as uploads to follow.
+async fn forward_message(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, seq)): Path<(String, i64)>,
+    Json(body): Json<ForwardBody>,
+) -> ApiResult<Value> {
+    let message = message_in(&st, &id, seq)?;
+    if !actionable(&message) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "tin này chưa chuyển tiếp được",
+        ));
+    }
+    let mut targets: Vec<String> = Vec::new();
+    for target in body.to {
+        if split_thread_id(&target).is_some() && !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    if targets.is_empty() {
+        return Err(ApiError::bad_request("chọn ít nhất một hội thoại"));
+    }
+    if targets.len() > 20 {
+        return Err(ApiError::bad_request(
+            "chuyển tiếp tối đa 20 hội thoại một lần",
+        ));
+    }
+    let raw = st.store.message_raw(seq).map_err(ApiError::internal)?;
+    let what = forwardable(&message, &raw)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "chưa chuyển tiếp được loại tin này"))?;
+    // A file is fetched once, then each conversation gets its own copy.
+    let cached = match &what {
+        Forwardable::File { url, .. } => Some(st.media.get(url).await.map_err(|e| match e {
+            FetchError::TooLarge => ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "tệp lớn hơn 256 MB, gateway không giữ để chuyển tiếp được",
+            ),
+            other => ApiError::bad_gateway(other.to_string()),
+        })?),
+        _ => None,
+    };
+    let mut results = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let Some((kind, remote_id)) = split_thread_id(target) else {
+            continue;
+        };
+        let outcome = match (&what, &cached) {
+            (Forwardable::Text(text), _) => forward_text(&st, kind, remote_id, text)
+                .await
+                .map(|m| json!({ "message": m })),
+            (Forwardable::Sticker(sticker), _) => ask_send_sticker(&st, kind, remote_id, *sticker)
+                .await
+                .map(|m| json!({ "message": m })),
+            (
+                Forwardable::File {
+                    name,
+                    kind: media_kind,
+                    width,
+                    height,
+                    ..
+                },
+                Some(file),
+            ) => {
+                let name = forward_name(name, media_kind, file.content_type);
+                forward_file(
+                    &st,
+                    (kind, remote_id, target),
+                    file,
+                    &name,
+                    media_kind == "image",
+                    (*width, *height),
+                )
+                .await
+                .map(|u| json!({ "upload": u }))
+            }
+            (Forwardable::File { .. }, None) => Err(ApiError::internal("file not fetched")),
+        };
+        results.push(match outcome {
+            Ok(mut v) => {
+                v["to"] = json!(target);
+                v
+            }
+            Err(e) => json!({ "to": target, "error": e.message }),
+        });
+    }
+    Ok(Json(json!({ "results": results })))
+}
+
+/// Delete a message for this account only: gone here and, through Zalo, on
+/// the account's other devices; the others in the chat still see it. Clients
+/// hear of it as `message_deleted`.
+async fn delete_message(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, seq)): Path<(String, i64)>,
+) -> ApiResult<Value> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let message = message_in(&st, &id, seq)?;
+    // A message Zalo never confirmed is only here.
+    if !message.remote_id.starts_with("local:") {
+        let (reply, answer) = oneshot::channel();
+        st.zalo
+            .commands
+            .send(ZaloCommand::DeleteForMe {
+                kind,
+                remote_id: remote_id.to_string(),
+                message_id: message.remote_id.clone(),
+                message_client_id: if message.client_id.is_empty() {
+                    "0".into()
+                } else {
+                    message.client_id.clone()
+                },
+                owner_id: message.sender_id.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+        answer
+            .await
+            .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+            .map_err(ApiError::bad_gateway)?;
+    }
+    st.store.delete_message(seq).map_err(ApiError::internal)?;
+    let thread = st.store.thread(&id).map_err(ApiError::internal)?;
+    st.bus
+        .publish(
+            "message_deleted",
+            json!({ "thread_id": id, "seq": seq, "thread": thread }),
+        )
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

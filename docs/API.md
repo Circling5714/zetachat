@@ -30,6 +30,8 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu. Thêm `"reply_to": <seq>` để trả lời một tin: tin mới mang `quote` của tin đó |
 | POST | `/threads/{id}/messages/{seq}/recall` | Thu hồi một tin mình đã gửi, với mọi người trong cuộc trò chuyện; trả về tin đã thành `chat.undo`. `409` với tin của người khác, tin chưa được Zalo xác nhận hoặc đã thu hồi |
+| POST | `/threads/{id}/messages/{seq}/forward` | Chuyển tiếp một tin `{ "to": ["zalo:u:…", "zalo:g:…"] }` (tối đa 20 hội thoại). Trả về `{ "results": [{ "to", "message" }, { "to", "upload" }, { "to", "error" }] }`, mỗi hội thoại một mục: tin chữ và liên kết đi bằng chức năng chuyển tiếp của Zalo, nhãn dán được gửi lại; ảnh, video, tin nhắn thoại và tệp được gateway gửi lại từ bản nó giữ, thành một lượt gửi tệp (`upload`) để theo dõi. `409` với loại tin chưa chuyển tiếp được (vị trí…) hoặc tin chưa được Zalo xác nhận |
+| DELETE | `/threads/{id}/messages/{seq}` | Xóa tin ở phía mình: mất khỏi gateway, và nhờ Zalo, khỏi các thiết bị khác của tài khoản; người khác vẫn thấy tin. Các client nhận sự kiện `message_deleted` |
 | POST | `/threads/{id}/messages/{seq}/reactions` | Thả cảm xúc `{ "icon": "/-heart" }`, một trong sáu biểu tượng Zalo cho dùng: `/-strong` 👍, `/-heart` ❤️, `:>` 😆, `:o` 😮, `:-((` 😭, `:-h` 😡. `icon` rỗng gỡ mọi cảm xúc của mình khỏi tin. Trả về tin kèm `reactions` mới; `409` với tin chưa được Zalo xác nhận hoặc đã thu hồi |
 | POST | `/threads/{id}/attachments?name=&caption=&width=&height=&as=` | Gửi ảnh hoặc tệp, xem mục "Gửi ảnh và tệp" bên dưới. Trả về `202` với `{ "upload": {…} }` |
 | GET | `/uploads` | Các lượt gửi tệp đang chạy và vừa xong (giữ 10 phút) |
@@ -91,6 +93,7 @@ Lượt gửi không sống qua lần khởi động lại gateway: tệp chưa 
 |---|---|
 | `message` | `{ "message": {…}, "thread": {…} }`: tin nhắn mới, đến hay đi |
 | `message_updated` | `{ "message": {…}, "thread": {…} }`: một tin đã lưu thay đổi (bị thu hồi, có cảm xúc mới); client thay tin có cùng `seq` |
+| `message_deleted` | `{ "thread_id", "seq", "thread" }`: một tin đã bị xóa ở phía mình; client bỏ tin có `seq` đó |
 | `thread_read` | `{ "thread_id": "…" }` |
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |
