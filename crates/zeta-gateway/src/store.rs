@@ -612,6 +612,22 @@ impl Store {
         Ok(Some(message))
     }
 
+    /// The original Zalo JSON of a message (`Null` for one sent from here).
+    pub fn message_raw(&self, seq: i64) -> Result<Value> {
+        let raw: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT raw FROM messages WHERE seq = ?1",
+                params![seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+            .unwrap_or(Value::Null))
+    }
+
     /// Store a reaction once (by its id, or by its sender's client id). Returns
     /// the stored messages it changed, with their reactions; a reaction to a
     /// message that is not stored is kept for when it is.

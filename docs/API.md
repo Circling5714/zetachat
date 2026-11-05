@@ -14,7 +14,8 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/status` | `zalo`: trạng thái phiên (`session` là `starting`, `logged_out`, `valid`, `rejected` hoặc `unknown`; `realtime`, `display_name`, `login`, `detail`). `last_event_seq`: số thứ tự sự kiện mới nhất, dùng làm `since` khi mở luồng sự kiện. `limits`: giới hạn gửi tệp Zalo đang áp dụng (`max_file_bytes`, `max_photo_bytes`, `blocked_extensions`) |
 | GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè chưa từng nhắn tin |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
-| POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu |
+| POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu. Thêm `"reply_to": <seq>` để trả lời một tin: tin mới mang `quote` của tin đó |
+| POST | `/threads/{id}/messages/{seq}/recall` | Thu hồi một tin mình đã gửi, với mọi người trong cuộc trò chuyện; trả về tin đã thành `chat.undo`. `409` với tin của người khác, tin chưa được Zalo xác nhận hoặc đã thu hồi |
 | POST | `/threads/{id}/messages/{seq}/reactions` | Thả cảm xúc `{ "icon": "/-heart" }`, một trong sáu biểu tượng Zalo cho dùng: `/-strong` 👍, `/-heart` ❤️, `:>` 😆, `:o` 😮, `:-((` 😭, `:-h` 😡. `icon` rỗng gỡ mọi cảm xúc của mình khỏi tin. Trả về tin kèm `reactions` mới; `409` với tin chưa được Zalo xác nhận hoặc đã thu hồi |
 | POST | `/threads/{id}/attachments?name=&caption=&width=&height=&as=` | Gửi ảnh hoặc tệp, xem mục "Gửi ảnh và tệp" bên dưới. Trả về `202` với `{ "upload": {…} }` |
 | GET | `/uploads` | Các lượt gửi tệp đang chạy và vừa xong (giữ 10 phút) |

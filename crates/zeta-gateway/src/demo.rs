@@ -302,6 +302,7 @@ struct Content<'a> {
     kind: &'a str,
     text: &'a str,
     media: Option<Media>,
+    quote: Option<Quote>,
 }
 
 fn store_and_publish(
@@ -336,7 +337,7 @@ fn store_and_publish(
             kind: content.kind.into(),
             text: content.text.into(),
             media: content.media,
-            quote: None,
+            quote: content.quote,
             sent_at: now,
             raw: "{}".into(),
         })
@@ -351,6 +352,7 @@ fn text(text: &str) -> Content<'_> {
         kind: "webchat",
         text,
         media: None,
+        quote: None,
     }
 }
 
@@ -421,6 +423,7 @@ async fn demo_upload(
                 kind: if a.photo { "chat.photo" } else { "share.file" },
                 text: &summary,
                 media: Some(found),
+                quote: None,
             };
             store_and_publish(store, bus, kind, remote_id, true, "", content)
                 .ok_or_else(|| "demo: không lưu được tin".to_string())
@@ -449,8 +452,18 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     kind,
                     remote_id,
                     text,
+                    reply_to,
                     reply,
                 } => {
+                    let quote = reply_to.map(|r| Quote {
+                        sender_name: if r.message.outgoing {
+                            "Demo".into()
+                        } else {
+                            r.message.sender_name
+                        },
+                        text: r.message.text,
+                        remote_id: r.message.remote_id,
+                    });
                     let sent = store_and_publish(
                         &store,
                         &bus,
@@ -458,7 +471,10 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                         &remote_id,
                         true,
                         "",
-                        self::text(&text),
+                        Content {
+                            quote,
+                            ..self::text(&text)
+                        },
                     );
                     let ok = sent.is_some();
                     let _ = reply.send(sent.ok_or_else(|| "demo: không lưu được tin".to_string()));
@@ -504,6 +520,26 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                             .await;
                         job.remove_file().await;
                     });
+                }
+                ZaloCommand::Recall {
+                    kind,
+                    remote_id,
+                    message_id,
+                    message_client_id,
+                    reply,
+                } => {
+                    let thread = thread_id(kind, &remote_id);
+                    let recalled = store
+                        .recall_message(&thread, &message_id, &message_client_id)
+                        .map_err(|e| e.to_string());
+                    if let Ok(Some(message)) = &recalled {
+                        let snapshot = store.thread(&thread).ok().flatten();
+                        let _ = bus.publish(
+                            "message_updated",
+                            json!({ "message": message, "thread": snapshot }),
+                        );
+                    }
+                    let _ = reply.send(recalled);
                 }
                 ZaloCommand::React {
                     kind,

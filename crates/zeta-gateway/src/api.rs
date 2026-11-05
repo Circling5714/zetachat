@@ -31,7 +31,7 @@ use crate::media_cache::{self, FetchError, MediaCache};
 use crate::model::{split_thread_id, Message, StoredEvent, Thread};
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
-use crate::zalo::{photo_type, Attachment, LoginState, ZaloCommand, ZaloHandle};
+use crate::zalo::{photo_type, Attachment, LoginState, ReplyTo, ZaloCommand, ZaloHandle};
 
 /// Shared state of the HTTP handlers.
 #[derive(Clone)]
@@ -109,6 +109,7 @@ pub fn router(state: AppState) -> Router {
             post(send_attachment).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/v1/threads/{id}/messages/{seq}/reactions", post(react))
+        .route("/api/v1/threads/{id}/messages/{seq}/recall", post(recall))
         .route("/api/v1/uploads", get(list_uploads))
         .route("/api/v1/uploads/{id}", delete(cancel_upload))
         .route("/api/v1/threads/{id}/read", post(mark_read))
@@ -263,6 +264,23 @@ async fn list_messages(
 #[derive(Deserialize)]
 struct SendBody {
     text: String,
+    /// `seq` of the message this one answers.
+    #[serde(default)]
+    reply_to: Option<i64>,
+}
+
+/// A message of thread `id` by its `seq`.
+fn message_in(st: &AppState, id: &str, seq: i64) -> Result<Message, ApiError> {
+    st.store
+        .message(seq)
+        .map_err(ApiError::internal)?
+        .filter(|m| m.thread_id == id)
+        .ok_or_else(|| ApiError::not_found("message"))
+}
+
+/// Zalo can act on a message once it has confirmed it, and not after a recall.
+fn actionable(m: &Message) -> bool {
+    !m.remote_id.starts_with("local:") && m.kind != "chat.undo"
 }
 
 async fn send_message(
@@ -276,6 +294,20 @@ async fn send_message(
     if text.is_empty() {
         return Err(ApiError::bad_request("text is empty"));
     }
+    let reply_to = match body.reply_to {
+        Some(seq) => {
+            let message = message_in(&st, &id, seq)?;
+            if !actionable(&message) {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "tin này chưa trả lời được",
+                ));
+            }
+            let raw = st.store.message_raw(seq).map_err(ApiError::internal)?;
+            Some(Box::new(ReplyTo { message, raw }))
+        }
+        None => None,
+    };
     let (reply, answer) = oneshot::channel();
     st.zalo
         .commands
@@ -283,6 +315,7 @@ async fn send_message(
             kind,
             remote_id: remote_id.to_string(),
             text: text.to_string(),
+            reply_to,
             reply,
         })
         .await
@@ -312,13 +345,8 @@ async fn react(
     if zeta_zalo::reaction::reaction_type(&body.icon).is_none() {
         return Err(ApiError::bad_request("unsupported reaction"));
     }
-    let message = st
-        .store
-        .message(seq)
-        .map_err(ApiError::internal)?
-        .filter(|m| m.thread_id == id)
-        .ok_or_else(|| ApiError::not_found("message"))?;
-    if message.remote_id.starts_with("local:") || message.kind == "chat.undo" {
+    let message = message_in(&st, &id, seq)?;
+    if !actionable(&message) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "tin này chưa thả cảm xúc được",
@@ -348,6 +376,41 @@ async fn react(
         .map_err(ApiError::bad_gateway)?;
     // Nothing changed (the same reaction seen before): the message as stored.
     Ok(Json(updated.unwrap_or(message)))
+}
+
+/// Recall one of this account's messages, for everyone in the chat. Answers
+/// with the message as it is now.
+async fn recall(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, seq)): Path<(String, i64)>,
+) -> ApiResult<Message> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let message = message_in(&st, &id, seq)?;
+    if !message.outgoing || !actionable(&message) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "chỉ thu hồi được tin mình đã gửi",
+        ));
+    }
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Recall {
+            kind,
+            remote_id: remote_id.to_string(),
+            message_id: message.remote_id.clone(),
+            message_client_id: message.client_id.clone(),
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    let now = st.store.message(seq).map_err(ApiError::internal)?;
+    Ok(Json(now.unwrap_or(message)))
 }
 
 #[derive(Deserialize)]

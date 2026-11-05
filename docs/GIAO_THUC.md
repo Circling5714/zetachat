@@ -102,6 +102,12 @@ Nhận cảm xúc: `cmd 612` khi vừa xảy ra; `610` và `611` (sub 1) chở n
 
 Báo mình đang gõ: `POST {chat}/api/message/typing` với `toid`, `destType: 3`, `imei`; nhóm: `POST {group}/api/group/typing` với `grid`, `imei`. Zalo trả lời không lỗi (thử vào Cloud). Người khác gõ tới qua `cmd 602`: `data.actions[]` có `act_type: "typing"`, `act` là `typing` (1-1) hoặc `gtyping` (nhóm), và `data` chứa `uid`, `ts`, `isPC`, `gid` (nhóm). Theo zca-js `data` là chuỗi JSON bị bỏ dấu ngoặc nhọn; gateway nhận cả ba dạng (thiếu ngoặc, đủ ngoặc, object) và ghi hình dạng khung vào log debug để kiểm chứng khi có người gõ thật.
 
+## 8d. Trả lời và thu hồi (đã kiểm chứng)
+
+Trả lời một tin: `POST {chat}/api/message/quote` (nhóm: `{group}/api/group/quote`) với chữ của tin mới và `qmsgOwner` (người gửi tin được trả lời; tin của mình thì là uid của mình), `qmsgId`, `qmsgCliId`, `qmsgType` (số: 1 chữ, 32 ảnh, 36 sticker, 44 video, 46 tệp…), `qmsgTs`, `qmsg` (chữ được trích, rỗng với media), `qmsgTTL`, `ttl: 0`; 1-1 thêm `imei`, nhóm thêm `visibility: 0` và `qmsgAttach` (chuỗi JSON của media được trích, với `thumbUrl`, `oriUrl`, `normalUrl`). Đã thử trả lời một tin tệp trong Cloud: Zalo nhận, bản sao gửi về có cùng `cliMsgId` nên không bị lưu trùng.
+
+Thu hồi tin của mình: `POST {chat}/api/message/undo` (nhóm: `{group}/api/group/undomsg` thêm `visibility: 0`, `imei`) với `msgId`, `clientId` mới và `cliMsgIdUndo` (client id của tin bị thu hồi). Sau đó Zalo đẩy một tin `chat.undo` như khi thu hồi từ điện thoại; gateway đã áp dụng thu hồi nên bỏ qua nó.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

@@ -21,6 +21,7 @@ const state = {
   loginPrompted: false,
   statusLimits: null, // upload limits from the gateway
   typing: new Map(), // thread id -> { name, timer }: someone is typing there
+  replyTo: null, // the message the next one answers
   typingSent: new Map(), // thread id -> when typing was last told to the gateway
 };
 
@@ -571,31 +572,38 @@ function closePicker() {
   picker = null;
 }
 
+function menuButton(label, action, className) {
+  const button = el('button', className || null, label);
+  button.type = 'button';
+  button.addEventListener('click', () => {
+    closePicker();
+    action();
+  });
+  return button;
+}
+
+/** Reactions on top, then what can be done with the message. */
 function openPicker(m, anchor) {
   closePicker();
   const box = el('div', 'react-picker');
   box.setAttribute('role', 'menu');
+  const row = el('div', 'react-row');
   for (const [icon, emoji, label] of REACTIONS) {
-    const button = el('button', null, emoji);
-    button.type = 'button';
+    const button = menuButton(emoji, () => react(m, icon));
     button.title = label;
     button.setAttribute('aria-label', label);
-    button.addEventListener('click', () => {
-      closePicker();
-      react(m, icon);
-    });
-    box.append(button);
+    row.append(button);
   }
   if ((m.reactions || []).some((r) => r.mine)) {
-    const remove = el('button', 'remove', 'Gỡ');
-    remove.type = 'button';
+    const remove = menuButton('Gỡ', () => react(m, ''), 'remove');
     remove.title = 'Gỡ cảm xúc của bạn';
-    remove.addEventListener('click', () => {
-      closePicker();
-      react(m, '');
-    });
-    box.append(remove);
+    row.append(remove);
   }
+  const actions = el('div', 'menu-actions');
+  actions.append(menuButton('Trả lời', () => startReply(m)));
+  if (!m.media && m.text) actions.append(menuButton('Sao chép', () => copyText(m.text)));
+  if (m.outgoing) actions.append(menuButton('Thu hồi', () => recallMessage(m), 'danger'));
+  box.append(row, actions);
   document.body.append(box);
   const at = anchor.getBoundingClientRect();
   const left = Math.min(window.innerWidth - box.offsetWidth - 8, Math.max(8, at.left + at.width / 2 - box.offsetWidth / 2));
@@ -611,9 +619,60 @@ document.addEventListener('click', (e) => {
   if (picker && !picker.contains(e.target)) closePicker();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closePicker();
+  if (e.key !== 'Escape') return;
+  if (picker) closePicker();
+  else if (state.replyTo && document.activeElement === input) cancelReply();
 });
 $('messages').addEventListener('scroll', closePicker, { passive: true });
+
+/** Answer `m` with the next message. */
+function startReply(m) {
+  state.replyTo = m;
+  renderReply();
+  input.focus();
+}
+
+function cancelReply() {
+  state.replyTo = null;
+  renderReply();
+}
+
+function renderReply() {
+  const m = state.replyTo;
+  const bar = $('reply-bar');
+  bar.hidden = !m || m.thread_id !== state.current;
+  if (bar.hidden) return;
+  const name = m.outgoing ? 'chính mình' : m.sender_name || threadName(state.threads.get(m.thread_id) || {});
+  $('reply-name').textContent = `Trả lời ${name}`;
+  $('reply-text').textContent = m.text || '';
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // Without HTTPS the clipboard API is missing: select and copy instead.
+    const area = el('textarea');
+    area.value = text;
+    document.body.append(area);
+    area.select();
+    document.execCommand('copy');
+    area.remove();
+  }
+  toast('Đã sao chép');
+}
+
+async function recallMessage(m) {
+  if (!window.confirm('Thu hồi tin nhắn này? Mọi người trong cuộc trò chuyện sẽ không còn thấy nội dung.')) return;
+  try {
+    const message = await api(`/threads/${encodeURIComponent(m.thread_id)}/messages/${m.seq}/recall`, { method: 'POST' });
+    onMessageUpdated({ message });
+  } catch (err) {
+    handleError(err, 'Không thu hồi được: ');
+  }
+}
+
+$('reply-cancel').addEventListener('click', cancelReply);
 
 async function react(m, icon) {
   try {
@@ -671,6 +730,8 @@ async function openThread(id) {
   $('messages').replaceChildren();
   renderThreads();
   renderUploads();
+  if (state.replyTo && state.replyTo.thread_id !== id) state.replyTo = null;
+  renderReply();
   try {
     const list = await fetchMessages(id);
     if (state.current !== id) return;
@@ -809,8 +870,12 @@ $('composer').addEventListener('submit', async (e) => {
   input.value = '';
   autosize();
   $('send').disabled = true;
+  const body = { text };
+  const replyTo = state.replyTo;
+  if (replyTo && replyTo.thread_id === id) body.reply_to = replyTo.seq;
   try {
-    const message = await api(`/threads/${encodeURIComponent(id)}/messages`, { json: { text } });
+    const message = await api(`/threads/${encodeURIComponent(id)}/messages`, { json: body });
+    if (state.replyTo === replyTo) cancelReply();
     onMessage({ message, thread: null });
   } catch (err) {
     input.value = text;

@@ -16,6 +16,7 @@ pub mod domains;
 pub mod error;
 pub mod login;
 pub mod media;
+pub mod message;
 pub mod param_cipher;
 pub mod reaction;
 pub mod session;

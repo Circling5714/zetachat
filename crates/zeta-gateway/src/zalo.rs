@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeta_zalo::api::{Recipient, SessionHealth};
+use zeta_zalo::message::QuotedMessage;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::upload::{self, FileLimits, FileSource, UploadedFile};
 use zeta_zalo::{reaction, typing};
@@ -103,7 +104,18 @@ pub enum ZaloCommand {
         kind: ThreadKind,
         remote_id: String,
         text: String,
+        /// The message this one answers, if any.
+        reply_to: Option<Box<ReplyTo>>,
         reply: oneshot::Sender<Result<Message, String>>,
+    },
+    /// Recall one of the account's messages for everyone; answers with the
+    /// message as it is now (`None` when Zalo's echo already applied it).
+    Recall {
+        kind: ThreadKind,
+        remote_id: String,
+        message_id: String,
+        message_client_id: String,
+        reply: oneshot::Sender<Result<Option<Message>, String>>,
     },
     /// Send an attachment; the outcome goes to `job`, which also owns the file.
     SendAttachment {
@@ -137,6 +149,48 @@ pub enum ZaloCommand {
     StartLogin {
         reply: oneshot::Sender<LoginState>,
     },
+}
+
+/// A stored message a new one replies to, with its original Zalo JSON (`Null`
+/// for messages sent from here).
+#[derive(Clone, Debug)]
+pub struct ReplyTo {
+    pub message: Message,
+    pub raw: Value,
+}
+
+/// What Zalo needs to know of a quoted message.
+fn quoted_message(r: &ReplyTo, self_uid: &str) -> QuotedMessage {
+    let m = &r.message;
+    let content = match r.raw.get("content") {
+        Some(content) if !content.is_null() => content.clone(),
+        // Sent from here: no original JSON, rebuild what the official client reads.
+        _ => match &m.media {
+            Some(media) => json!({
+                "href": media.url,
+                "thumb": if media.thumb.is_empty() { &media.url } else { &media.thumb },
+                "title": if media.name.is_empty() { &media.description } else { &media.name },
+            }),
+            None => json!(m.text),
+        },
+    };
+    QuotedMessage {
+        owner_id: if m.outgoing {
+            self_uid.to_string()
+        } else {
+            m.sender_id.clone()
+        },
+        msg_id: m.remote_id.clone(),
+        cli_msg_id: if m.client_id.is_empty() {
+            "0".into()
+        } else {
+            m.client_id.clone()
+        },
+        msg_type: m.kind.clone(),
+        ts: m.sent_at,
+        content,
+        ttl: r.raw.get("ttl").and_then(Value::as_i64).unwrap_or(0),
+    }
 }
 
 /// How long to wait for Zalo to announce an uploaded file on the socket: a
@@ -613,6 +667,7 @@ impl Connector {
                 kind,
                 remote_id,
                 text,
+                reply_to,
                 reply,
             } => {
                 let Some(client) = self.client.clone() else {
@@ -621,11 +676,62 @@ impl Connector {
                 };
                 let store = self.store.clone();
                 let bus = self.bus.clone();
-                let self_uid = self.self_uid.clone();
+                let me = Me {
+                    uid: self.self_uid.clone(),
+                    name: self
+                        .status
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .display_name
+                        .clone(),
+                };
                 tokio::spawn(async move {
-                    let result =
-                        send_and_store(&client, &store, &bus, &self_uid, kind, &remote_id, &text)
-                            .await;
+                    let target = (kind, remote_id.as_str());
+                    let result = send_and_store(
+                        &client,
+                        &store,
+                        &bus,
+                        &me,
+                        target,
+                        &text,
+                        reply_to.as_deref(),
+                    )
+                    .await;
+                    let _ = reply.send(result);
+                });
+            }
+            ZaloCommand::Recall {
+                kind,
+                remote_id,
+                message_id,
+                message_client_id,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                tokio::spawn(async move {
+                    let to = recipient(kind, &remote_id);
+                    let result = match client.recall(to, &message_id, &message_client_id).await {
+                        Ok(()) => {
+                            let thread = thread_id(kind, &remote_id);
+                            match store.recall_message(&thread, &message_id, &message_client_id) {
+                                Ok(Some(message)) => {
+                                    let snapshot = store.thread(&thread).ok().flatten();
+                                    let payload = json!({ "message": message, "thread": snapshot });
+                                    if let Err(e) = bus.publish("message_updated", payload) {
+                                        tracing::error!(error = %e, "cannot publish a recall");
+                                    }
+                                    Ok(Some(message))
+                                }
+                                Ok(None) => Ok(None),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = reply.send(result);
                 });
             }
@@ -1058,6 +1164,14 @@ struct Sent {
     msg_type: &'static str,
     text: String,
     media: Option<Media>,
+    quote: Option<Quote>,
+}
+
+/// This account, as a sender.
+struct Me {
+    uid: String,
+    /// Display name, shown when someone quotes our message.
+    name: String,
 }
 
 /// Store a message this gateway sent and announce it. When the socket echo was
@@ -1092,7 +1206,7 @@ fn store_sent(
         kind: sent.msg_type.into(),
         text: sent.text,
         media: sent.media,
-        quote: None,
+        quote: sent.quote,
         sent_at: now_ms(),
         raw: "{}".into(),
     };
@@ -1115,23 +1229,41 @@ async fn send_and_store(
     client: &ZaloClient,
     store: &Store,
     bus: &EventBus,
-    self_uid: &str,
-    kind: ThreadKind,
-    remote_id: &str,
+    me: &Me,
+    (kind, remote_id): (ThreadKind, &str),
     text: &str,
+    reply_to: Option<&ReplyTo>,
 ) -> Result<Message, String> {
-    let sent = client
-        .send_text(recipient(kind, remote_id), text)
-        .await
-        .map_err(|e| e.to_string())?;
+    let to = recipient(kind, remote_id);
+    let err = |e: zeta_zalo::Error| e.to_string();
+    let (sent, quote) = match reply_to {
+        Some(r) => {
+            let sent = client
+                .send_reply(to, text, &quoted_message(r, &me.uid))
+                .await
+                .map_err(err)?;
+            let quote = Quote {
+                sender_name: if r.message.outgoing {
+                    me.name.clone()
+                } else {
+                    r.message.sender_name.clone()
+                },
+                text: r.message.text.clone(),
+                remote_id: r.message.remote_id.clone(),
+            };
+            (sent, Some(quote))
+        }
+        None => (client.send_text(to, text).await.map_err(err)?, None),
+    };
     let sent = Sent {
         msg_id: sent.msg_id,
         client_id: sent.client_id,
         msg_type: "webchat",
         text: text.to_string(),
         media: None,
+        quote,
     };
-    store_sent(store, bus, self_uid, kind, remote_id, sent)
+    store_sent(store, bus, &me.uid, kind, remote_id, sent)
 }
 
 /// Everything a background send of a photo or file needs.
@@ -1233,6 +1365,7 @@ impl AttachmentSender {
                     size,
                     ..Media::default()
                 }),
+                quote: None,
             }
         } else {
             let uploaded = self
@@ -1269,6 +1402,7 @@ impl AttachmentSender {
                     size,
                     ..Media::default()
                 }),
+                quote: None,
             }
         };
         store_sent(

@@ -48,6 +48,7 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                     kind,
                     remote_id,
                     text,
+                    reply_to,
                     reply,
                 } => {
                     let thread = ThreadUpsert {
@@ -60,15 +61,19 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                     let message = store
                         .insert_message(&NewMessage {
                             thread_id: thread.id(),
-                            remote_id: "srv-1".into(),
-                            client_id: "1".into(),
+                            remote_id: format!("srv-{sent}"),
+                            client_id: format!("{sent}"),
                             sender_id: "me".into(),
                             sender_name: String::new(),
                             outgoing: true,
                             kind: "webchat".into(),
                             text,
                             media: None,
-                            quote: None,
+                            quote: reply_to.map(|r| zeta_gateway::model::Quote {
+                                sender_name: r.message.sender_name,
+                                text: r.message.text,
+                                remote_id: r.message.remote_id,
+                            }),
                             sent_at: 10,
                             raw: "{}".into(),
                         })
@@ -173,6 +178,22 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                     seen.lock().unwrap().push((remote_id, ids));
                 }
                 ZaloCommand::Typing { .. } => {}
+                ZaloCommand::Recall {
+                    kind,
+                    remote_id,
+                    message_id,
+                    message_client_id,
+                    reply,
+                } => {
+                    let recalled = store
+                        .recall_message(
+                            &thread_id(kind, &remote_id),
+                            &message_id,
+                            &message_client_id,
+                        )
+                        .map_err(|e| e.to_string());
+                    let _ = reply.send(recalled);
+                }
                 ZaloCommand::StartLogin { reply } => {
                     let _ = reply.send(LoginState::WaitingScan {
                         qr: "https://example/qr".into(),
@@ -497,6 +518,73 @@ async fn reactions_go_to_zalo_and_come_back_counted() {
         StatusCode::NOT_FOUND,
         "the message is in another thread"
     );
+}
+
+#[tokio::test]
+async fn replies_quote_their_message_and_own_messages_can_be_recalled() {
+    let f = fixture();
+    let id = thread_id(ThreadKind::User, "42");
+    let uri = format!("/api/v1/threads/{id}/messages");
+    let (_, first) = call(
+        &f,
+        "POST",
+        &uri,
+        Some(json!({ "text": "đi cà phê nhé" })),
+        true,
+    )
+    .await;
+    let first_seq = first["seq"].as_i64().unwrap();
+
+    let (status, reply) = call(
+        &f,
+        "POST",
+        &uri,
+        Some(json!({ "text": "ok", "reply_to": first_seq })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["quote"]["text"], "đi cà phê nhé");
+    assert_eq!(reply["quote"]["remote_id"], first["remote_id"]);
+    let (status, _) = call(
+        &f,
+        "POST",
+        &uri,
+        Some(json!({ "text": "ok", "reply_to": 9999 })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let recall = format!("/api/v1/threads/{id}/messages/{}/recall", reply["seq"]);
+    let (status, recalled) = call(&f, "POST", &recall, None, true).await;
+    assert_eq!(status, StatusCode::OK, "{recalled}");
+    assert_eq!(recalled["kind"], "chat.undo");
+    let (status, _) = call(&f, "POST", &recall, None, true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "already recalled");
+
+    // Only one's own messages.
+    let incoming = f
+        .store
+        .insert_message(&NewMessage {
+            thread_id: id.clone(),
+            remote_id: "theirs".into(),
+            client_id: String::new(),
+            sender_id: "42".into(),
+            sender_name: "B".into(),
+            outgoing: false,
+            kind: "webchat".into(),
+            text: "x".into(),
+            media: None,
+            quote: None,
+            sent_at: 5,
+            raw: "{}".into(),
+        })
+        .unwrap()
+        .unwrap();
+    let theirs = format!("/api/v1/threads/{id}/messages/{}/recall", incoming.seq);
+    let (status, _) = call(&f, "POST", &theirs, None, true).await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
