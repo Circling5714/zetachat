@@ -28,7 +28,7 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/stickers/packs` | Các gói nhãn dán trong kho của Zalo, mới nhất trước: `[{ "id", "name", "icon", "count" }]`. Gateway giữ danh sách 12 giờ |
 | GET | `/stickers/packs/{id}` | Nhãn dán của một gói: `[{ "id", "cate_id", "type", "url" }]`; `url` là ảnh trên CDN của Zalo, tải qua `/media` |
 | GET | `/stickers/search?q=` | Nhãn dán theo từ khóa ("haha", "cảm ơn", "yêu"…), như Zalo gợi ý; cùng dạng như trên |
-| GET | `/stickers/motion?ids=` | Nhãn dán động ra sao, tối đa 50 id: `{ "<id>": { "sprite", "frames", "duration_ms" } }`, hoặc `null` với nhãn tĩnh. `sprite` là dải `frames` khung xếp ngang trên CDN của Zalo; mỗi khung hiện `duration_ms`. Gateway giữ kết quả, vì nhãn dán không đổi |
+| GET | `/stickers/motion?ids=` | Nhãn dán động ra sao, tối đa 50 id: `{ "<id>": { "sprite", "frames", "duration_ms", "ext" } }`. `sprite` thường là dải `frames` khung xếp ngang trên CDN của Zalo, mỗi khung hiện `duration_ms`. `frames` bằng 0 nghĩa là Zalo để sprite tự nói: một hình 130×130 (nhãn tĩnh) hoặc, với `ext` 2, một ảnh WebP động. `null` khi nhãn không có sprite. Id mà Zalo không trả lời được thì vắng mặt, để client hỏi lại. Gateway giữ kết quả, vì nhãn dán không đổi |
 | POST | `/threads/{id}/stickers` | Gửi nhãn dán `{ "id", "cate_id", "type" }` lấy từ các đường dẫn trên; trả về tin đã lưu (`kind` là `chat.sticker`) |
 | GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |

@@ -71,19 +71,29 @@ impl Sticker {
     }
 }
 
-/// How a sticker moves: Zalo draws animated stickers from a sprite sheet, the
-/// frames side by side, shown one after the other over `duration_ms`.
+/// How a sticker moves, as `sticker_detail` describes it. Seen live:
+///
+/// - Most animated stickers: the sprite is the frames side by side, each 130
+///   pixels, `totalFrames` of them shown `duration` milliseconds each.
+/// - `totalFrames` 0 means "look at the sprite": a still sticker's sprite is
+///   its one picture; a newer sticker (`ext` 2) gets an animated WebP there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StickerMotion {
-    /// The sprite sheet on Zalo's CDN.
+    /// The sprite sheet (or animated picture) on Zalo's CDN.
     pub sprite: String,
-    /// An animated WebP, when Zalo has one (it often has not).
+    /// An animated WebP, when Zalo names one (it rarely does).
     pub webp: String,
+    /// 0 when Zalo does not say.
     pub frames: u32,
+    /// Per frame.
     pub duration_ms: u32,
+    /// Zalo's `ext`: 2 for stickers whose sprite is an animated picture.
+    #[serde(default)]
+    pub ext: u32,
 }
 
-/// The motion in a `sticker_detail` answer; `None` for a still sticker.
+/// The motion in a `sticker_detail` answer; `None` when there is no picture
+/// to move.
 fn motion_of(data: &Value) -> Option<StickerMotion> {
     let url = |key: &str| first_str(data, &[key]).replace("http://", "https://");
     let motion = StickerMotion {
@@ -91,9 +101,9 @@ fn motion_of(data: &Value) -> Option<StickerMotion> {
         webp: url("stickerWebpUrl"),
         frames: u32::try_from(number(data, &["totalFrames"])).unwrap_or(0),
         duration_ms: u32::try_from(number(data, &["duration"])).unwrap_or(0),
+        ext: u32::try_from(number(data, &["ext"])).unwrap_or(0),
     };
-    let moves = (!motion.sprite.is_empty() && motion.frames > 1) || !motion.webp.is_empty();
-    moves.then_some(motion)
+    (!motion.sprite.is_empty() || !motion.webp.is_empty()).then_some(motion)
 }
 
 fn number(v: &Value, keys: &[&str]) -> u64 {
@@ -378,10 +388,13 @@ mod tests {
                 webp: String::new(),
                 frames: 12,
                 duration_ms: 1200,
+                ext: 0,
             })
         );
-        let still = json!({ "stickerSpriteUrl": "https://x/s.png", "totalFrames": 1 });
-        assert_eq!(motion_of(&still), None);
+        // totalFrames 0, as seen live: the sprite tells (here an animated WebP).
+        let newer = json!({ "stickerSpriteUrl": "https://x/s", "totalFrames": 0, "ext": 2 });
+        assert_eq!(motion_of(&newer).map(|m| (m.frames, m.ext)), Some((0, 2)));
+        assert_eq!(motion_of(&json!({ "totalFrames": 3 })), None);
     }
 
     #[test]

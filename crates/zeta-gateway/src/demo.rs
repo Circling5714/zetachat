@@ -136,7 +136,7 @@ fn demo_sticker_answer(query: &StickerQuery) -> Value {
             let mut answer = serde_json::Map::new();
             for id in ids {
                 let motion = if *id == 9001 {
-                    json!({ "sprite": demo_sprite(), "frames": 3, "duration_ms": 400 })
+                    json!({ "sprite": demo_sprite(), "frames": 3, "duration_ms": 400, "ext": 0 })
                 } else {
                     Value::Null
                 };

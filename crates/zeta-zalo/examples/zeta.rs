@@ -311,6 +311,18 @@ async fn stickers(args: &[String]) -> Result<()> {
                 println!("  {s:?}");
             }
         }
+        "detail" => {
+            // Public sticker data: printed as Zalo gives it.
+            let id: u64 = args.get(2).context("thiếu id nhãn dán")?.parse()?;
+            let data = client
+                .get_encrypted(
+                    zeta_zalo::Service::Sticker,
+                    "/api/message/sticker/sticker_detail",
+                    &serde_json::json!({ "sid": id }),
+                )
+                .await?;
+            println!("{data}");
+        }
         "motion" => {
             let id: u64 = args.get(2).context("thiếu id nhãn dán")?.parse()?;
             match client.sticker_motion(id).await? {

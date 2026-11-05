@@ -909,7 +909,8 @@ function videoNode(md) {
 // side, each shown for a while. The still picture shows first; once the
 // gateway says the sticker moves and the sheet has loaded, it takes over.
 
-const MOTION_KEY = 'zetachat.stickerMotion';
+// v2: v1 took stickers whose frames Zalo leaves to the sprite for still ones.
+const MOTION_KEY = 'zetachat.stickerMotion.v2';
 const motions = new Map(); // sticker id -> { sprite, frames, duration_ms } | null
 const motionWaiting = new Map(); // sticker id -> callbacks
 let motionTimer = 0;
@@ -967,21 +968,33 @@ async function askMotions() {
   if (motionWaiting.size) motionTimer = setTimeout(askMotions, 40);
 }
 
-/** Replace a still sticker picture by its moving sprite, once loaded. */
+/**
+ * Replace a still sticker picture by its moving one, once loaded. The sprite
+ * decides, as Zalo often leaves the frame count to it: frames side by side
+ * slide by one at a time; another picture (an animated WebP) plays by
+ * itself; a sprite just like the still picture changes nothing.
+ */
 function animateSticker(img, m) {
-  if (!m || !(m.frames > 1) || !img.isConnected) return;
-  const strip = new Image();
-  strip.className = 'sticker-strip';
-  strip.alt = img.alt;
-  strip.addEventListener('load', () => {
-    if (!img.isConnected) return;
-    const box = el('div', `${img.className} sticker-moving`);
-    strip.style.animationDuration = `${m.frames * m.duration_ms}ms`;
-    strip.style.animationTimingFunction = `steps(${m.frames})`;
-    box.append(strip);
-    img.replaceWith(box);
+  if (!m || !m.sprite || !img.isConnected) return;
+  const sheet = new Image();
+  sheet.alt = img.alt;
+  sheet.addEventListener('load', () => {
+    if (!img.isConnected || !sheet.naturalHeight) return;
+    const ratio = sheet.naturalWidth / sheet.naturalHeight;
+    const frames = m.frames > 1 ? m.frames : Math.round(ratio);
+    if (frames >= 2 && Math.abs(ratio - frames) < 0.05) {
+      const box = el('div', `${img.className} sticker-moving`);
+      sheet.className = 'sticker-strip';
+      sheet.style.animationDuration = `${frames * (m.duration_ms || 100)}ms`;
+      sheet.style.animationTimingFunction = `steps(${frames})`;
+      box.append(sheet);
+      img.replaceWith(box);
+    } else if (m.ext === 2 || sheet.naturalWidth !== img.naturalWidth || sheet.naturalHeight !== img.naturalHeight) {
+      sheet.className = img.className;
+      img.replaceWith(sheet);
+    }
   }, { once: true });
-  strip.src = mediaSrc(m.sprite);
+  sheet.src = mediaSrc(m.sprite);
 }
 
 function stickerNode(md) {

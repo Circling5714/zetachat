@@ -32,16 +32,18 @@ pub enum StickerQuery {
 /// Motions kept at most; stickers never change, so only the count matters.
 const MAX_MOTIONS: usize = 5000;
 
-/// A sticker's motion for clients: `{ sprite, frames, duration_ms }` (per
-/// frame), `null` for a still one.
+/// A sticker's motion for clients: `{ sprite, frames, duration_ms, ext }`
+/// (`frames` 0: look at the sprite; `duration_ms` per frame), `null` when
+/// it has no picture to move.
 fn motion_json(m: Option<&StickerMotion>) -> Value {
     match m {
-        Some(m) if m.frames > 1 => json!({
-            "sprite": m.sprite,
+        Some(m) => json!({
+            "sprite": if m.webp.is_empty() { &m.sprite } else { &m.webp },
             "frames": m.frames,
             "duration_ms": if m.duration_ms > 0 { m.duration_ms } else { 100 },
+            "ext": m.ext,
         }),
-        _ => Value::Null,
+        None => Value::Null,
     }
 }
 
@@ -121,9 +123,9 @@ impl StickerCache {
                     let motion = match kept {
                         Some(motion) => motion,
                         None => {
-                            // A failed question is not kept: asked again next time.
+                            // A failed question is neither kept nor answered, so
+                            // clients ask again rather than take it for still.
                             let Ok(motion) = client.sticker_motion(*id).await else {
-                                answer.insert(id.to_string(), Value::Null);
                                 continue;
                             };
                             let mut map = self.motion.lock().unwrap_or_else(|e| e.into_inner());
@@ -190,9 +192,17 @@ mod tests {
             webp: String::new(),
             frames: 10,
             duration_ms: 0,
+            ext: 0,
         };
         assert_eq!(motion_json(Some(&moving))["duration_ms"], 100);
         assert_eq!(motion_json(Some(&moving))["frames"], 10);
+        // Zalo leaves the frames to the sprite: still answered.
+        let unknown = StickerMotion {
+            frames: 0,
+            ext: 2,
+            ..moving
+        };
+        assert_eq!(motion_json(Some(&unknown))["ext"], 2);
         assert!(motion_json(None).is_null());
     }
 
