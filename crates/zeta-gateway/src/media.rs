@@ -113,6 +113,26 @@ pub fn extract_quote(message: &Value) -> Option<Quote> {
     })
 }
 
+/// People named in a message: its `mentions`, `[{ uid, pos, len, type }]`
+/// as zca-js describes them (`uid` "-1" is everyone).
+pub fn extract_mentions(message: &Value) -> Vec<zeta_zalo::api::Mention> {
+    let Some(list) = message.get("mentions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|m| {
+            let uid = match m.get("uid") {
+                Some(Value::String(s)) => s.trim().to_string(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => return None,
+            };
+            let pos = u32::try_from(number(m, &["pos"])).ok()?;
+            let len = u32::try_from(number(m, &["len"])).ok()?;
+            (!uid.is_empty() && len > 0).then_some(zeta_zalo::api::Mention { uid, pos, len })
+        })
+        .collect()
+}
+
 /// Ids of the message a `chat.undo` recalls: (global id, client id).
 pub fn recalled_ids(content: Option<&Value>) -> Option<(String, String)> {
     let id = |key: &str| match content.and_then(|c| c.get(key)) {

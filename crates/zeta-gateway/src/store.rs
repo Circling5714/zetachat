@@ -14,6 +14,8 @@ use zeta_zalo::reaction::reaction_emoji;
 
 use crate::auth;
 use crate::media;
+#[cfg(test)]
+use crate::model::Mention;
 use crate::model::{
     now_ms, Device, Message, NewMessage, NewReaction, Person, ReactionCount, StoredEvent, Thread,
     ThreadKind, ThreadUpsert,
@@ -115,7 +117,23 @@ const PERSON_COLUMNS: &str = "uid, name, zalo_name, avatar, friend, updated_at";
 /// Most messages a search looks through, newest first.
 const SEARCH_SCAN: i64 = 200_000;
 const MESSAGE_COLUMNS: &str = "seq, thread_id, remote_id, client_id, sender_id, sender_name, \
-    outgoing, kind, text, sent_at, media, quote, status";
+    outgoing, kind, text, sent_at, media, quote, status, mentions";
+
+/// Version 7: people named in a message (JSON), from its Zalo JSON.
+const SCHEMA_V7: &str = "ALTER TABLE messages ADD COLUMN mentions TEXT NOT NULL DEFAULT '';";
+
+/// The mentions of a message's Zalo JSON, as stored (empty for none).
+fn mentions_of_raw(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return String::new();
+    };
+    let found = media::extract_mentions(&value);
+    if found.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&found).unwrap_or_default()
+    }
+}
 
 /// Version 6: how far the account's messages got (delivered, seen), and an
 /// index to find a message by Zalo's id alone, as receipts give it.
@@ -190,6 +208,7 @@ fn message_from_row(row: &Row<'_>) -> Result<Message> {
         quote: from_json(&row.get::<_, String>(11)?),
         reactions: Vec::new(),
         status: row.get(12)?,
+        mentions: from_json(&row.get::<_, String>(13)?).unwrap_or_default(),
     })
 }
 
@@ -467,6 +486,24 @@ impl Store {
             tx.pragma_update(None, "user_version", 6)?;
             tx.commit()?;
         }
+        if version < 7 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V7)?;
+            let rows: Vec<(i64, String)> = {
+                let mut stmt =
+                    tx.prepare("SELECT seq, raw FROM messages WHERE raw LIKE '%\"mentions\"%'")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_>>()?
+            };
+            for (seq, raw) in rows {
+                tx.execute(
+                    "UPDATE messages SET mentions = ?2 WHERE seq = ?1",
+                    params![seq, mentions_of_raw(&raw)],
+                )?;
+            }
+            tx.pragma_update(None, "user_version", 7)?;
+            tx.commit()?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -698,11 +735,12 @@ impl Store {
                 return Ok(None);
             }
         }
+        let mentions = mentions_of_raw(&m.raw);
         tx.execute(
             "INSERT INTO messages
                 (thread_id, remote_id, client_id, sender_id, sender_name, outgoing, kind, text,
-                 sent_at, raw, media, quote)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 sent_at, raw, media, quote, mentions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 m.thread_id,
                 m.remote_id,
@@ -715,7 +753,8 @@ impl Store {
                 m.sent_at,
                 m.raw,
                 to_json(m.media.as_ref()),
-                to_json(m.quote.as_ref())
+                to_json(m.quote.as_ref()),
+                mentions
             ],
         )?;
         let seq = tx.last_insert_rowid();
@@ -744,6 +783,7 @@ impl Store {
             sent_at: m.sent_at,
             reactions: Vec::new(),
             status: 0,
+            mentions: from_json(&mentions).unwrap_or_default(),
         }))
     }
 
@@ -1387,7 +1427,7 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         // Version 5 added people and group sizes, version 6 message status.
         assert!(s
             .messages("zalo:u:1", None, 10)
@@ -1437,6 +1477,33 @@ mod tests {
         // Touching keeps names.
         s.touch_people(&["3".to_string()], 99).unwrap();
         assert_eq!(s.people(&["3".to_string()]).unwrap()[0].name, "Bố");
+    }
+
+    #[test]
+    fn mentions_come_from_the_zalo_json() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "Lan"), true).unwrap();
+        let mut m = msg("zalo:u:1", "a", "", false, 1);
+        m.text = "@Lan ơi".into();
+        m.raw = r#"{"mentions":[{"uid":"1","pos":0,"len":4,"type":0},{"uid":"2","len":0}]}"#.into();
+        let stored = s.insert_message(&m).unwrap().unwrap();
+        assert_eq!(
+            stored.mentions,
+            [Mention {
+                uid: "1".into(),
+                pos: 0,
+                len: 4
+            }]
+        );
+        assert_eq!(
+            s.messages("zalo:u:1", None, 5).unwrap()[0].mentions.len(),
+            1
+        );
+        let plain = s
+            .insert_message(&msg("zalo:u:1", "b", "", false, 2))
+            .unwrap()
+            .unwrap();
+        assert!(plain.mentions.is_empty());
     }
 
     #[test]

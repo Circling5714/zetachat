@@ -149,6 +149,12 @@ Khi tài khoản đọc một hội thoại trên thiết bị khác (điện th
 
 Tin của chính mình: khung **502** (chat 1-1) có `delivereds: [{ msgId, realMsgId, seen, deliveredUids, seenUids, mSTs }]` và `seens: [{ idTo, msgId, realMsgId }]`; khung **522** (nhóm) có `delivereds` kèm `groupId` và `groupSeens: [{ msgId, groupId, seenUids }]`, như zca-js đọc. Khung 502 có `delivereds` đã thấy thật, mỗi lần khoảng 2 giây sau khi gửi vào Cloud lúc điện thoại đang mở. Gateway tìm tin theo id (mã Zalo, hoặc client id), đưa nó và các tin trước nó lên "đã nhận" hay "đã xem". Việc khớp id với dữ liệu thật chưa kiểm chứng: lần thử sau cùng, Zalo không gửi khung 502 nào trong 30 giây.
 
+## 8k. Nhắc tên trong nhóm (theo zca-js, chưa kiểm chứng)
+
+Gửi: tin nhóm có nhắc tên đi tới `{group}/api/group/mention` thay cho `/api/group/sendmsg`, thêm `mentionInfo`: chuỗi JSON `[{ pos, uid, len, type }]`, `type` 1 khi `uid` là "-1" (cả nhóm). Vị trí tính theo đơn vị UTF-16, vì client của Zalo đếm như chuỗi JavaScript. Tin trả lời vẫn đi `/quote` và mang thêm `mentionInfo`. Chưa thử, vì phải gửi vào một nhóm có người thật.
+
+Nhận: tin có trường `mentions: [{ uid, pos, len, type }]` (kiểu `TMessage` của zca-js). Gateway lưu chúng (schema v7) và client tô tên được nhắc. Trong các tin thật đã lưu chưa có tin nào nhắc tên.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

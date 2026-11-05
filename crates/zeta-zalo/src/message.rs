@@ -12,7 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::api::{first_str, Recipient, SentMessage};
+use crate::api::{first_str, mention_info, Mention, Recipient, SentMessage};
 use crate::client::ZaloClient;
 use crate::domains::Service;
 use crate::error::{Error, Result};
@@ -74,6 +74,7 @@ fn reply_params(
     quote: &QuotedMessage,
     client_id: u64,
     imei: &str,
+    mentions: &[Mention],
 ) -> Map<String, Value> {
     let mut p = Map::new();
     match to {
@@ -104,6 +105,9 @@ fn reply_params(
                 quoted_attachment(&quote.content)
             };
             p.insert("qmsgAttach".into(), json!(attach.to_string()));
+            if !mentions.is_empty() {
+                p.insert("mentionInfo".into(), json!(mention_info(mentions)));
+            }
         }
     }
     p.insert("qmsgTTL".into(), json!(quote.ttl));
@@ -146,9 +150,20 @@ impl ZaloClient {
         text: &str,
         quote: &QuotedMessage,
     ) -> Result<SentMessage> {
+        self.send_reply_with(to, text, quote, &[]).await
+    }
+
+    /// [`Self::send_reply`] naming people (groups only).
+    pub async fn send_reply_with(
+        &self,
+        to: Recipient<'_>,
+        text: &str,
+        quote: &QuotedMessage,
+        mentions: &[Mention],
+    ) -> Result<SentMessage> {
         let key = self.session_key()?;
         let client_id = now_millis();
-        let params = reply_params(to, text, quote, client_id, &self.device().imei);
+        let params = reply_params(to, text, quote, client_id, &self.device().imei, mentions);
         let (service, path) = match to {
             Recipient::User(_) => (Service::Chat, "/api/message/quote"),
             Recipient::Group(_) => (Service::Group, "/api/group/quote"),
@@ -308,7 +323,7 @@ mod tests {
     fn replies_to_a_person_carry_the_quoted_text() {
         let mut q = quote(json!("đi cà phê nhé"));
         q.msg_type = "webchat".into();
-        let p = reply_params(Recipient::User("100"), "ok", &q, 42, "imei-1");
+        let p = reply_params(Recipient::User("100"), "ok", &q, 42, "imei-1", &[]);
         assert_eq!(p["toid"], "100");
         assert_eq!(p["message"], "ok");
         assert_eq!(
@@ -327,7 +342,15 @@ mod tests {
     fn replies_in_a_group_carry_the_quoted_media() {
         let q =
             quote(json!({ "href": "https://p.zdn.vn/a.jpg", "thumb": "https://p.zdn.vn/t.jpg" }));
-        let p = reply_params(Recipient::Group("900"), "đẹp quá", &q, 42, "imei-1");
+        let p = reply_params(Recipient::Group("900"), "đẹp quá", &q, 42, "imei-1", &[]);
+        assert!(p.get("mentionInfo").is_none());
+        let named = [Mention {
+            uid: "7".into(),
+            pos: 0,
+            len: 3,
+        }];
+        let p = reply_params(Recipient::Group("900"), "@An đẹp", &q, 42, "imei-1", &named);
+        assert!(p["mentionInfo"].as_str().unwrap().contains("\"uid\":\"7\""));
         assert_eq!(
             (p["grid"].as_str(), p["visibility"].as_i64()),
             (Some("900"), Some(0))

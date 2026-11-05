@@ -25,8 +25,8 @@ use crate::events::EventBus;
 use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
-    now_ms, thread_id, GroupMembers, Media, Member, Message, NewMessage, NewReaction, Person,
-    Quote, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
+    now_ms, thread_id, GroupMembers, Media, Member, Mention, Message, NewMessage, NewReaction,
+    Person, Quote, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
 };
 use crate::stickers::{StickerCache, StickerQuery};
 use crate::store::Store;
@@ -112,6 +112,8 @@ pub enum ZaloCommand {
         text: String,
         /// The message this one answers, if any.
         reply_to: Option<Box<ReplyTo>>,
+        /// People named in a group message.
+        mentions: Vec<Mention>,
         reply: oneshot::Sender<Result<Message, String>>,
     },
     /// Recall one of the account's messages for everyone; answers with the
@@ -799,6 +801,7 @@ impl Connector {
                 remote_id,
                 text,
                 reply_to,
+                mentions,
                 reply,
             } => {
                 let Some(client) = self.client.clone() else {
@@ -824,7 +827,7 @@ impl Connector {
                         &bus,
                         &me,
                         target,
-                        &text,
+                        (&text, &mentions),
                         reply_to.as_deref(),
                     )
                     .await;
@@ -1810,7 +1813,7 @@ async fn send_and_store(
     bus: &EventBus,
     me: &Me,
     (kind, remote_id): (ThreadKind, &str),
-    text: &str,
+    (text, mentions): (&str, &[Mention]),
     reply_to: Option<&ReplyTo>,
 ) -> Result<Message, String> {
     let to = recipient(kind, remote_id);
@@ -1818,7 +1821,7 @@ async fn send_and_store(
     let (sent, quote) = match reply_to {
         Some(r) => {
             let sent = client
-                .send_reply(to, text, &quoted_message(r, &me.uid))
+                .send_reply_with(to, text, &quoted_message(r, &me.uid), mentions)
                 .await
                 .map_err(err)?;
             let quote = Quote {
@@ -1832,7 +1835,13 @@ async fn send_and_store(
             };
             (sent, Some(quote))
         }
-        None => (client.send_text(to, text).await.map_err(err)?, None),
+        None => (
+            client
+                .send_text_with(to, text, mentions)
+                .await
+                .map_err(err)?,
+            None,
+        ),
     };
     let sent = Sent {
         msg_id: sent.msg_id,
@@ -1841,7 +1850,8 @@ async fn send_and_store(
         text: text.to_string(),
         media: None,
         quote,
-        raw: None,
+        // Kept the way Zalo writes them, so they show like received ones.
+        raw: (!mentions.is_empty()).then(|| json!({ "mentions": mentions })),
     };
     store_sent(store, bus, &me.uid, kind, remote_id, sent)
 }

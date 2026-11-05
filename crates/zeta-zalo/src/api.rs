@@ -81,6 +81,32 @@ pub enum Recipient<'a> {
     Group(&'a str),
 }
 
+/// Someone named in a group message: `len` UTF-16 units from `pos` (Zalo's
+/// clients count like JavaScript strings). `uid` "-1" names everyone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mention {
+    pub uid: String,
+    pub pos: u32,
+    pub len: u32,
+}
+
+/// `mentionInfo` as zca-js sends it: JSON text of `[{ pos, uid, len, type }]`,
+/// `type` 1 for everyone.
+pub(crate) fn mention_info(mentions: &[Mention]) -> String {
+    let list: Vec<Value> = mentions
+        .iter()
+        .map(|m| {
+            json!({
+                "pos": m.pos,
+                "uid": m.uid,
+                "len": m.len,
+                "type": if m.uid == "-1" { 1 } else { 0 },
+            })
+        })
+        .collect();
+    Value::Array(list).to_string()
+}
+
 /// Result of a send.
 #[derive(Clone, Debug)]
 pub struct SentMessage {
@@ -468,6 +494,17 @@ impl ZaloClient {
     /// Sent to the primary host only: a send that timed out may still have been
     /// delivered, so retrying on another host could duplicate it.
     pub async fn send_text(&self, to: Recipient<'_>, text: &str) -> Result<SentMessage> {
+        self.send_text_with(to, text, &[]).await
+    }
+
+    /// Send a text naming people (groups only, as zca-js): with mentions it
+    /// goes to `group/mention` with `mentionInfo`, else as [`Self::send_text`].
+    pub async fn send_text_with(
+        &self,
+        to: Recipient<'_>,
+        text: &str,
+        mentions: &[Mention],
+    ) -> Result<SentMessage> {
         let key = self.session_key()?;
         let client_id = now_millis();
         let imei = &self.device().imei;
@@ -476,6 +513,15 @@ impl ZaloClient {
                 Service::Chat,
                 "/api/message/sms",
                 json!({ "toid": uid, "message": text, "clientId": client_id, "imei": imei }),
+            ),
+            Recipient::Group(grid) if !mentions.is_empty() => (
+                Service::Group,
+                "/api/group/mention",
+                json!({
+                    "grid": grid, "message": text, "clientId": client_id,
+                    "mentionInfo": mention_info(mentions),
+                    "imei": imei, "ttl": 0, "visibility": 0
+                }),
             ),
             Recipient::Group(grid) => (
                 Service::Group,
@@ -566,6 +612,30 @@ mod tests {
             ("9", "Z", "u")
         );
         assert!(Friend::from_value(&json!({ "displayName": "nobody" })).is_none());
+    }
+
+    #[test]
+    fn mention_info_as_zca_js_sends_it() {
+        let info = mention_info(&[
+            Mention {
+                uid: "7".into(),
+                pos: 0,
+                len: 4,
+            },
+            Mention {
+                uid: "-1".into(),
+                pos: 5,
+                len: 8,
+            },
+        ]);
+        let v: Value = serde_json::from_str(&info).unwrap();
+        assert_eq!(
+            v,
+            json!([
+                { "pos": 0, "uid": "7", "len": 4, "type": 0 },
+                { "pos": 5, "uid": "-1", "len": 8, "type": 1 }
+            ])
+        );
     }
 
     #[test]

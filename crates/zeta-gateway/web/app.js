@@ -28,6 +28,7 @@ const state = {
   hits: null, // messages the search box found; null while searching
   meKey: '', // what the account's picture shows, to redraw it only on change
   requests: [], // friend requests received and not answered
+  mentions: [], // people named in the message being written: { uid, label }
 };
 
 // ------------------------------------------------------------------ helpers
@@ -866,7 +867,30 @@ const ZALO_EMOTICONS = {
 function displayText(text) {
   const whole = ZALO_EMOTICONS[(text || '').trim()];
   if (whole) return whole;
+  return inlineEmoticons(text);
+}
+
+function inlineEmoticons(text) {
   return (text || '').replace(/(^|\s)(\/-[a-z]+)(?=\s|$)/g, (m, pre, code) => pre + (ZALO_EMOTICONS[code] || code));
+}
+
+function mentionsMe(m) {
+  const me = state.status && state.status.uid;
+  return (m.mentions || []).some((x) => x.uid === '-1' || (me && x.uid === me));
+}
+
+/** Text with the people it names picked out (positions in UTF-16 units, as Zalo counts). */
+function appendMentioned(parent, text, mentions) {
+  const me = state.status && state.status.uid;
+  let last = 0;
+  for (const r of [...mentions].sort((a, b) => a.pos - b.pos)) {
+    if (r.pos < last || r.pos + r.len > text.length) continue;
+    if (r.pos > last) appendText(parent, inlineEmoticons(text.slice(last, r.pos)));
+    const mine = r.uid === '-1' || (me && r.uid === me);
+    parent.append(el('span', mine ? 'mention me' : 'mention', text.slice(r.pos, r.pos + r.len)));
+    last = r.pos + r.len;
+  }
+  if (last < text.length) appendText(parent, inlineEmoticons(text.slice(last)));
 }
 
 const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\p{Regional_Indicator}|[\u200d\ufe0f\u20e3]|\s)+$/u;
@@ -941,6 +965,8 @@ function messageNode(m, prev, t) {
       appendText(caption, md.description);
       bubble.appendChild(caption);
     }
+  } else if (m.mentions && m.mentions.length) {
+    appendMentioned(bubble, m.text || '', m.mentions);
   } else {
     appendText(bubble, text || '');
   }
@@ -1347,6 +1373,8 @@ async function openThread(id, focusSeq) {
   renderReply();
   if (panelKind === 'emoji') closePanel();
   if (info.thread && info.thread !== id) openInfo();
+  state.mentions = [];
+  closeMentionBox();
   try {
     let list = await fetchMessages(id);
     let full = list.length === 50;
@@ -1763,6 +1791,134 @@ function autosize() {
   input.style.overflowY = input.scrollHeight > 160 ? 'auto' : 'hidden';
 }
 
+// ------------------------------------------------------------------ mentions
+//
+// In a group, "@" followed by a few letters lists the members; picking one
+// writes "@Name" and remembers who it is, so the message names them.
+
+const mention = { members: new Map(), shown: [], active: 0 };
+
+/** The "@…" being typed right before the cursor, in a group. */
+function mentionQuery() {
+  const t = state.threads.get(state.current);
+  if (!t || t.kind !== 'group' || input.selectionStart !== input.selectionEnd) return null;
+  const before = input.value.slice(0, input.selectionStart);
+  const found = /(^|\s)@([^\s@]{0,30})$/.exec(before);
+  if (!found) return null;
+  return { start: input.selectionStart - found[2].length - 1, text: found[2] };
+}
+
+/** Members of a group, asked once per page load. */
+function groupMembers(id) {
+  if (!mention.members.has(id)) {
+    const asked = api(`/threads/${encodeURIComponent(id)}/members`)
+      .then((data) => data.members || [])
+      .catch(() => {
+        mention.members.delete(id);
+        return [];
+      });
+    mention.members.set(id, asked);
+  }
+  return mention.members.get(id);
+}
+
+function closeMentionBox() {
+  $('mention-box').hidden = true;
+  mention.shown = [];
+}
+
+async function updateMentionBox() {
+  const q = mentionQuery();
+  if (!q) {
+    closeMentionBox();
+    return;
+  }
+  const id = state.current;
+  const members = await groupMembers(id);
+  const now = mentionQuery();
+  if (state.current !== id || !now || now.text !== q.text) return;
+  const me = state.status && state.status.uid;
+  const wanted = fold(q.text);
+  const list = members
+    .filter((m) => m.uid !== me && (m.name || '').trim() && fold(m.name).includes(wanted))
+    .slice(0, 8)
+    .map((m) => ({ uid: m.uid, name: m.name.trim(), avatar: m.avatar }));
+  if (fold('tat ca all').includes(wanted)) list.unshift({ uid: '-1', name: 'Tất cả', avatar: '', note: 'Nhắc cả nhóm' });
+  mention.shown = list;
+  mention.active = 0;
+  renderMentionBox();
+}
+
+function renderMentionBox() {
+  const box = $('mention-box');
+  box.replaceChildren();
+  if (!mention.shown.length) {
+    box.hidden = true;
+    return;
+  }
+  mention.shown.forEach((m, i) => {
+    const item = el('div', i === mention.active ? 'mention-item active' : 'mention-item');
+    item.setAttribute('role', 'option');
+    const picture = m.uid === '-1' ? el('div', 'avatar', '@') : avatarBox(`zalo:u:${m.uid}`, m.name, m.avatar);
+    item.append(picture, el('span', 'name', m.name));
+    if (m.note) item.append(el('span', 'note', m.note));
+    // mousedown, so the box does not lose the cursor before the click lands.
+    item.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      pickMention(m);
+    });
+    box.append(item);
+  });
+  box.hidden = false;
+}
+
+function pickMention(m) {
+  const q = mentionQuery();
+  if (!q) return;
+  const label = `@${m.name}`;
+  input.setRangeText(`${label} `, q.start, input.selectionStart, 'end');
+  state.mentions.push({ uid: m.uid, label });
+  closeMentionBox();
+  autosize();
+  updateSendButton();
+  input.focus();
+}
+
+/** Keys while the list is open; true when the key was for the list. */
+function mentionKey(e) {
+  if ($('mention-box').hidden || !mention.shown.length) return false;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    const n = mention.shown.length;
+    mention.active = (mention.active + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+    renderMentionBox();
+  } else if (e.key === 'Enter' || e.key === 'Tab') {
+    pickMention(mention.shown[mention.active]);
+  } else if (e.key === 'Escape') {
+    closeMentionBox();
+  } else {
+    return false;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  return true;
+}
+
+/** Where the chosen names stand in the text to send (each "@Name" once). */
+function draftMentions(text) {
+  const taken = [];
+  const out = [];
+  for (const m of state.mentions) {
+    let at = text.indexOf(m.label);
+    while (at !== -1 && taken.some(([s, e]) => at < e && at + m.label.length > s)) {
+      at = text.indexOf(m.label, at + 1);
+    }
+    if (at === -1) continue;
+    taken.push([at, at + m.label.length]);
+    out.push({ uid: m.uid, pos: at, len: m.label.length });
+  }
+  return out.sort((a, b) => a.pos - b.pos);
+}
+
 /** An empty box turns the send button into a quick 👍, as in Zalo. */
 function updateSendButton() {
   const empty = !input.value.trim();
@@ -1776,8 +1932,11 @@ input.addEventListener('input', () => {
   autosize();
   updateSendButton();
   sendTyping();
+  updateMentionBox();
 });
+input.addEventListener('blur', () => setTimeout(closeMentionBox, 150));
 input.addEventListener('keydown', (e) => {
+  if (mentionKey(e)) return;
   // Enter sends; Shift+Enter is a new line; never send while an IME is composing.
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
     e.preventDefault();
@@ -1799,8 +1958,12 @@ $('composer').addEventListener('submit', async (e) => {
   const body = { text };
   const replyTo = state.replyTo;
   if (replyTo && replyTo.thread_id === id) body.reply_to = replyTo.seq;
+  const named = draftMentions(text);
+  if (named.length) body.mentions = named;
+  closeMentionBox();
   try {
     const message = await api(`/threads/${encodeURIComponent(id)}/messages`, { json: body });
+    state.mentions = [];
     if (state.replyTo === replyTo) cancelReply();
     onMessage({ message, thread: null });
   } catch (err) {
@@ -2491,7 +2654,8 @@ function askNotificationPermission() {
 
 function notify(t, m) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
-  const title = t.kind === 'group' ? `${threadName(t)} · ${m.sender_name || 'Thành viên'}` : threadName(t);
+  let title = t.kind === 'group' ? `${threadName(t)} · ${m.sender_name || 'Thành viên'}` : threadName(t);
+  if (mentionsMe(m)) title += ' nhắc đến bạn';
   const n = new Notification(title, { body: displayText(m.text), tag: m.thread_id, icon: '/icon.svg' });
   n.onclick = () => {
     window.focus();

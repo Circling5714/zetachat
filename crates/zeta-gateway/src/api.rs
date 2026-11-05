@@ -31,8 +31,8 @@ use crate::auth::AuthDevice;
 use crate::events::EventBus;
 use crate::media_cache::{self, CachedFile, FetchError, MediaCache};
 use crate::model::{
-    now_ms, split_thread_id, GroupMembers, Message, Person, StoredEvent, Thread, ThreadKind,
-    PEOPLE_FRESH_MS,
+    now_ms, split_thread_id, GroupMembers, Mention, Message, Person, StoredEvent, Thread,
+    ThreadKind, PEOPLE_FRESH_MS,
 };
 use crate::stickers::StickerQuery;
 use crate::store::Store;
@@ -654,6 +654,30 @@ struct SendBody {
     /// `seq` of the message this one answers.
     #[serde(default)]
     reply_to: Option<i64>,
+    /// People named in a group message (`@Tên`): positions in UTF-16 units
+    /// of `text` as sent.
+    #[serde(default)]
+    mentions: Vec<Mention>,
+}
+
+/// Mentions that fit the text once it is trimmed: shifted by what the trim took
+/// from the front, inside the text, with a user id (digits, or "-1" for
+/// everyone). At most 50.
+fn checked_mentions(raw: &str, text: &str, mentions: Vec<Mention>) -> Vec<Mention> {
+    let lead = raw.len() - raw.trim_start().len();
+    let shift = raw[..lead].encode_utf16().count() as u32;
+    let units = text.encode_utf16().count() as u32;
+    mentions
+        .into_iter()
+        .filter(|m| {
+            m.uid == "-1" || (!m.uid.is_empty() && m.uid.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .filter_map(|m| {
+            let pos = m.pos.checked_sub(shift)?;
+            (m.len > 0 && pos + m.len <= units).then_some(Mention { pos, ..m })
+        })
+        .take(50)
+        .collect()
 }
 
 /// A message of thread `id` by its `seq`.
@@ -681,6 +705,11 @@ async fn send_message(
     if text.is_empty() {
         return Err(ApiError::bad_request("text is empty"));
     }
+    // Zalo takes mentions in groups only.
+    let mentions = match kind {
+        ThreadKind::Group => checked_mentions(&body.text, text, body.mentions),
+        ThreadKind::User => Vec::new(),
+    };
     let reply_to = match body.reply_to {
         Some(seq) => {
             let message = message_in(&st, &id, seq)?;
@@ -703,6 +732,7 @@ async fn send_message(
             remote_id: remote_id.to_string(),
             text: text.to_string(),
             reply_to,
+            mentions,
             reply,
         })
         .await

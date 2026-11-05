@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::media::{Media, Quote};
+pub use zeta_zalo::api::Mention;
 
 /// One conversation: a 1-1 chat or a group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +150,8 @@ pub struct Message {
     /// For this account's messages: 0 sent, 1 delivered to the other side,
     /// 2 seen there.
     pub status: i64,
+    /// People named in the text (`@Tên`), positions in UTF-16 units.
+    pub mentions: Vec<Mention>,
 }
 
 /// Reactions to a message with one icon.

@@ -67,6 +67,7 @@ fn fake_connector(
                     remote_id,
                     text,
                     reply_to,
+                    mentions,
                     reply,
                 } => {
                     let thread = ThreadUpsert {
@@ -93,7 +94,7 @@ fn fake_connector(
                                 remote_id: r.message.remote_id,
                             }),
                             sent_at: 10,
-                            raw: "{}".into(),
+                            raw: json!({ "mentions": mentions }).to_string(),
                         })
                         .unwrap()
                         .unwrap();
@@ -1294,4 +1295,46 @@ async fn presence_of_1_1_chats_only() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
+    let f = fixture();
+    let group = thread_id(ThreadKind::Group, "70");
+    // "  @Lan ơi" is trimmed to "@Lan ơi": the mention moves back by two.
+    let body = json!({
+        "text": "  @Lan ơi",
+        "mentions": [
+            { "uid": "5", "pos": 2, "len": 4 },
+            { "uid": "x", "pos": 2, "len": 4 },
+            { "uid": "6", "pos": 8, "len": 9 },
+            { "uid": "-1", "pos": 0, "len": 1 }
+        ]
+    });
+    let (status, sent) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{group}/messages"),
+        Some(body),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["text"], "@Lan ơi");
+    assert_eq!(
+        sent["mentions"],
+        json!([{ "uid": "5", "pos": 0, "len": 4 }])
+    );
+    // 1-1 chats take no mentions.
+    let user = thread_id(ThreadKind::User, "70");
+    let body = json!({ "text": "@Lan", "mentions": [{ "uid": "5", "pos": 0, "len": 4 }] });
+    let (_, sent) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/messages"),
+        Some(body),
+        true,
+    )
+    .await;
+    assert_eq!(sent["mentions"], json!([]));
 }

@@ -305,6 +305,8 @@ struct Sample {
     minutes_ago: i64,
     media: Option<Media>,
     quote: Option<Quote>,
+    /// Zalo-shaped JSON of the message (mentions…), `{}` for none.
+    raw: String,
 }
 
 fn say(outgoing: bool, sender: &'static str, text: &'static str, minutes_ago: i64) -> Sample {
@@ -316,6 +318,21 @@ fn say(outgoing: bool, sender: &'static str, text: &'static str, minutes_ago: i6
         minutes_ago,
         media: None,
         quote: None,
+        raw: "{}".into(),
+    }
+}
+
+/// A message naming `uid` with its first `len` UTF-16 units.
+fn naming(
+    sender: &'static str,
+    text: &'static str,
+    uid: &str,
+    len: u32,
+    minutes_ago: i64,
+) -> Sample {
+    Sample {
+        raw: json!({ "mentions": [{ "uid": uid, "pos": 0, "len": len, "type": 0 }] }).to_string(),
+        ..say(false, sender, text, minutes_ago)
     }
 }
 
@@ -355,6 +372,7 @@ fn share(
         minutes_ago,
         media: Some(media),
         quote: None,
+        raw: "{}".into(),
     }
 }
 
@@ -391,7 +409,7 @@ fn add_thread(store: &Store, kind: ThreadKind, remote: &str, name: &str, message
             media: sample.media,
             quote: sample.quote,
             sent_at: now_ms() - sample.minutes_ago * 60_000,
-            raw: "{}".into(),
+            raw: sample.raw,
         });
     }
 }
@@ -558,6 +576,7 @@ fn seed(store: &Store) {
             say(false, "Đức Anh", "Mai họp lúc 9 giờ nhé mọi người", 2900),
             say(false, "Thu Trang", "Ok anh, em chuẩn bị slide", 2890),
             say(true, "", "Mình sẽ gửi bản demo trước buổi họp", 2880),
+            naming("Đức Anh", "@Demo nhớ gửi trước 8 giờ nhé", ME, 5, 2870),
         ],
     );
     add_thread(store, ThreadKind::Group, "2002", "Lớp 12A1", Vec::new());
@@ -596,6 +615,7 @@ struct Content<'a> {
     text: &'a str,
     media: Option<Media>,
     quote: Option<Quote>,
+    raw: String,
 }
 
 fn store_and_publish(
@@ -632,7 +652,7 @@ fn store_and_publish(
             media: content.media,
             quote: content.quote,
             sent_at: now,
-            raw: "{}".into(),
+            raw: content.raw,
         })
         .ok()??;
     let snapshot = store.thread(&message.thread_id).ok().flatten();
@@ -646,6 +666,7 @@ fn text(text: &str) -> Content<'_> {
         text,
         media: None,
         quote: None,
+        raw: "{}".into(),
     }
 }
 
@@ -717,6 +738,7 @@ async fn demo_upload(
                 text: &summary,
                 media: Some(found),
                 quote: None,
+                raw: "{}".into(),
             };
             store_and_publish(store, bus, kind, remote_id, true, "", content)
                 .ok_or_else(|| "demo: không lưu được tin".to_string())
@@ -750,6 +772,7 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     remote_id,
                     text,
                     reply_to,
+                    mentions,
                     reply,
                 } => {
                     let quote = reply_to.map(|r| Quote {
@@ -770,6 +793,7 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                         "",
                         Content {
                             quote,
+                            raw: json!({ "mentions": mentions }).to_string(),
                             ..self::text(&text)
                         },
                     );
@@ -945,6 +969,7 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                             ..Media::default()
                         }),
                         quote: None,
+                        raw: "{}".into(),
                     };
                     let sent = store_and_publish(&store, &bus, kind, &remote_id, true, "", content);
                     let _ = reply.send(sent.ok_or_else(|| "demo: không lưu được tin".to_string()));
