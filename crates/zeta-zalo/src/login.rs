@@ -118,8 +118,17 @@ pub(crate) fn session_cookie_from_confirm(raw: &RawResponse, body: &Value) -> Op
 }
 
 impl ZaloClient {
-    /// `getServerInfo`: refresh the endpoint table. Works without a session.
+    /// `getServerInfo`: refresh the endpoint table and the upload limits. Works
+    /// without a session.
     pub async fn refresh_server_info(&mut self) -> Result<()> {
+        let data = self.server_info().await?;
+        self.domains_mut().apply_login_config(&data);
+        self.limits = crate::upload::FileLimits::from_server_info(&data);
+        Ok(())
+    }
+
+    /// The raw `getServerInfo` answer: endpoint table and client settings.
+    pub async fn server_info(&self) -> Result<Value> {
         let mut p = Map::new();
         p.insert("imei".into(), json!(self.device().imei));
         p.insert("type".into(), json!(ZPW_TYPE));
@@ -132,9 +141,7 @@ impl ZaloClient {
             self.domains().auth,
             signed_query(&p, "getserverinfo")
         );
-        let data = self.get(&url, None).await?;
-        self.domains_mut().apply_login_config(&data);
-        Ok(())
+        self.get(&url, None).await
     }
 
     /// Ask for a login QR code.

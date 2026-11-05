@@ -1,6 +1,6 @@
 //! HTTP API tests with an in-memory store and a fake Zalo connector.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -14,7 +14,9 @@ use zeta_gateway::events::EventBus;
 use zeta_gateway::media_cache::MediaCache;
 use zeta_gateway::model::{thread_id, Media, NewMessage, ThreadKind, ThreadUpsert};
 use zeta_gateway::store::Store;
-use zeta_gateway::zalo::{LoginState, ZaloCommand, ZaloHandle, ZaloStatus};
+use zeta_gateway::uploads::Uploads;
+use zeta_gateway::zalo::{LoginState, ZaloCommand, ZaloHandle};
+use zeta_zalo::upload::FileLimits;
 
 /// Read receipts the connector was asked for: (remote id, message ids).
 type SeenLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
@@ -30,7 +32,13 @@ struct Fixture {
 /// A connector that "sends" by storing the message, like the real one does.
 fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle {
     let (commands, mut rx) = mpsc::channel(8);
-    let status = Arc::new(RwLock::new(ZaloStatus::default()));
+    let handle = ZaloHandle::new(commands);
+    // Small limits, so the tests can go over them.
+    *handle.limits.write().unwrap() = FileLimits {
+        max_file_bytes: 64,
+        max_photo_bytes: 16,
+        ..FileLimits::default()
+    };
     tokio::spawn(async move {
         let mut sent = 0;
         while let Some(cmd) = rx.recv().await {
@@ -74,8 +82,20 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                     kind,
                     remote_id,
                     attachment,
-                    reply,
+                    job,
                 } => {
+                    // "slow…" files wait to be cancelled.
+                    if attachment.name.starts_with("slow") {
+                        tokio::spawn(async move {
+                            assert!(job.start());
+                            job.cancelled().await;
+                            job.remove_file().await;
+                        });
+                        continue;
+                    }
+                    assert!(job.start());
+                    job.progress(attachment.size);
+                    assert!(job.begin_finishing());
                     let thread = ThreadUpsert {
                         kind,
                         remote_id,
@@ -84,19 +104,15 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                     };
                     store.upsert_thread(&thread, false).unwrap();
                     // Echo what arrived, so the test can check the request was parsed.
+                    let content = std::fs::read(&attachment.path).unwrap();
                     let media = Media {
-                        kind: if attachment.is_photo() {
-                            "image"
-                        } else {
-                            "file"
-                        }
-                        .into(),
+                        kind: if attachment.photo { "image" } else { "file" }.into(),
                         url: "https://f.zdn.vn/x".into(),
                         name: attachment.name.clone(),
                         description: attachment.caption.clone(),
                         width: attachment.width,
                         height: attachment.height,
-                        size: attachment.bytes.len() as u64,
+                        size: attachment.size,
                         ..Media::default()
                     };
                     let message = store
@@ -108,7 +124,11 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                             sender_name: String::new(),
                             outgoing: true,
                             kind: attachment.mime.clone(),
-                            text: String::new(),
+                            text: format!(
+                                "{} {}",
+                                String::from_utf8_lossy(&content),
+                                attachment.md5
+                            ),
                             media: Some(media),
                             quote: None,
                             sent_at: 20,
@@ -116,7 +136,8 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
                         })
                         .unwrap()
                         .unwrap();
-                    let _ = reply.send(Ok(message));
+                    job.finish(Ok(message));
+                    job.remove_file().await;
                 }
                 ZaloCommand::MarkSeen {
                     remote_id,
@@ -138,7 +159,7 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog) -> ZaloHandle
             }
         }
     });
-    ZaloHandle { commands, status }
+    handle
 }
 
 fn fixture() -> Fixture {
@@ -147,12 +168,14 @@ fn fixture() -> Fixture {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let zalo = fake_connector(store.clone(), bus.clone(), seen.clone());
     let (_, token) = store.add_device("test").unwrap();
-    let media = std::env::temp_dir().join(format!("zetachat-api-{:016x}", rand::random::<u64>()));
+    let dir = std::env::temp_dir().join(format!("zetachat-api-{:016x}", rand::random::<u64>()));
+    let uploads = Arc::new(Uploads::new(dir.join("uploads"), bus.clone()).unwrap());
     let app = api::router(AppState {
         store: store.clone(),
         bus,
         zalo,
-        media: Arc::new(MediaCache::new(media).unwrap()),
+        media: Arc::new(MediaCache::new(dir.join("media")).unwrap()),
+        uploads,
     });
     Fixture {
         app,
@@ -285,50 +308,128 @@ async fn upload(
     )
 }
 
+/// Wait until upload `id` has ended; returns it.
+async fn ended_upload(f: &Fixture, id: &str) -> Value {
+    for _ in 0..200 {
+        let (_, list) = call(f, "GET", "/api/v1/uploads", None, true).await;
+        let found = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["id"] == id)
+            .cloned();
+        if let Some(upload) = found {
+            if ["done", "failed", "cancelled"].contains(&upload["state"].as_str().unwrap()) {
+                return upload;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("upload {id} did not end");
+}
+
+/// Post a file and wait for its upload to end; returns the sent message.
+async fn send_file(f: &Fixture, query: &str, content_type: Option<&str>, body: &[u8]) -> Value {
+    let uri = format!("/api/v1/threads/zalo:u:42/attachments?{query}");
+    let (status, body) = upload(f, &uri, content_type, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["upload"]["thread_id"], "zalo:u:42");
+    let ended = ended_upload(f, body["upload"]["id"].as_str().unwrap()).await;
+    assert_eq!(ended["state"], "done", "{ended}");
+    assert_eq!(ended["sent"], ended["size"]);
+    ended["message"].clone()
+}
+
 #[tokio::test]
 async fn photos_and_files_are_handed_to_the_connector() {
     let f = fixture();
-    let base = "/api/v1/threads/zalo:u:42/attachments";
-
-    let (status, body) = upload(
+    let message = send_file(
         &f,
-        &format!("{base}?name=%E1%BA%A2nh.png&width=640&height=480&caption=Xem%20n%C3%A8"),
+        "name=%E1%BA%A2nh.png&width=640&height=480&caption=Xem%20n%C3%A8",
         Some("image/png"),
         b"\x89PNG....",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["kind"], "image/png");
-    assert_eq!(body["media"]["kind"], "image");
-    assert_eq!(body["media"]["name"], "Ảnh.png");
-    assert_eq!(body["media"]["description"], "Xem nè");
+    assert_eq!(message["kind"], "image/png");
+    assert_eq!(message["media"]["kind"], "image");
+    assert_eq!(message["media"]["name"], "Ảnh.png");
+    assert_eq!(message["media"]["description"], "Xem nè");
     assert_eq!(
         (
-            body["media"]["width"].as_u64(),
-            body["media"]["height"].as_u64()
+            message["media"]["width"].as_u64(),
+            message["media"]["height"].as_u64()
         ),
         (Some(640), Some(480))
     );
 
-    // No content type: guessed from the name. Directories are dropped.
-    let (status, body) = upload(
-        &f,
-        &format!("{base}?name=..%2F..%2Fbao-cao.pdf"),
-        None,
-        b"%PDF",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["kind"], "application/pdf");
-    assert_eq!(body["media"]["kind"], "file");
-    assert_eq!(body["media"]["name"], "bao-cao.pdf");
-    assert_eq!(body["media"]["size"], 4);
+    // No content type: guessed from the name. Directories are dropped. The
+    // connector gets the content and its MD5.
+    let message = send_file(&f, "name=..%2F..%2Fbao-cao.pdf", None, b"%PDF").await;
+    assert_eq!(message["kind"], "application/pdf");
+    assert_eq!(message["media"]["kind"], "file");
+    assert_eq!(message["media"]["name"], "bao-cao.pdf");
+    assert_eq!(message["media"]["size"], 4);
+    let md5 = message["text"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("%PDF ")
+        .unwrap();
+    assert_eq!(md5.len(), 32, "{message}");
+
+    // Pictures go as files when asked, or when too large for a photo.
+    let message = send_file(&f, "name=a.png&as=file", Some("image/png"), b"x").await;
+    assert_eq!(message["media"]["kind"], "file");
+    let message = send_file(&f, "name=big.png", Some("image/png"), &[7; 17]).await;
+    assert_eq!(message["media"]["kind"], "file");
+
+    // Zalo's rules: refused extensions, the size limit (announced or not).
+    let base = "/api/v1/threads/zalo:u:42/attachments";
+    let (status, body) = upload(&f, &format!("{base}?name=setup.EXE"), None, b"MZ").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains(".exe"), "{body}");
+    let (status, body) = upload(&f, &format!("{base}?name=a.bin"), None, &[0; 65]).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("{base}?name=a.bin"))
+        .header("authorization", format!("Bearer {}", f.token))
+        .header("content-length", "1000")
+        .body(Body::from(vec![0; 1000]))
+        .unwrap();
+    let resp = f.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
     let (status, _) = upload(&f, &format!("{base}?name=a.txt"), Some("text/plain"), b"").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = upload(&f, base, Some("text/plain"), b"x").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "name is required");
     let (status, _) = upload(&f, "/api/v1/threads/bogus/attachments?name=a", None, b"x").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The status tells devices the limits.
+    let (_, status) = call(&f, "GET", "/api/v1/status", None, true).await;
+    assert_eq!(status["limits"]["max_file_bytes"], 64);
+    assert!(status["limits"]["blocked_extensions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("exe")));
+}
+
+#[tokio::test]
+async fn uploads_can_be_cancelled_until_they_end() {
+    let f = fixture();
+    let uri = "/api/v1/threads/zalo:u:42/attachments?name=slow.zip";
+    let (status, body) = upload(&f, uri, None, b"PK").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let id = body["upload"]["id"].as_str().unwrap().to_string();
+    let cancel = format!("/api/v1/uploads/{id}");
+    let (status, body) = call(&f, "DELETE", &cancel, None, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["upload"]["state"], "cancelled");
+    assert_eq!(ended_upload(&f, &id).await["state"], "cancelled");
+    let (status, _) = call(&f, "DELETE", &cancel, None, true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "already ended");
+    let (status, _) = call(&f, "DELETE", "/api/v1/uploads/up_nope", None, true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 

@@ -9,6 +9,7 @@ pub mod media;
 pub mod media_cache;
 pub mod model;
 pub mod store;
+pub mod uploads;
 pub mod web;
 pub mod zalo;
 
@@ -22,6 +23,11 @@ pub fn db_path(data_dir: &Path) -> PathBuf {
 /// Cached media files inside the data directory.
 pub fn media_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("media")
+}
+
+/// Files waiting to be sent to Zalo, inside the data directory.
+pub fn uploads_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("uploads")
 }
 
 /// Saved Zalo session inside the data directory. Contains credentials.

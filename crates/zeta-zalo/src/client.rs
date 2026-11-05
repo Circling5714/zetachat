@@ -13,6 +13,7 @@ use crate::crypto;
 use crate::domains::{Domains, Service};
 use crate::error::{endpoint_of, Error, Result};
 use crate::session::{Device, SessionData};
+use crate::upload::FileLimits;
 use crate::{USER_AGENT, ZPW_TYPE, ZPW_VER};
 
 /// A Zalo client. Before login it can only run the login flow; after a login or
@@ -24,6 +25,7 @@ pub struct ZaloClient {
     domains: Domains,
     session: Option<SessionData>,
     key: Option<Vec<u8>>,
+    pub(crate) limits: FileLimits,
 }
 
 /// Status, body and session cookie of a request whose status matters (QR polling).
@@ -86,6 +88,7 @@ impl ZaloClient {
             domains: Domains::default(),
             session: None,
             key: None,
+            limits: FileLimits::default(),
         })
     }
 

@@ -29,6 +29,7 @@ Cách dùng:
   zeta groups  <session.json> [--names]          đếm (hoặc liệt kê) nhóm
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
+  zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
   zeta send    <session.json> user|group <id> <nội dung>
   zeta listen  <session.json> [giây]             nghe sự kiện thời gian thực
   zeta import-ctdozlite <ctdozlite.json> <out.json>";
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
         Some("groups") => groups(rest).await,
         Some("recent") => recent(rest).await,
         Some("probe") => probe(rest).await,
+        Some("limits") => limits(rest).await,
         Some("send") => send(rest).await,
         Some("listen") => listen(rest).await,
         Some("import-ctdozlite") => import_ctdozlite(rest),
@@ -221,6 +223,34 @@ async fn probe(args: &[String]) -> Result<()> {
     match client.get_encrypted(service, path, &params).await {
         Ok(data) => println!("OK {}", shape(&data, 0)),
         Err(e) => println!("LỖI {e}"),
+    }
+    Ok(())
+}
+
+/// Client settings from `getServerInfo` (server configuration, nothing personal):
+/// the feature names, and the file-sharing section in full.
+async fn limits(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    let data = client.server_info().await?;
+    // Zalo spells it "setttings"; zca-js falls back to "settings".
+    let settings = data.get("setttings").or_else(|| data.get("settings"));
+    let Some(features) = settings.and_then(|s| s.get("features")) else {
+        println!("không có settings.features; khóa: {}", shape(&data, 2));
+        return Ok(());
+    };
+    let names: Vec<&String> = features
+        .as_object()
+        .map(|m| m.keys().collect())
+        .unwrap_or_default();
+    println!("features: {names:?}");
+    let wanted: Vec<&str> = match args.get(1..) {
+        Some(more) if !more.is_empty() => more.iter().map(String::as_str).collect(),
+        _ => vec!["sharefile"],
+    };
+    for key in wanted {
+        if let Some(section) = features.get(key) {
+            println!("{key}: {}", serde_json::to_string_pretty(section)?);
+        }
     }
     Ok(())
 }

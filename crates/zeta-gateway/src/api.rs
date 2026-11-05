@@ -8,13 +8,15 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, SET_COOKIE,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
@@ -28,10 +30,8 @@ use crate::events::EventBus;
 use crate::media_cache::{self, FetchError, MediaCache};
 use crate::model::{split_thread_id, Message, StoredEvent, Thread};
 use crate::store::Store;
-use crate::zalo::{Attachment, LoginState, ZaloCommand, ZaloHandle};
-
-/// Largest photo or file a device can send.
-pub const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
+use crate::zalo::{photo_type, Attachment, LoginState, ZaloCommand, ZaloHandle};
 
 /// Shared state of the HTTP handlers.
 #[derive(Clone)]
@@ -40,6 +40,7 @@ pub struct AppState {
     pub bus: EventBus,
     pub zalo: ZaloHandle,
     pub media: Arc<MediaCache>,
+    pub uploads: Arc<Uploads>,
 }
 
 /// JSON error `{ "error": "…" }` with an HTTP status.
@@ -102,10 +103,13 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/threads/{id}/messages",
             get(list_messages).post(send_message),
         )
+        // The body goes to disk as it comes, within Zalo's limit (checked there).
         .route(
             "/api/v1/threads/{id}/attachments",
-            post(send_attachment).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            post(send_attachment).layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/v1/uploads", get(list_uploads))
+        .route("/api/v1/uploads/{id}", delete(cancel_upload))
         .route("/api/v1/threads/{id}/read", post(mark_read))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
@@ -130,10 +134,16 @@ async fn health() -> Json<Value> {
 
 async fn status(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Value> {
     let last_event_seq = st.store.last_event_seq().map_err(ApiError::internal)?;
+    let limits = st.zalo.limits();
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "zalo": st.zalo.status(),
         "last_event_seq": last_event_seq,
+        "limits": {
+            "max_file_bytes": limits.max_file_bytes,
+            "max_photo_bytes": limits.max_photo_bytes,
+            "blocked_extensions": limits.blocked_extensions,
+        },
     })))
 }
 
@@ -293,6 +303,9 @@ struct AttachmentQuery {
     width: u32,
     #[serde(default)]
     height: u32,
+    /// `file` sends a picture as a file (original quality, no preview).
+    #[serde(default, rename = "as")]
+    send_as: String,
 }
 
 /// A file name without directories or control characters, at most 180 characters.
@@ -328,21 +341,46 @@ fn type_from_name(name: &str) -> &'static str {
     }
 }
 
-/// Send a photo or a file. The body is the file itself; pictures in common
-/// formats become photos, anything else a file.
+fn too_large(limit: u64) -> ApiError {
+    ApiError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("Zalo chỉ nhận tệp tới {} MB", limit / (1024 * 1024)),
+    )
+}
+
+/// Send a photo or a file. The body is the file itself, written to disk as it
+/// arrives; the answer (`202`) comes once it is all there, with the upload that
+/// then carries it to Zalo (follow it through `upload` events). Pictures in
+/// common formats become photos unless `as=file`; anything else is a file.
 async fn send_attachment(
     State(st): State<AppState>,
     _: AuthDevice,
     Path(id): Path<String>,
     Query(q): Query<AttachmentQuery>,
     headers: HeaderMap,
-    body: Bytes,
-) -> ApiResult<Message> {
+    body: Body,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
-    if body.is_empty() {
-        return Err(ApiError::bad_request("file is empty"));
-    }
     let name = clean_file_name(&q.name);
+    let limits = st.zalo.limits();
+    if let Some(ext) = limits.blocked_extension(&name) {
+        return Err(ApiError::bad_request(format!(
+            "Zalo không cho gửi tệp .{ext}; hãy nén thành .zip rồi gửi"
+        )));
+    }
+    let announced = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if announced.is_some_and(|n| n > limits.max_file_bytes) {
+        return Err(too_large(limits.max_file_bytes));
+    }
+    if st.uploads.pending() >= MAX_PENDING {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "đang có nhiều tệp chờ gửi, hãy đợi một chút",
+        ));
+    }
     let declared = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -350,30 +388,69 @@ async fn send_attachment(
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty() && v != "application/octet-stream");
     let mime = declared.unwrap_or_else(|| type_from_name(&name).to_string());
+
+    let file = st
+        .uploads
+        .receive(body, limits.max_file_bytes)
+        .await
+        .map_err(|e| match e {
+            SpoolError::Empty => ApiError::bad_request("file is empty"),
+            SpoolError::TooLarge(limit) => too_large(limit),
+            SpoolError::Interrupted(reason) => ApiError::bad_request(reason),
+            SpoolError::Io(e) => ApiError::internal(e),
+        })?;
+    let photo = q.send_as != "file" && photo_type(&mime) && file.size <= limits.max_photo_bytes;
+    let (size, md5) = (file.size, file.md5.clone());
+    let job = st.uploads.register(file, &id, &name, photo);
     let attachment = Attachment {
         name,
         mime,
-        bytes: body.to_vec(),
+        path: job.path().to_path_buf(),
+        size,
+        md5,
         width: q.width,
         height: q.height,
         caption: q.caption,
+        photo,
     };
-    let (reply, answer) = oneshot::channel();
-    st.zalo
-        .commands
-        .send(ZaloCommand::SendAttachment {
-            kind,
-            remote_id: remote_id.to_string(),
-            attachment,
-            reply,
-        })
-        .await
-        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
-    let message = answer
-        .await
-        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
-        .map_err(ApiError::bad_gateway)?;
-    Ok(Json(message))
+    let command = ZaloCommand::SendAttachment {
+        kind,
+        remote_id: remote_id.to_string(),
+        attachment,
+        job: job.clone(),
+    };
+    if st.zalo.commands.send(command).await.is_err() {
+        job.finish(Err("Zalo connector is not running".into()));
+        job.remove_file().await;
+        return Err(ApiError::unavailable("Zalo connector is not running"));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "upload": job.snapshot() })),
+    ))
+}
+
+async fn list_uploads(State(st): State<AppState>, _: AuthDevice) -> Json<Vec<Upload>> {
+    Json(st.uploads.list())
+}
+
+/// Cancel an upload that has not reached the sending of its message.
+async fn cancel_upload(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    let job = st
+        .uploads
+        .get(&id)
+        .ok_or_else(|| ApiError::not_found("upload"))?;
+    match job.cancel() {
+        Ok(upload) => Ok(Json(json!({ "upload": upload }))),
+        Err(CancelError::TooLate(_)) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "tệp đã lên Zalo, không hủy được nữa",
+        )),
+    }
 }
 
 async fn mark_read(
@@ -424,11 +501,17 @@ async fn list_events(
     Ok(Json(events))
 }
 
+/// Logged events carry their `seq` as id; transient ones (seq 0) carry none, so
+/// a client's `Last-Event-ID` only ever points into the log.
 fn to_sse(event: &StoredEvent) -> SseEvent {
-    SseEvent::default()
-        .id(event.seq.to_string())
+    let sse = SseEvent::default()
         .event(event.kind.clone())
-        .data(event.payload.to_string())
+        .data(event.payload.to_string());
+    if event.seq > 0 {
+        sse.id(event.seq.to_string())
+    } else {
+        sse
+    }
 }
 
 /// Server-sent events: the backlog after `Last-Event-ID` (or `?since=`), then live
@@ -472,6 +555,9 @@ fn event_stream(
             }
             loop {
                 match live.recv().await {
+                    Ok(event) if event.seq == 0 => {
+                        return Some((Ok(to_sse(&event)), (backlog, live, last)));
+                    }
                     Ok(event) if event.seq > last => {
                         last = event.seq;
                         return Some((Ok(to_sse(&event)), (backlog, live, last)));

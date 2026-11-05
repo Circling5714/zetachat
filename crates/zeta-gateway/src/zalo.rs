@@ -12,19 +12,20 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeta_zalo::api::{Recipient, SessionHealth};
 use zeta_zalo::socket::{self, RealtimeEvent};
-use zeta_zalo::upload::{self, Photo};
+use zeta_zalo::upload::{self, FileLimits, FileSource, UploadedFile};
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
 use crate::events::EventBus;
 use crate::media;
-use crate::media_cache::MediaCache;
+use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
     now_ms, thread_id, Media, Message, NewMessage, Quote, ThreadKind, ThreadUpsert,
 };
 use crate::store::Store;
+use crate::uploads::UploadJob;
 
 /// How often the session is checked with Zalo (one light `me-v2` call).
 const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
@@ -70,27 +71,30 @@ pub struct ZaloStatus {
     pub detail: String,
 }
 
-/// A photo or file a device wants to send.
+/// Pictures Zalo can show as photos; everything else is sent as a file.
+pub fn photo_type(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+    )
+}
+
+/// A photo or file a device wants to send, waiting on disk.
 #[derive(Clone, Debug)]
 pub struct Attachment {
     pub name: String,
     pub mime: String,
-    pub bytes: Vec<u8>,
+    pub path: PathBuf,
+    pub size: u64,
+    /// MD5 of the content, hex.
+    pub md5: String,
     /// Picture size, 0 when unknown.
     pub width: u32,
     pub height: u32,
     /// Shown under a photo; may be empty.
     pub caption: String,
-}
-
-impl Attachment {
-    /// Pictures Zalo shows as photos; everything else is sent as a file.
-    pub fn is_photo(&self) -> bool {
-        matches!(
-            self.mime.as_str(),
-            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
-        )
-    }
+    /// Sent as a photo rather than as a file.
+    pub photo: bool,
 }
 
 pub enum ZaloCommand {
@@ -100,11 +104,12 @@ pub enum ZaloCommand {
         text: String,
         reply: oneshot::Sender<Result<Message, String>>,
     },
+    /// Send an attachment; the outcome goes to `job`, which also owns the file.
     SendAttachment {
         kind: ThreadKind,
         remote_id: String,
         attachment: Attachment,
-        reply: oneshot::Sender<Result<Message, String>>,
+        job: Arc<UploadJob>,
     },
     /// The account read these incoming messages (original Zalo JSON): send a
     /// read receipt, if enabled.
@@ -118,8 +123,15 @@ pub enum ZaloCommand {
     },
 }
 
-/// How long to wait for Zalo to announce an uploaded file on the socket.
-const FILE_DONE_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long to wait for Zalo to announce an uploaded file on the socket: a
+/// minute and a half, plus a second per 8 MB.
+fn file_done_patience(size: u64) -> Duration {
+    Duration::from_secs(90 + size / (8 * 1024 * 1024))
+}
+
+/// Times the last part is sent again while Zalo's announcement is late, as
+/// Zalo PC does (`retry_upload_file_configs`).
+const LAST_PART_RESENDS: u32 = 2;
 
 /// Files Zalo finished storing, announced on the socket (`file_done`); senders
 /// wait here for the URL of their upload.
@@ -142,16 +154,18 @@ impl UploadBoard {
         self.changed.notify_waiters();
     }
 
-    async fn wait(&self, file_id: &str, timeout: Duration) -> Option<String> {
+    /// The first of `file_ids` announced within `timeout`, with its URL.
+    async fn wait_any(&self, file_ids: &[String], timeout: Duration) -> Option<(String, String)> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             // Registered before looking, so an announcement in between still wakes us.
             let changed = self.changed.notified();
-            let found = self
-                .done
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(file_id);
+            let found = {
+                let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+                file_ids
+                    .iter()
+                    .find_map(|id| done.remove(id).map(|url| (id.clone(), url)))
+            };
             if found.is_some() {
                 return found;
             }
@@ -167,11 +181,29 @@ impl UploadBoard {
 pub struct ZaloHandle {
     pub commands: mpsc::Sender<ZaloCommand>,
     pub status: Arc<RwLock<ZaloStatus>>,
+    /// Upload limits; the server's once a session is up.
+    pub limits: Arc<RwLock<FileLimits>>,
 }
 
 impl ZaloHandle {
+    /// A handle around `commands`, with a fresh status and default limits.
+    pub fn new(commands: mpsc::Sender<ZaloCommand>) -> Self {
+        Self {
+            commands,
+            status: Arc::default(),
+            limits: Arc::default(),
+        }
+    }
+
     pub fn status(&self) -> ZaloStatus {
         self.status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn limits(&self) -> FileLimits {
+        self.limits
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -192,19 +224,22 @@ pub struct ZaloConfig {
 /// Start the connector task.
 pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
     let (commands, rx) = mpsc::channel(32);
-    let status = Arc::new(RwLock::new(ZaloStatus::default()));
+    let handle = ZaloHandle::new(commands);
     let connector = Connector {
         cfg,
         store,
         bus,
-        status: status.clone(),
+        status: handle.status.clone(),
+        limits: handle.limits.clone(),
         client: None,
         self_uid: String::new(),
         login_running: false,
         uploads: Arc::new(UploadBoard::default()),
+        // One attachment at a time, in the order they came.
+        attachment_turns: Arc::new(Semaphore::new(1)),
     };
     tokio::spawn(connector.run(rx));
-    ZaloHandle { commands, status }
+    handle
 }
 
 // ---------------------------------------------------------------------------
@@ -327,10 +362,12 @@ struct Connector {
     store: Arc<Store>,
     bus: EventBus,
     status: Arc<RwLock<ZaloStatus>>,
+    limits: Arc<RwLock<FileLimits>>,
     client: Option<Arc<ZaloClient>>,
     self_uid: String,
     login_running: bool,
     uploads: Arc<UploadBoard>,
+    attachment_turns: Arc<Semaphore>,
 }
 
 async fn next_realtime(
@@ -433,8 +470,20 @@ impl Connector {
     /// Verify a client with Zalo, sync contacts and start the real-time loop.
     async fn activate(
         &mut self,
-        client: ZaloClient,
+        mut client: ZaloClient,
     ) -> Option<mpsc::UnboundedReceiver<RealtimeEvent>> {
+        match client.refresh_file_limits().await {
+            Ok(()) => {
+                let limits = client.file_limits().clone();
+                tracing::info!(
+                    max_mb = limits.max_file_bytes / (1024 * 1024),
+                    part_kb = limits.chunk_bytes / 1024,
+                    "upload limits loaded"
+                );
+                *self.limits.write().unwrap_or_else(|e| e.into_inner()) = limits;
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot load upload limits, using defaults"),
+        }
         let health = client.check_session().await;
         match &health {
             SessionHealth::Rejected => {
@@ -532,10 +581,11 @@ impl Connector {
                 kind,
                 remote_id,
                 attachment,
-                reply,
+                job,
             } => {
                 let Some(client) = self.client.clone() else {
-                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    job.finish(Err("Zalo chưa đăng nhập".into()));
+                    tokio::spawn(async move { job.remove_file().await });
                     return;
                 };
                 let sender = AttachmentSender {
@@ -546,12 +596,10 @@ impl Connector {
                     uploads: self.uploads.clone(),
                     self_uid: self.self_uid.clone(),
                 };
+                let turns = self.attachment_turns.clone();
                 tokio::spawn(async move {
-                    let result = sender.send(kind, &remote_id, attachment).await;
-                    if let Err(e) = &result {
-                        tracing::warn!(error = %e, "attachment not sent");
-                    }
-                    let _ = reply.send(result);
+                    run_upload(&sender, &turns, kind, &remote_id, &attachment, &job).await;
+                    job.remove_file().await;
                 });
             }
             ZaloCommand::MarkSeen {
@@ -907,28 +955,76 @@ struct AttachmentSender {
     self_uid: String,
 }
 
+/// What an upload cancelled from a device ends with (never shown: a cancelled
+/// upload stays cancelled).
+const CANCELLED: &str = "đã hủy";
+
+/// Wait for the turn of an upload, then send it, unless it is cancelled first.
+async fn run_upload(
+    sender: &AttachmentSender,
+    turns: &Semaphore,
+    kind: ThreadKind,
+    remote_id: &str,
+    attachment: &Attachment,
+    job: &UploadJob,
+) {
+    let turn = tokio::select! {
+        turn = turns.acquire() => turn,
+        () = job.cancelled() => return,
+    };
+    let Ok(_turn) = turn else {
+        job.finish(Err("gateway đang dừng".into()));
+        return;
+    };
+    if !job.start() {
+        return;
+    }
+    let result = tokio::select! {
+        result = sender.send(kind, remote_id, attachment, job) => result,
+        // Dropping the send stops it between two requests to Zalo; once the
+        // message itself goes out, cancelling is refused.
+        () = job.cancelled() => return,
+    };
+    if let Err(e) = &result {
+        tracing::warn!(error = %e, "attachment not sent");
+    }
+    job.finish(result);
+}
+
 impl AttachmentSender {
     async fn send(
         &self,
         kind: ThreadKind,
         remote_id: &str,
-        a: Attachment,
+        a: &Attachment,
+        job: &UploadJob,
     ) -> Result<Message, String> {
         let to = recipient(kind, remote_id);
         let err = |e: zeta_zalo::Error| e.to_string();
         let caption = a.caption.trim().to_string();
-        let size = a.bytes.len() as u64;
-        let sent = if a.is_photo() {
-            let photo = Photo {
-                bytes: &a.bytes,
-                file_name: &a.name,
-                mime: &a.mime,
-                width: a.width,
-                height: a.height,
-                caption: &caption,
-            };
-            let photo = self.client.send_photo(to, photo).await.map_err(err)?;
-            self.keep(&[&photo.hd_url, &photo.thumb_url], &a).await;
+        let size = a.size;
+        let src = FileSource {
+            path: &a.path,
+            size: a.size,
+            file_name: &a.name,
+            mime: &a.mime,
+        };
+        let progress = |stored: u64| job.progress(stored);
+        let sent = if a.photo {
+            let uploaded = self
+                .client
+                .upload_photo(to, src, &progress)
+                .await
+                .map_err(err)?;
+            if !job.begin_finishing() {
+                return Err(CANCELLED.into());
+            }
+            let photo = self
+                .client
+                .send_uploaded_photo(to, &uploaded, a.width, a.height, &caption)
+                .await
+                .map_err(err)?;
+            self.keep(&[&photo.hd_url, &photo.thumb_url], a).await;
             Sent {
                 msg_id: photo.msg_id,
                 client_id: photo.client_id,
@@ -952,20 +1048,26 @@ impl AttachmentSender {
         } else {
             let uploaded = self
                 .client
-                .upload_file(to, &a.bytes, &a.name, &a.mime)
+                .upload_file(to, src, &a.md5, &progress)
                 .await
                 .map_err(err)?;
-            let url = self
-                .uploads
-                .wait(&uploaded.file_id, FILE_DONE_TIMEOUT)
-                .await
-                .ok_or_else(|| "Zalo chưa xác nhận đã nhận tệp, hãy thử lại".to_string())?;
+            let (file_id, url) = self.stored_file(to, src, &uploaded).await?;
+            let uploaded = UploadedFile {
+                file_id,
+                ..uploaded
+            };
+            if !job.begin_finishing() {
+                return Err(CANCELLED.into());
+            }
             let file = self
                 .client
                 .send_file(to, &uploaded, &url)
                 .await
                 .map_err(err)?;
-            self.keep(&[&url], &a).await;
+            // Very large files are not kept: the cache would not keep them either.
+            if size <= MAX_FILE_BYTES {
+                self.keep(&[&url], a).await;
+            }
             Sent {
                 msg_id: file.msg_id,
                 client_id: file.client_id,
@@ -990,8 +1092,37 @@ impl AttachmentSender {
         )
     }
 
-    /// Keep the sent bytes in the media cache under the URLs Zalo gave them, so
-    /// the sender sees them at once without downloading them back.
+    /// Wait until Zalo announces the stored file; returns its id and URL. While
+    /// the announcement is late, the last part goes again, like Zalo PC does.
+    async fn stored_file(
+        &self,
+        to: Recipient<'_>,
+        src: FileSource<'_>,
+        file: &UploadedFile,
+    ) -> Result<(String, String), String> {
+        let patience = file_done_patience(file.size);
+        let mut ids = vec![file.file_id.clone()];
+        for resend in 0..=LAST_PART_RESENDS {
+            if resend > 0 {
+                tracing::info!(
+                    resend,
+                    "file not announced yet, sending its last part again"
+                );
+                match self.client.resend_last_part(to, src, file).await {
+                    Ok(id) if !id.is_empty() && !ids.contains(&id) => ids.push(id),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "cannot send the last part again"),
+                }
+            }
+            if let Some(found) = self.uploads.wait_any(&ids, patience).await {
+                return Ok(found);
+            }
+        }
+        Err("Zalo chưa xác nhận đã nhận tệp, hãy thử lại".into())
+    }
+
+    /// Keep a copy of the sent file in the media cache under the URLs Zalo gave
+    /// it, so the sender sees it at once without downloading it back.
     async fn keep(&self, urls: &[&String], a: &Attachment) {
         let Some(cache) = &self.media else {
             return;
@@ -1002,7 +1133,7 @@ impl AttachmentSender {
                 continue;
             }
             seen.push(url);
-            if let Err(e) = cache.insert(url, &a.bytes, &a.mime).await {
+            if let Err(e) = cache.insert_file(url, &a.path, &a.mime).await {
                 tracing::debug!(error = %e, "cannot cache a sent file");
             }
         }
@@ -1137,37 +1268,45 @@ mod tests {
     #[tokio::test]
     async fn upload_announcements_reach_their_sender() {
         let board = Arc::new(UploadBoard::default());
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let found = |id: &str| Some((id.to_string(), format!("https://f.zdn.vn/{id}")));
         // Announced before anyone waits (the socket can beat the HTTP answer).
         board.complete("1".into(), "https://f.zdn.vn/1".into());
         assert_eq!(
-            board.wait("1", Duration::from_millis(10)).await.as_deref(),
-            Some("https://f.zdn.vn/1")
+            board
+                .wait_any(&ids(&["1"]), Duration::from_millis(10))
+                .await,
+            found("1")
         );
-        // Announced while waiting.
+        // Announced while waiting, for the second of two ids.
         let waiter = {
             let board = board.clone();
-            tokio::spawn(async move { board.wait("2", Duration::from_secs(5)).await })
+            let wanted = ids(&["2", "4"]);
+            tokio::spawn(async move { board.wait_any(&wanted, Duration::from_secs(5)).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         board.complete("3".into(), "https://f.zdn.vn/3".into());
-        board.complete("2".into(), "https://f.zdn.vn/2".into());
-        assert_eq!(waiter.await.unwrap().as_deref(), Some("https://f.zdn.vn/2"));
-        assert_eq!(board.wait("9", Duration::from_millis(10)).await, None);
+        board.complete("4".into(), "https://f.zdn.vn/4".into());
+        assert_eq!(waiter.await.unwrap(), found("4"));
+        assert_eq!(
+            board
+                .wait_any(&ids(&["9"]), Duration::from_millis(10))
+                .await,
+            None
+        );
     }
 
     #[test]
     fn photos_and_files() {
-        let a = |mime: &str| Attachment {
-            name: "x".into(),
-            mime: mime.into(),
-            bytes: vec![1],
-            width: 0,
-            height: 0,
-            caption: String::new(),
-        };
-        assert!(a("image/png").is_photo());
-        assert!(!a("image/svg+xml").is_photo());
-        assert!(!a("application/pdf").is_photo());
+        assert!(photo_type("image/png"));
+        assert!(!photo_type("image/svg+xml"));
+        assert!(!photo_type("application/pdf"));
+        // A minute and a half, plus a second per 8 MB.
+        assert_eq!(file_done_patience(1000), Duration::from_secs(90));
+        assert_eq!(
+            file_done_patience(1024 * 1024 * 1024),
+            Duration::from_secs(218)
+        );
     }
 
     #[test]

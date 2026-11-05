@@ -1,7 +1,7 @@
 //! Demo connector: sample conversations and an echo reply, no Zalo involved.
 //! For trying the web client and taking screenshots (`serve --demo`).
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -15,6 +15,7 @@ use crate::model::{
     now_ms, thread_id, Media, Message, NewMessage, Quote, ThreadKind, ThreadUpsert,
 };
 use crate::store::Store;
+use crate::uploads::UploadJob;
 use crate::zalo::{Attachment, LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus};
 
 /// Sample pictures are inline SVG, so the demo needs no network at all.
@@ -321,12 +322,12 @@ fn text(text: &str) -> Content<'_> {
 async fn keep_attachment(media: &MediaCache, a: &Attachment) -> Result<(Media, String), String> {
     let url = format!("{LOCAL_URL_PREFIX}{}/{}", now_ms(), a.name);
     media
-        .insert(&url, &a.bytes, &a.mime)
+        .insert_file(&url, &a.path, &a.mime)
         .await
         .map_err(|e| e.to_string())?;
-    let size = a.bytes.len() as u64;
+    let size = a.size;
     let caption = a.caption.trim().to_string();
-    Ok(if a.is_photo() {
+    Ok(if a.photo {
         let summary = if caption.is_empty() {
             "[Hình ảnh]".to_string()
         } else {
@@ -354,17 +355,57 @@ async fn keep_attachment(media: &MediaCache, a: &Attachment) -> Result<(Media, S
     })
 }
 
+/// Pretend to upload, with progress, then store the message.
+async fn demo_upload(
+    store: &Store,
+    bus: &EventBus,
+    media: &MediaCache,
+    kind: ThreadKind,
+    remote_id: &str,
+    a: &Attachment,
+    job: &UploadJob,
+) {
+    if !job.start() {
+        return;
+    }
+    let steps = 12;
+    for step in 1..=steps {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            () = job.cancelled() => return,
+        }
+        job.progress(a.size * step / steps);
+    }
+    if !job.begin_finishing() {
+        return;
+    }
+    let result = match keep_attachment(media, a).await {
+        Ok((found, summary)) => {
+            let content = Content {
+                kind: if a.photo { "chat.photo" } else { "share.file" },
+                text: &summary,
+                media: Some(found),
+            };
+            store_and_publish(store, bus, kind, remote_id, true, "", content)
+                .ok_or_else(|| "demo: không lưu được tin".to_string())
+        }
+        Err(e) => Err(e),
+    };
+    job.finish(result);
+}
+
 /// Start the demo connector.
 pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHandle {
     seed(&store);
-    let status = Arc::new(RwLock::new(ZaloStatus {
+    let (commands, mut rx) = mpsc::channel(32);
+    let handle = ZaloHandle::new(commands);
+    *handle.status.write().unwrap_or_else(|e| e.into_inner()) = ZaloStatus {
         session: SessionState::Valid,
         realtime: true,
         display_name: "Demo".into(),
         ..ZaloStatus::default()
-    }));
-    let (commands, mut rx) = mpsc::channel(32);
-    let shared = status.clone();
+    };
+    let shared = handle.status.clone();
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -412,25 +453,14 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                     kind,
                     remote_id,
                     attachment,
-                    reply,
+                    job,
                 } => {
-                    let result = match keep_attachment(&media, &attachment).await {
-                        Ok((found, summary)) => {
-                            let content = Content {
-                                kind: if attachment.is_photo() {
-                                    "chat.photo"
-                                } else {
-                                    "share.file"
-                                },
-                                text: &summary,
-                                media: Some(found),
-                            };
-                            store_and_publish(&store, &bus, kind, &remote_id, true, "", content)
-                                .ok_or_else(|| "demo: không lưu được tin".to_string())
-                        }
-                        Err(e) => Err(e),
-                    };
-                    let _ = reply.send(result);
+                    let (store, bus, media) = (store.clone(), bus.clone(), media.clone());
+                    tokio::spawn(async move {
+                        demo_upload(&store, &bus, &media, kind, &remote_id, &attachment, &job)
+                            .await;
+                        job.remove_file().await;
+                    });
                 }
                 // Nobody to tell in the demo.
                 ZaloCommand::MarkSeen { .. } => {}
@@ -447,5 +477,5 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
             }
         }
     });
-    ZaloHandle { commands, status }
+    handle
 }

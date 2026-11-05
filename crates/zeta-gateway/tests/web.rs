@@ -12,6 +12,7 @@ use zeta_gateway::events::EventBus;
 use zeta_gateway::media_cache::MediaCache;
 use zeta_gateway::model::{thread_id, NewMessage, ThreadKind, ThreadUpsert};
 use zeta_gateway::store::Store;
+use zeta_gateway::uploads::Uploads;
 use zeta_gateway::zalo::{LoginState, ZaloHandle, ZaloStatus};
 
 struct Fx {
@@ -27,19 +28,18 @@ fn fx() -> Fx {
     let bus = EventBus::new(store.clone());
     // Nothing listens on the command channel: these tests never send commands.
     let (commands, _) = tokio::sync::mpsc::channel(1);
-    let status = Arc::new(RwLock::new(ZaloStatus::default()));
-    let zalo = ZaloHandle {
-        commands,
-        status: status.clone(),
-    };
+    let zalo = ZaloHandle::new(commands);
+    let status = zalo.status.clone();
     let (_, token) = store.add_device("web").unwrap();
     let dir = std::env::temp_dir().join(format!("zetachat-web-{:016x}", rand::random::<u64>()));
-    let media = Arc::new(MediaCache::new(dir).unwrap());
+    let media = Arc::new(MediaCache::new(dir.join("media")).unwrap());
+    let uploads = Arc::new(Uploads::new(dir.join("uploads"), bus.clone()).unwrap());
     let app = api::router(AppState {
         store: store.clone(),
         bus,
         zalo,
         media: media.clone(),
+        uploads,
     });
     Fx {
         app,

@@ -2,7 +2,7 @@
 
 Mọi đường dẫn bắt đầu bằng `/api/v1`. Trừ `/health`, mọi lời gọi đều cần token thiết bị, gửi bằng header `Authorization: Bearer zc_…` hoặc cookie `zetachat_token`. Token được tạo bằng lệnh `zetachat-gateway device add <tên>`.
 
-Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404` không có hội thoại, `400` dữ liệu không hợp lệ, `413` tệp quá lớn để gateway tải, `502` Zalo từ chối (ví dụ chưa đăng nhập) hoặc CDN của Zalo không trả tệp, `503` connector Zalo không chạy.
+Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404` không có hội thoại, `400` dữ liệu không hợp lệ, `409` không còn hủy được, `413` tệp quá lớn (để gửi hoặc để gateway tải), `429` đang có quá nhiều tệp chờ gửi, `502` Zalo từ chối (ví dụ chưa đăng nhập) hoặc CDN của Zalo không trả tệp, `503` connector Zalo không chạy.
 
 ## Đường dẫn
 
@@ -11,11 +11,13 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/health` | `{ ok, version }`, không cần token |
 | POST | `/session` | Đổi token `{ "token": "zc_…" }` lấy cookie `zetachat_token` (HttpOnly, SameSite=Strict, thêm Secure khi đi qua HTTPS). Giao diện web dùng cách này |
 | DELETE | `/session` | Xóa cookie |
-| GET | `/status` | `zalo`: trạng thái phiên (`session` là `starting`, `logged_out`, `valid`, `rejected` hoặc `unknown`; `realtime`, `display_name`, `login`, `detail`). `last_event_seq`: số thứ tự sự kiện mới nhất, dùng làm `since` khi mở luồng sự kiện |
+| GET | `/status` | `zalo`: trạng thái phiên (`session` là `starting`, `logged_out`, `valid`, `rejected` hoặc `unknown`; `realtime`, `display_name`, `login`, `detail`). `last_event_seq`: số thứ tự sự kiện mới nhất, dùng làm `since` khi mở luồng sự kiện. `limits`: giới hạn gửi tệp Zalo đang áp dụng (`max_file_bytes`, `max_photo_bytes`, `blocked_extensions`) |
 | GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè chưa từng nhắn tin |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu |
-| POST | `/threads/{id}/attachments?name=&caption=&width=&height=` | Gửi ảnh hoặc tệp. Thân request là chính tệp (tối đa 100 MB), `Content-Type` là loại tệp. Ảnh JPEG, PNG, WebP, GIF được gửi dạng ảnh (`width`, `height` là kích thước ảnh nếu client biết); loại khác được gửi dạng tệp. Trả về tin nhắn đã lưu |
+| POST | `/threads/{id}/attachments?name=&caption=&width=&height=&as=` | Gửi ảnh hoặc tệp, xem mục "Gửi ảnh và tệp" bên dưới. Trả về `202` với `{ "upload": {…} }` |
+| GET | `/uploads` | Các lượt gửi tệp đang chạy và vừa xong (giữ 10 phút) |
+| DELETE | `/uploads/{id}` | Hủy một lượt gửi chưa tới bước gửi tin; `409` nếu đã quá muộn |
 | POST | `/threads/{id}/read` | Đánh dấu đã đọc. Nếu bật báo đã xem (mặc định), gateway báo cho Zalo về các tin đến chưa đọc: người gửi thấy "Đã xem", điện thoại hết báo chưa đọc |
 | GET | `/events?since=&limit=` | Nhật ký sự kiện sau `seq = since` |
 | GET | `/events/stream` | Luồng sự kiện (server-sent events). Gửi lại header `Last-Event-ID` khi nối lại để không sót sự kiện |
@@ -47,6 +49,25 @@ Client tải `url` và `thumb` qua `/media?u=…`, không gọi thẳng CDN củ
 
 Chỉ ảnh, video và âm thanh được trả về để hiển thị trực tiếp; mọi loại khác (HTML, SVG, PDF…) được trả dưới dạng `application/octet-stream` kèm `Content-Disposition: attachment`, để một tệp ai đó gửi vào cuộc trò chuyện không thể chạy như một trang của gateway.
 
+## Gửi ảnh và tệp
+
+Thân request là chính tệp, `Content-Type` là loại tệp. Gateway ghi tệp xuống đĩa trong lúc nhận (không giữ cả tệp trong RAM), trả `202` ngay khi nhận đủ, rồi tự đưa tệp lên Zalo ở nền: từng tệp một, theo thứ tự, mỗi tệp chia thành nhiều phần 3 MB gửi song song. Thiết bị có thể đóng trang sau khi nhận `202`; tệp vẫn được gửi tiếp.
+
+Giới hạn là của Zalo; gateway đọc chúng từ máy chủ Zalo mỗi khi phiên khởi động và báo lại trong `/status` → `limits`. Tệp tối đa 1 GB. Zalo không nhận tệp `.exe`, `.bat`, `.cmd`, `.msi`… (`400`; hãy nén thành `.zip`). Ảnh JPEG, PNG, WebP, GIF đến 100 MB được gửi dạng ảnh (`width`, `height` là kích thước ảnh nếu client biết); ảnh lớn hơn, ảnh gửi kèm `as=file` và mọi loại khác được gửi dạng tệp.
+
+Một lượt gửi (`upload`) có `id`, `thread_id`, `name`, `size`, `kind` (`photo` hoặc `file`), `sent` (số byte Zalo đã nhận), `error`, `message` (tin đã gửi, khi xong) và `state`:
+
+| `state` | Ý nghĩa |
+|---|---|
+| `queued` | Chờ các tệp trước gửi xong |
+| `sending` | Đang gửi lên Zalo; khi `sent` bằng `size`, Zalo đang xử lý tệp |
+| `finishing` | Zalo đã có tệp, đang gửi tin; không hủy được nữa |
+| `done` | Đã gửi; tin cũng tới qua sự kiện `message` |
+| `failed` | Không gửi được, `error` nói vì sao |
+| `cancelled` | Đã hủy |
+
+Lượt gửi không sống qua lần khởi động lại gateway: tệp chưa tới Zalo phải gửi lại.
+
 ## Sự kiện
 
 | `event` | `data` |
@@ -56,8 +77,9 @@ Chỉ ảnh, video và âm thanh được trả về để hiển thị trực t
 | `thread_read` | `{ "thread_id": "…" }` |
 | `threads_changed` | `{}`: gateway vừa nạp lịch sử (ví dụ tin gần đây khi phiên Zalo khởi động); client tải lại danh sách hội thoại |
 | `status` | Trạng thái phiên Zalo, như `/status` |
+| `upload` | `{ "upload": {…} }`: tiến độ một lượt gửi tệp, vài lần mỗi giây khi đang gửi |
 
-Mỗi sự kiện có `id` là số thứ tự tăng dần. Client lưu `id` cuối cùng đã nhận; khi mất mạng và nối lại, gửi nó qua `Last-Event-ID` (hoặc `?since=`) để nhận phần còn thiếu.
+Mỗi sự kiện có `id` là số thứ tự tăng dần. Client lưu `id` cuối cùng đã nhận; khi mất mạng và nối lại, gửi nó qua `Last-Event-ID` (hoặc `?since=`) để nhận phần còn thiếu. Riêng `upload` không vào nhật ký và không có `id`: client đang mất kết nối sẽ bỏ lỡ nó, nên khi nối lại thì hỏi `/uploads`.
 
 ## Ví dụ
 
@@ -69,4 +91,8 @@ curl -H "Authorization: Bearer $T" -H 'content-type: application/json' \
 curl -N -H "Authorization: Bearer $T" https://chat.example.lan/api/v1/events/stream
 curl -H "Authorization: Bearer $T" -H 'content-type: image/jpeg' --data-binary @anh.jpg \
      'https://chat.example.lan/api/v1/threads/zalo:u:123/attachments?name=anh.jpg&width=1280&height=960'
+# Tệp lớn: -T đọc dần từ đĩa thay vì nạp cả tệp vào RAM
+curl -X POST -T video.mp4 -H "Authorization: Bearer $T" -H 'content-type: video/mp4' \
+     'https://chat.example.lan/api/v1/threads/zalo:u:123/attachments?name=video.mp4'
+curl -H "Authorization: Bearer $T" https://chat.example.lan/api/v1/uploads
 ```

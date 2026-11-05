@@ -43,6 +43,18 @@ impl EventBus {
         Ok(event)
     }
 
+    /// Broadcast an event that is not kept in the log (upload progress…). It has
+    /// `seq` 0; listeners that are not connected miss it.
+    pub fn notify(&self, kind: &str, payload: Value) {
+        let event = StoredEvent {
+            seq: 0,
+            kind: kind.to_string(),
+            payload,
+            created_at: now_ms(),
+        };
+        let _ = self.tx.send(event);
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<StoredEvent> {
         self.tx.subscribe()
     }
@@ -60,6 +72,11 @@ mod tests {
         let mut rx = bus.subscribe();
         let ev = bus.publish("message", json!({ "a": 1 })).unwrap();
         assert_eq!(rx.recv().await.unwrap(), ev);
-        assert_eq!(store.events_since(0, 10).unwrap(), vec![ev]);
+        assert_eq!(store.events_since(0, 10).unwrap(), vec![ev.clone()]);
+
+        bus.notify("upload", json!({ "b": 2 }));
+        let transient = rx.recv().await.unwrap();
+        assert_eq!((transient.seq, transient.kind.as_str()), (0, "upload"));
+        assert_eq!(store.events_since(0, 10).unwrap(), vec![ev], "not logged");
     }
 }

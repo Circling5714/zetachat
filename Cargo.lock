@@ -2269,6 +2269,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures-util",
+ "md-5",
  "qrcode",
  "rand 0.8.8",
  "rusqlite",

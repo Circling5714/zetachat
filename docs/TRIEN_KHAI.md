@@ -67,11 +67,16 @@ proxy_buffering off;
 proxy_read_timeout 1h;
 ```
 
-Gateway trả tệp tối đa 256 MB; Nginx không giới hạn dung lượng phản hồi nên không cần chỉnh gì thêm cho ảnh và video. Để gửi ảnh và tệp đến 100 MB, thêm vào ô *Advanced* (mặc định Nginx chỉ nhận request 1 MB):
+Gateway trả tệp tối đa 256 MB; Nginx không giới hạn dung lượng phản hồi nên không cần chỉnh gì thêm cho ảnh và video. Để gửi tệp tới 1 GB như Zalo PC, thêm vào ô *Advanced*:
 
 ```nginx
-client_max_body_size 100m;
+client_max_body_size 1100m;
+proxy_request_buffering off;
 ```
+
+Dòng đầu nâng giới hạn request (Nginx gốc chỉ nhận 1 MB; nếu trước đây bạn đã đặt `100m` thì sửa thành `1100m`). Dòng sau để Nginx chuyển tệp sang gateway ngay trong lúc nhận, thay vì ghi trọn tệp ra đĩa của nó rồi mới chuyển: thanh tiến độ trên giao diện đúng hơn và Nginx không cần chỗ trống cho tệp 1 GB.
+
+Tệp chờ gửi nằm trong `<thư mục dữ liệu>/uploads` cho tới khi lên Zalo xong; gateway xóa chúng ngay sau đó, và xóa phần còn sót lại mỗi lần khởi động.
 
 Chỉ cho Nginx Proxy Manager truy cập cổng của gateway:
 

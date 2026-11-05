@@ -19,6 +19,7 @@ const state = {
   streamOpened: false,
   lastQr: '',
   loginPrompted: false,
+  statusLimits: null, // upload limits from the gateway
 };
 
 // ------------------------------------------------------------------ helpers
@@ -556,6 +557,7 @@ async function openThread(id) {
   $('chat-sub').textContent = t.kind === 'group' ? 'Nhóm' : '';
   $('messages').replaceChildren();
   renderThreads();
+  renderUploads();
   try {
     const list = await fetchMessages(id);
     if (state.current !== id) return;
@@ -653,8 +655,42 @@ $('composer').addEventListener('submit', async (e) => {
 });
 
 // -------------------------------------------------------------- attachments
+//
+// A file goes to the gateway first (progress from the browser), which answers
+// with an upload; the gateway then sends it to Zalo in parts and reports on it
+// with `upload` events. Files go to the gateway one at a time.
 
-const MAX_UPLOAD = 100 * 1024 * 1024; // the gateway's limit
+/** Zalo's rules until the gateway tells its own (`/status` → `limits`). */
+const DEFAULT_LIMITS = {
+  max_file_bytes: 1024 * 1024 * 1024,
+  max_photo_bytes: 100 * 1024 * 1024,
+  blocked_extensions: ['exe', 'cmd', 'bat', 'com', 'lnk', 'vbs', 'msi', 'vb', 'ws', 'wsf', 'scf', 'scr', 'pif', 'chm'],
+};
+
+/** Uploads of this page, by key; `id` is the gateway's once it has the file. */
+const uploads = new Map();
+/** Latest state of each upload the gateway reported, by id. */
+const serverUploads = new Map();
+/** Files waiting for their turn to go to the gateway. */
+const uploadQueue = [];
+let uploadKeys = 0;
+let uploadPumping = false;
+
+const UPLOAD_RANK = { queued: 0, sending: 1, finishing: 2, done: 3, failed: 3, cancelled: 3 };
+
+function limits() {
+  return (state.statusLimits && state.statusLimits.max_file_bytes) ? state.statusLimits : DEFAULT_LIMITS;
+}
+
+/** Keep the most advanced of two reports on the same upload. */
+function newerUpload(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const ra = UPLOAD_RANK[a.state] ?? 0;
+  const rb = UPLOAD_RANK[b.state] ?? 0;
+  if (ra !== rb) return ra > rb ? a : b;
+  return (b.sent || 0) >= (a.sent || 0) ? b : a;
+}
 
 /** Width and height of a picture; zeros when the browser cannot read it. */
 async function pictureSize(file) {
@@ -669,57 +705,280 @@ async function pictureSize(file) {
   }
 }
 
-async function uploadFile(id, file) {
-  const [width, height] = await pictureSize(file);
-  const ext = (file.type.split('/')[1] || 'bin').replace('jpeg', 'jpg');
-  const name = file.name || `zetachat-${Date.now()}.${ext}`;
-  const query = new URLSearchParams({ name, width, height });
-  const res = await fetch(`${API}/threads/${encodeURIComponent(id)}/attachments?${query}`, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'content-type': file.type || 'application/octet-stream' },
-    body: file,
+/** POST a file to the gateway; resolves with its answer (`{ upload }`). */
+function postFile(entry, query) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    entry.xhr = xhr;
+    xhr.open('POST', `${API}/threads/${encodeURIComponent(entry.thread_id)}/attachments?${query}`);
+    xhr.setRequestHeader('content-type', entry.file.type || 'application/octet-stream');
+    xhr.responseType = 'json';
+    xhr.upload.onprogress = (e) => {
+      entry.loaded = e.loaded;
+      scheduleUploads();
+    };
+    xhr.onload = () => {
+      entry.xhr = null;
+      if (xhr.status === 401) reject(new Unauthorized('unauthorized'));
+      else if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response || {});
+      else reject(new Error((xhr.response && xhr.response.error) || `HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => {
+      entry.xhr = null;
+      reject(new Error('mất kết nối tới gateway'));
+    };
+    xhr.onabort = () => {
+      entry.xhr = null;
+      reject(new DOMException('cancelled', 'AbortError'));
+    };
+    xhr.send(entry.file);
   });
-  if (res.status === 401) throw new Unauthorized('unauthorized');
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
-  return data;
 }
 
-let uploading = 0;
-function showUploading(delta) {
-  uploading += delta;
-  const box = $('sending');
-  box.hidden = uploading === 0;
-  box.textContent = uploading > 1 ? `Đang gửi ${uploading} tệp…` : 'Đang gửi…';
-}
-
-/** Send files one after the other, in the conversation open when they were picked. */
-async function sendFiles(files) {
-  const id = state.current;
-  if (!id) return;
-  for (const file of files) {
-    if (file.size > MAX_UPLOAD) {
-      toast(`${file.name}: lớn hơn 100 MB, không gửi được qua gateway`);
-      continue;
+/** Send queued files to the gateway, one at a time. */
+async function pumpUploads() {
+  if (uploadPumping) return;
+  uploadPumping = true;
+  try {
+    while (uploadQueue.length) {
+      const entry = uploadQueue.shift();
+      if (!uploads.has(entry.key)) continue; // cancelled while waiting
+      entry.phase = 'local';
+      scheduleUploads();
+      const [width, height] = await pictureSize(entry.file);
+      const query = new URLSearchParams({ name: entry.name, width, height });
+      if (entry.asFile) query.set('as', 'file');
+      try {
+        const data = await postFile(entry, query);
+        const u = data.upload;
+        if (!u) throw new Error('gateway trả lời thiếu thông tin tệp');
+        entry.id = u.id;
+        entry.phase = 'server';
+        serverUploads.set(u.id, newerUpload(serverUploads.get(u.id), u));
+        settleUpload(entry);
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          uploads.delete(entry.key);
+        } else if (err instanceof Unauthorized) {
+          uploads.delete(entry.key);
+          handleError(err);
+        } else {
+          entry.phase = 'server';
+          entry.localError = err.message || 'lỗi không rõ';
+        }
+      }
+      scheduleUploads();
     }
-    showUploading(1);
-    try {
-      const message = await uploadFile(id, file);
-      onMessage({ message, thread: null });
-    } catch (err) {
-      handleError(err, `Không gửi được ${file.name || 'tệp'}: `);
-    } finally {
-      showUploading(-1);
-    }
+  } finally {
+    uploadPumping = false;
   }
 }
 
+/** Drop an upload that ended well; its message comes as a `message` event too. */
+function settleUpload(entry) {
+  const u = entry.id && serverUploads.get(entry.id);
+  if (!u) return;
+  if (u.state === 'done' || u.state === 'cancelled') {
+    uploads.delete(entry.key);
+    serverUploads.delete(entry.id);
+    if (u.message) onMessage({ message: u.message, thread: null });
+  }
+}
+
+/** Queue files for the conversation open when they were picked. */
+function sendFiles(files, asFile = false) {
+  const thread = state.current;
+  if (!thread) return;
+  const rules = limits();
+  for (const file of files) {
+    const ext = (file.type.split('/')[1] || 'bin').replace('jpeg', 'jpg');
+    const name = file.name || `zetachat-${Date.now()}.${ext}`;
+    const blocked = (/\.([^.]+)$/.exec(name) || [])[1];
+    if (blocked && rules.blocked_extensions.includes(blocked.toLowerCase())) {
+      toast(`Zalo không cho gửi tệp .${blocked.toLowerCase()}, hãy nén thành .zip rồi gửi`);
+      continue;
+    }
+    if (!file.size) {
+      toast(`${name}: tệp rỗng`);
+      continue;
+    }
+    if (file.size > rules.max_file_bytes) {
+      toast(`${name}: lớn hơn ${fmtSize(rules.max_file_bytes)}, Zalo không nhận`);
+      continue;
+    }
+    uploadKeys += 1;
+    const entry = {
+      key: `local-${uploadKeys}`,
+      id: '',
+      thread_id: thread,
+      name,
+      size: file.size,
+      file,
+      asFile,
+      phase: 'waiting',
+      loaded: 0,
+      xhr: null,
+      localError: '',
+    };
+    uploads.set(entry.key, entry);
+    uploadQueue.push(entry);
+  }
+  scheduleUploads();
+  pumpUploads();
+}
+
+/** What to show for an upload: a line of text and the bar's fraction (or null). */
+function uploadStatus(entry) {
+  const total = fmtSize(entry.size);
+  const pct = (done) => `${Math.floor((100 * done) / Math.max(1, entry.size))}%`;
+  if (entry.localError) return [`Không gửi được: ${entry.localError}`, null];
+  if (entry.phase === 'waiting') return [`Đang chờ · ${total}`, null];
+  if (entry.phase === 'local') {
+    return [`Đang tải lên ${pct(entry.loaded)} · ${fmtSize(entry.loaded) || '0 B'} / ${total}`, entry.loaded / entry.size];
+  }
+  const u = serverUploads.get(entry.id) || { state: 'queued', sent: 0 };
+  switch (u.state) {
+    case 'queued':
+      return [`Chờ gửi lên Zalo · ${total}`, 0];
+    case 'sending':
+      if (u.sent >= entry.size) return ['Zalo đang xử lý tệp…', 1];
+      return [`Đang gửi lên Zalo ${pct(u.sent)} · ${fmtSize(u.sent) || '0 B'} / ${total}`, u.sent / entry.size];
+    case 'finishing':
+      return ['Đang gửi tin…', 1];
+    case 'failed':
+      return [`Không gửi được: ${u.error || 'lỗi không rõ'}`, null];
+    default:
+      return ['', null];
+  }
+}
+
+function uploadFailed(entry) {
+  if (entry.localError) return true;
+  const u = entry.phase === 'server' && serverUploads.get(entry.id);
+  return Boolean(u && u.state === 'failed');
+}
+
+let uploadsFrame = 0;
+function scheduleUploads() {
+  if (!uploadsFrame) uploadsFrame = requestAnimationFrame(renderUploads);
+}
+
+function renderUploads() {
+  uploadsFrame = 0;
+  const box = $('uploads');
+  const list = [...uploads.values()].filter((entry) => entry.thread_id === state.current);
+  box.hidden = !list.length;
+  box.replaceChildren();
+  for (const entry of list) {
+    const failed = uploadFailed(entry);
+    const row = el('div', failed ? 'upload failed' : 'upload');
+    const [text, fraction] = uploadStatus(entry);
+    const info = el('div', 'upload-info');
+    info.append(el('div', 'file-name', entry.name), el('div', 'upload-status', text));
+    if (fraction !== null) {
+      const bar = el('div', 'upload-bar');
+      const fill = el('div', 'upload-fill');
+      fill.style.width = `${Math.min(100, Math.round(fraction * 100))}%`;
+      bar.append(fill);
+      info.append(bar);
+    }
+    row.append(el('div', 'file-icon', extOf(entry.name) || 'TỆP'), info);
+    const u = serverUploads.get(entry.id);
+    if (!(u && u.state === 'finishing' && !failed)) {
+      const close = el('button', 'upload-cancel', '×');
+      close.type = 'button';
+      close.title = failed ? 'Đóng' : 'Hủy gửi';
+      close.setAttribute('aria-label', close.title);
+      close.addEventListener('click', () => cancelUpload(entry));
+      row.append(close);
+    }
+    box.append(row);
+  }
+}
+
+async function cancelUpload(entry) {
+  if (uploadFailed(entry) || entry.phase === 'waiting') {
+    uploads.delete(entry.key);
+    scheduleUploads();
+    return;
+  }
+  if (entry.xhr) {
+    entry.xhr.abort();
+    return;
+  }
+  if (!entry.id) return;
+  try {
+    const data = await api(`/uploads/${encodeURIComponent(entry.id)}`, { method: 'DELETE' });
+    if (data && data.upload) serverUploads.set(entry.id, data.upload);
+    settleUpload(entry);
+  } catch (err) {
+    handleError(err, 'Không hủy được: ');
+  }
+  scheduleUploads();
+}
+
+/** An `upload` event from the gateway. */
+function onUpload(payload) {
+  const u = payload && payload.upload;
+  if (!u) return;
+  serverUploads.set(u.id, newerUpload(serverUploads.get(u.id), u));
+  for (const entry of uploads.values()) {
+    if (entry.id === u.id) settleUpload(entry);
+  }
+  scheduleUploads();
+}
+
+/** Uploads the gateway has (after a reload or a reconnection). */
+async function loadUploads() {
+  let list;
+  try {
+    list = await api('/uploads');
+  } catch {
+    return;
+  }
+  const known = new Set(list.map((u) => u.id));
+  for (const u of list) {
+    serverUploads.set(u.id, newerUpload(serverUploads.get(u.id), u));
+    const tracked = [...uploads.values()].some((entry) => entry.id === u.id);
+    if (!tracked && (UPLOAD_RANK[u.state] ?? 3) < 3) {
+      uploads.set(u.id, {
+        key: u.id, id: u.id, thread_id: u.thread_id, name: u.name, size: u.size,
+        phase: 'server', loaded: u.size, xhr: null, localError: '',
+      });
+    }
+  }
+  for (const entry of uploads.values()) {
+    if (entry.phase !== 'server' || !entry.id || entry.localError) continue;
+    if (!known.has(entry.id)) {
+      const u = serverUploads.get(entry.id);
+      // The gateway forgot it: it restarted before the file reached Zalo.
+      if (!u || UPLOAD_RANK[u.state] < 3) entry.localError = 'gateway đã khởi động lại, hãy gửi lại tệp này';
+    }
+    settleUpload(entry);
+  }
+  scheduleUploads();
+}
+
+window.addEventListener('beforeunload', (e) => {
+  // Files still going to the gateway are lost with the page; those it already
+  // has keep going to Zalo.
+  if ([...uploads.values()].some((entry) => entry.phase === 'local' || entry.phase === 'waiting')) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+$('attach-photo').addEventListener('click', () => $('photo-input').click());
+$('photo-input').addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  sendFiles(files);
+});
 $('attach').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', (e) => {
   const files = [...e.target.files];
   e.target.value = '';
-  sendFiles(files);
+  sendFiles(files, true);
 });
 
 // Pasting a screenshot sends it.
@@ -841,6 +1100,7 @@ function track(e) {
 }
 
 async function resync() {
+  loadUploads();
   try {
     await loadThreads();
     const id = state.current;
@@ -862,6 +1122,8 @@ function openStream() {
   es.addEventListener('message', (e) => { track(e); onMessage(JSON.parse(e.data)); });
   es.addEventListener('message_updated', (e) => { track(e); onMessageUpdated(JSON.parse(e.data)); });
   es.addEventListener('status', (e) => { track(e); onStatus(JSON.parse(e.data)); });
+  // Upload progress: not in the event log, so no id to track.
+  es.addEventListener('upload', (e) => onUpload(JSON.parse(e.data)));
   // History was loaded on the gateway: reload lists instead of replaying messages.
   es.addEventListener('threads_changed', (e) => { track(e); resync(); });
   es.addEventListener('thread_read', (e) => {
@@ -986,9 +1248,11 @@ async function start() {
   $('pair').hidden = true;
   $('app').hidden = false;
   state.lastSeq = st.last_event_seq || 0;
+  state.statusLimits = st.limits || null;
   renderStatus(st.zalo);
   await loadThreads();
   openStream();
+  loadUploads();
   if (st.zalo.session === 'logged_out' || st.zalo.session === 'rejected') {
     state.loginPrompted = true;
     openLogin();

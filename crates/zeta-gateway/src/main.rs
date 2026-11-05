@@ -13,8 +13,9 @@ use zeta_gateway::events::EventBus;
 use zeta_gateway::media_cache::MediaCache;
 use zeta_gateway::model::now_ms;
 use zeta_gateway::store::Store;
+use zeta_gateway::uploads::Uploads;
 use zeta_gateway::zalo::{self, ZaloConfig};
-use zeta_gateway::{db_path, media_dir, session_path};
+use zeta_gateway::{db_path, media_dir, session_path, uploads_dir};
 use zeta_zalo::login::QrEvent;
 use zeta_zalo::{Device, SessionData, ZaloClient};
 
@@ -160,6 +161,7 @@ async fn serve(data_dir: &Path, args: ServeArgs) -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "cannot prune events"),
     }
     let bus = EventBus::new(store.clone());
+    let uploads = Arc::new(Uploads::new(uploads_dir(data_dir), bus.clone())?);
     let zalo = if demo {
         if session_path(data_dir).exists() {
             bail!(
@@ -186,6 +188,7 @@ async fn serve(data_dir: &Path, args: ServeArgs) -> Result<()> {
         bus,
         zalo,
         media,
+        uploads,
     });
     let listener = tokio::net::TcpListener::bind(listen)
         .await

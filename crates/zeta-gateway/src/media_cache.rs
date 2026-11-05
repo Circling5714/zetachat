@@ -295,6 +295,34 @@ impl MediaCache {
         })
     }
 
+    /// Store a copy of the file at `src` as the cached copy of `url` (a file this
+    /// gateway sent, so the sender sees it without downloading it back).
+    pub async fn insert_file(
+        &self,
+        url: &str,
+        src: &Path,
+        declared: &str,
+    ) -> std::io::Result<CachedFile> {
+        let (key, data, meta) = self.paths(url);
+        if let Some(shard) = data.parent() {
+            tokio::fs::create_dir_all(shard).await?;
+        }
+        // Copied next to its place, then renamed: readers never see half a file.
+        let part = data.with_file_name(format!("{key}.part{:08x}", rand::random::<u32>()));
+        if let Err(e) = tokio::fs::copy(src, &part).await {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e);
+        }
+        let head = read_head(&part).await?;
+        tokio::fs::rename(&part, &data).await?;
+        let content_type = serve_type(declared, &head);
+        tokio::fs::write(&meta, content_type).await?;
+        Ok(CachedFile {
+            path: data,
+            content_type,
+        })
+    }
+
     /// Delete the least recently used files until the cache holds at most
     /// `budget` bytes; also clears leftovers of interrupted downloads. Returns the
     /// number of files removed and the bytes freed. Blocking: run it off the

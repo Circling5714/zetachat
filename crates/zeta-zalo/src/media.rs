@@ -17,7 +17,15 @@ use crate::error::{Error, Result};
 use crate::USER_AGENT;
 
 /// Domains Zalo serves media from; subdomains included.
-pub const MEDIA_DOMAINS: &[&str] = &["zdn.vn", "zadn.vn", "dlmd.me", "zaloapp.com", "zalo.me"];
+pub const MEDIA_DOMAINS: &[&str] = &[
+    "zdn.vn",
+    "zadn.vn",
+    "dlmd.me",
+    // Files of hundreds of MB (seen live: `bfg30.dlfl.vn`).
+    "dlfl.vn",
+    "zaloapp.com",
+    "zalo.me",
+];
 
 /// Whether `url` points at Zalo's media CDN. Only such URLs are downloaded, so a
 /// crafted message cannot make the gateway fetch anything else (hosts on its own
@@ -163,6 +171,7 @@ mod tests {
         for ok in [
             "https://photo-stal-24.zdn.vn/jpg/a/b.jpg",
             "https://video-stal-43.dlmd.me/x/y.mp4",
+            "https://bfg30.dlfl.vn/a/b.bin",
             "https://s120-ava-talk.zadn.vn/a/b.jpg",
             "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=1&size=130",
             "http://stc-chat.zdn.vn/images/stickers/default/thumb/7.png",

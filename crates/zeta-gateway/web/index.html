@@ -54,11 +54,15 @@
           </div>
         </header>
         <div id="messages" class="messages" aria-live="polite"></div>
-        <div id="sending" class="sending" role="status" hidden></div>
+        <div id="uploads" class="uploads" role="status" aria-live="polite" hidden></div>
         <form id="composer" class="composer">
-          <button id="attach" class="attach-btn" type="button" title="Gửi ảnh hoặc tệp (có thể dán hoặc kéo thả)" aria-label="Gửi ảnh hoặc tệp">
+          <button id="attach-photo" class="attach-btn" type="button" title="Gửi ảnh (có thể dán hoặc kéo thả)" aria-label="Gửi ảnh">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8.5" cy="9.5" r="1.8" fill="currentColor"/><path d="M4 18l5.2-5.2a1.5 1.5 0 0 1 2.1 0L15 16.5M13.5 15l2.2-2.2a1.5 1.5 0 0 1 2.1 0L21 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button id="attach" class="attach-btn" type="button" title="Đính kèm tệp, tối đa 1 GB (có thể kéo thả)" aria-label="Đính kèm tệp">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M8.5 12.5l6.4-6.4a3 3 0 0 1 4.2 4.2l-8.1 8.1a5 5 0 0 1-7.1-7.1L11.6 3.6M10.6 15.2l6.3-6.3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
+          <input id="photo-input" type="file" accept="image/*" multiple hidden>
           <input id="file-input" type="file" multiple hidden>
           <textarea id="input" rows="1" placeholder="Nhập tin nhắn…" aria-label="Tin nhắn"></textarea>
           <button id="send" class="btn" type="submit">Gửi</button>
