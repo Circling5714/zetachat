@@ -21,6 +21,7 @@ pub mod param_cipher;
 pub mod reaction;
 pub mod session;
 pub mod socket;
+pub mod sticker;
 pub mod typing;
 pub mod upload;
 

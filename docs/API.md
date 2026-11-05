@@ -15,6 +15,10 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/threads?limit=&offset=&all=` | Hội thoại, mới nhất trước. `all=true` lấy cả bạn bè và nhóm chưa từng nhắn tin. Mỗi hội thoại có `members`: số thành viên của nhóm (0 khi chưa biết, và với chat 1-1) |
 | GET | `/friends` | Danh sách bạn bè: `[{ "uid", "name", "zalo_name", "avatar", "friend": true, "updated_at" }]`, đồng bộ mỗi khi phiên Zalo khởi động |
 | GET | `/people?ids=<uid>,<uid>…` | Tên và ảnh đại diện của người dùng (người gửi tin trong nhóm, thành viên nhóm), tối đa 100 id. Người gateway chưa biết, hoặc đã hơn 3 ngày chưa hỏi lại, được hỏi Zalo trước (50 người mỗi lần). Trả về những người gateway biết, theo thứ tự đã hỏi; người Zalo không trả lời có `name` rỗng |
+| GET | `/stickers/packs` | Các gói nhãn dán trong kho của Zalo, mới nhất trước: `[{ "id", "name", "icon", "count" }]`. Gateway giữ danh sách 12 giờ |
+| GET | `/stickers/packs/{id}` | Nhãn dán của một gói: `[{ "id", "cate_id", "type", "url" }]`; `url` là ảnh trên CDN của Zalo, tải qua `/media` |
+| GET | `/stickers/search?q=` | Nhãn dán theo từ khóa ("haha", "cảm ơn", "yêu"…), như Zalo gợi ý; cùng dạng như trên |
+| POST | `/threads/{id}/stickers` | Gửi nhãn dán `{ "id", "cate_id", "type" }` lấy từ các đường dẫn trên; trả về tin đã lưu (`kind` là `chat.sticker`) |
 | GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
 | POST | `/threads/{id}/messages` | Gửi tin `{ "text": "…" }`, trả về tin nhắn đã lưu. Thêm `"reply_to": <seq>` để trả lời một tin: tin mới mang `quote` của tin đó |

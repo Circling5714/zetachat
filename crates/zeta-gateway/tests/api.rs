@@ -185,6 +185,42 @@ fn fake_connector(store: Arc<Store>, bus: EventBus, seen: SeenLog, asked: AskedL
                     seen.lock().unwrap().push((remote_id, ids));
                 }
                 ZaloCommand::Typing { .. } => {}
+                // The store's answer says what was asked.
+                ZaloCommand::Stickers { query, reply } => {
+                    let _ = reply.send(Ok(json!({ "asked": format!("{query:?}") })));
+                }
+                ZaloCommand::SendSticker {
+                    kind,
+                    remote_id,
+                    sticker,
+                    reply,
+                } => {
+                    let thread = ThreadUpsert {
+                        kind,
+                        remote_id,
+                        name: String::new(),
+                        avatar: String::new(),
+                    };
+                    store.upsert_thread(&thread, false).unwrap();
+                    let message = store
+                        .insert_message(&NewMessage {
+                            thread_id: thread.id(),
+                            remote_id: format!("srv-{sent}"),
+                            client_id: format!("{sent}"),
+                            sender_id: "me".into(),
+                            sender_name: String::new(),
+                            outgoing: true,
+                            kind: "chat.sticker".into(),
+                            text: "[Nhãn dán]".into(),
+                            media: zeta_gateway::zalo::sticker_media(&sticker),
+                            quote: None,
+                            sent_at: 10,
+                            raw: "{}".into(),
+                        })
+                        .unwrap()
+                        .unwrap();
+                    let _ = reply.send(Ok(message));
+                }
                 // Zalo knows everyone but the users whose id starts with 9.
                 ZaloCommand::LookupPeople { uids, reply } => {
                     asked.lock().unwrap().push(uids.clone());
@@ -812,4 +848,60 @@ async fn people_are_looked_up_once_friends_listed_and_messages_searched() {
     assert_eq!(hits, ["Phở Hà Nội", "Ăn phở không?"]);
     let (_, none) = call(&f, "GET", "/api/v1/search?q=", None, true).await;
     assert_eq!(none["messages"], json!([]));
+}
+
+#[tokio::test]
+async fn stickers_are_listed_searched_and_sent() {
+    let f = fixture();
+    let (status, packs) = call(&f, "GET", "/api/v1/stickers/packs", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(packs["asked"], "Packs");
+    let (_, pack) = call(&f, "GET", "/api/v1/stickers/packs/12815", None, true).await;
+    assert_eq!(pack["asked"], "Pack(12815)");
+    let (status, _) = call(&f, "GET", "/api/v1/stickers/packs/abc", None, true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, found) = call(
+        &f,
+        "GET",
+        "/api/v1/stickers/search?q=%20haha%20",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(found["asked"], "Search(\"haha\")");
+    // Nothing to search: no question to Zalo.
+    let (_, none) = call(&f, "GET", "/api/v1/stickers/search?q=%20", None, true).await;
+    assert_eq!(none, json!([]));
+
+    let uri = format!(
+        "/api/v1/threads/{}/stickers",
+        thread_id(ThreadKind::Group, "77")
+    );
+    let (status, body) = call(
+        &f,
+        "POST",
+        &uri,
+        Some(json!({ "id": 21300, "cate_id": 10, "type": 7 })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["kind"].as_str(), body["text"].as_str()),
+        (Some("chat.sticker"), Some("[Nhãn dán]"))
+    );
+    assert_eq!(body["media"]["kind"], "sticker");
+    assert!(body["media"]["url"]
+        .as_str()
+        .unwrap()
+        .ends_with("eid=21300&size=130"));
+    let (status, _) = call(
+        &f,
+        "POST",
+        &uri,
+        Some(json!({ "id": 0, "cate_id": 0, "type": 7 })),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

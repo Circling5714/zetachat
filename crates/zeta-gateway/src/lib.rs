@@ -8,6 +8,7 @@ pub mod events;
 pub mod media;
 pub mod media_cache;
 pub mod model;
+pub mod stickers;
 pub mod store;
 pub mod uploads;
 pub mod web;

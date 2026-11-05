@@ -114,6 +114,16 @@ Thu hồi tin của mình: `POST {chat}/api/message/undo` (nhóm: `{group}/api/g
 
 Tên và ảnh của người không phải bạn bè: `POST {profile}/api/social/group/members` với `friend_pversion_map: ["<uid>_0", …]`, đúng như Zalo PC làm với thành viên nhóm nó chưa biết. Kết quả nằm trong `profiles`, là object theo uid: `{ displayName, zaloName, avatar, … }`. Đã thử hỏi 45 người một lần: Zalo trả đủ 45 hồ sơ, người nào cũng có tên và ảnh. Theo ctdozlite, `getminiprofiles` trả mã 114 nếu đưa uid trần. Gateway hỏi mỗi người tối đa 3 ngày một lần.
 
+## 8f. Nhãn dán (đã kiểm chứng)
+
+Theo ctdozlite (chép từ Zalo PC), host là `sticker` trong bảng dịch vụ (`tt-sticker-wpa.zaloapp.com`):
+
+- Danh sách gói: `GET /api/message/sticker/category/list/v2` với `params` là chuỗi rỗng đã mã hóa (không phải JSON). Kết quả có `dataUrl`, là tệp JSON trên CDN của Zalo (có khi nén gzip) liệt kê cả kho: `{ id, name, totalImage, iconUrl }`. `exCateIds` là các gói cần bỏ. Đã thử: 353 gói.
+- Nhãn dán của một gói: `GET /api/message/sticker/category/sticker_detail` với `{ cid }`, ra danh sách `{ id, cateId, type }`. Đã thử: một gói 30 nhãn.
+- Tìm theo từ khóa: `/api/message/sticker/suggest/stickers` (`{ keyword, gif: 1, guggy: 0, imei }`, kết quả trong `sugg_sticker`) và `/api/message/sticker/search` (`{ keyword, limit, srcType: 0, imei }`, ra danh sách); gateway gộp hai kết quả. Đã thử: "haha" ra 93 nhãn, "cảm ơn" ra 26 nhãn.
+- Gửi: `POST {chat}/api/message/sticker` (nhóm: `{group}/api/group/sticker`) với `toid` hoặc `grid`, `stickerId`, `cateId`, `type`, `clientId`, `imei`, `zsource: 101`. Đã thử gửi vào Cloud: Zalo nhận, bản sao gửi về không bị lưu trùng.
+- Ảnh: `https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=<id>&size=130`; 30 nhãn dán có sẵn (gói 0) nằm ở `stc-chat.zdn.vn`. Ảnh của gói và của nhãn dán tải được không cần cookie.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::events::EventBus;
@@ -15,7 +15,8 @@ use crate::model::{
     now_ms, thread_id, Media, Message, NewMessage, NewReaction, Person, Quote, ThreadKind,
     ThreadUpsert,
 };
-use crate::store::Store;
+use crate::stickers::StickerQuery;
+use crate::store::{fold, Store};
 use crate::uploads::UploadJob;
 use crate::zalo::{Attachment, LoginState, SessionState, ZaloCommand, ZaloHandle, ZaloStatus};
 
@@ -40,6 +41,90 @@ fn portrait(hue: u32) -> String {
     svg_data(&format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><defs><linearGradient id="p" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl({hue},70%,74%)"/><stop offset="1" stop-color="hsl({deep},62%,50%)"/></linearGradient></defs><rect width="160" height="160" fill="url(#p)"/><circle cx="80" cy="66" r="30" fill="#fff" opacity="0.92"/><path d="M24 160 C28 118 52 104 80 104 C108 104 132 118 136 160 Z" fill="#fff" opacity="0.92"/></svg>"##
     ))
+}
+
+/// A drawn sticker face: its colour and the path of its mouth.
+fn face(fill: &str, mouth: &str) -> String {
+    svg_data(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><circle cx="120" cy="124" r="100" fill="{fill}" stroke="#a16207" stroke-width="6"/><circle cx="85" cy="102" r="13" fill="#422006"/><circle cx="155" cy="102" r="13" fill="#422006"/><path d="{mouth}" fill="none" stroke="#422006" stroke-width="11" stroke-linecap="round"/></svg>"##
+    ))
+}
+
+fn heart(fill: &str) -> String {
+    svg_data(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><path d="M120 206 C40 150 20 110 40 76 C60 42 104 46 120 80 C136 46 180 42 200 76 C220 110 200 150 120 206 Z" fill="{fill}" stroke="#fff" stroke-width="8"/></svg>"##
+    ))
+}
+
+/// Sample stickers: id, pack, words a search finds them by, picture.
+fn demo_stickers() -> Vec<(u64, u64, &'static str, String)> {
+    vec![
+        (
+            9001,
+            1,
+            "vui cười haha",
+            face("#facc15", "M68 148 Q120 200 172 148"),
+        ),
+        (
+            9002,
+            1,
+            "buồn khóc",
+            face("#93c5fd", "M72 172 Q120 128 168 172"),
+        ),
+        (
+            9003,
+            1,
+            "ngạc nhiên wow",
+            face("#fdba74", "M100 162 Q120 196 140 162 Q120 128 100 162"),
+        ),
+        (
+            9004,
+            1,
+            "bình thường ok",
+            face("#bef264", "M78 160 L162 160"),
+        ),
+        (
+            9005,
+            1,
+            "giận tức",
+            face("#fca5a5", "M72 170 Q120 144 168 170"),
+        ),
+        (
+            9006,
+            1,
+            "vui yêu thương",
+            face("#f9a8d4", "M64 144 Q120 210 176 144"),
+        ),
+        (9101, 2, "yêu tim thương", heart("#ef4444")),
+        (9102, 2, "yêu tim", heart("#ec4899")),
+        (9103, 2, "yêu tim", heart("#a855f7")),
+        (9104, 2, "yêu tim", heart("#f97316")),
+    ]
+}
+
+/// What the demo's sticker store answers.
+fn demo_sticker_answer(query: &StickerQuery) -> Value {
+    let all = demo_stickers();
+    let item =
+        |s: &(u64, u64, &str, String)| json!({ "id": s.0, "cate_id": s.1, "type": 7, "url": s.3 });
+    match query {
+        StickerQuery::Packs => json!([
+            { "id": 1, "name": "Mặt cười", "icon": all[0].3, "count": 6 },
+            { "id": 2, "name": "Trái tim", "icon": all[6].3, "count": 4 },
+        ]),
+        StickerQuery::Pack(id) => {
+            Value::Array(all.iter().filter(|s| s.1 == *id).map(item).collect())
+        }
+        StickerQuery::Search(q) => {
+            let q = fold(q);
+            Value::Array(
+                all.iter()
+                    .filter(|s| fold(s.2).contains(&q))
+                    .map(item)
+                    .collect(),
+            )
+        }
+    }
 }
 
 /// This account in the demo.
@@ -666,6 +751,32 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 // Everyone in the demo is known from the start.
                 ZaloCommand::LookupPeople { uids, reply } => {
                     let _ = reply.send(store.people(&uids).map_err(|e| e.to_string()));
+                }
+                ZaloCommand::Stickers { query, reply } => {
+                    let _ = reply.send(Ok(demo_sticker_answer(&query)));
+                }
+                ZaloCommand::SendSticker {
+                    kind,
+                    remote_id,
+                    sticker,
+                    reply,
+                } => {
+                    let url = demo_stickers()
+                        .into_iter()
+                        .find(|s| s.0 == sticker.id)
+                        .map_or_else(|| sticker.url(), |s| s.3);
+                    let content = Content {
+                        kind: "chat.sticker",
+                        text: "[Nhãn dán]",
+                        media: Some(Media {
+                            kind: "sticker".into(),
+                            url,
+                            ..Media::default()
+                        }),
+                        quote: None,
+                    };
+                    let sent = store_and_publish(&store, &bus, kind, &remote_id, true, "", content);
+                    let _ = reply.send(sent.ok_or_else(|| "demo: không lưu được tin".to_string()));
                 }
                 ZaloCommand::StartLogin { reply } => {
                     let state = LoginState::WaitingScan {

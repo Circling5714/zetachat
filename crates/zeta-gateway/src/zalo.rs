@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeta_zalo::api::{Recipient, SessionHealth};
 use zeta_zalo::message::QuotedMessage;
 use zeta_zalo::socket::{self, RealtimeEvent};
+use zeta_zalo::sticker::Sticker;
 use zeta_zalo::upload::{self, FileLimits, FileSource, UploadedFile};
 use zeta_zalo::{reaction, typing};
 use zeta_zalo::{Device, SessionData, ZaloClient};
@@ -27,6 +28,7 @@ use crate::model::{
     now_ms, thread_id, Media, Message, NewMessage, NewReaction, Person, Quote, ThreadKind,
     ThreadUpsert,
 };
+use crate::stickers::{StickerCache, StickerQuery};
 use crate::store::Store;
 use crate::uploads::UploadJob;
 
@@ -155,6 +157,19 @@ pub enum ZaloCommand {
     LookupPeople {
         uids: Vec<String>,
         reply: oneshot::Sender<Result<Vec<Person>, String>>,
+    },
+    /// Ask the sticker store: packs, a pack's stickers, a search (JSON for
+    /// clients).
+    Stickers {
+        query: StickerQuery,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// Send a sticker; answers with the stored message.
+    SendSticker {
+        kind: ThreadKind,
+        remote_id: String,
+        sticker: Sticker,
+        reply: oneshot::Sender<Result<Message, String>>,
     },
     StartLogin {
         reply: oneshot::Sender<LoginState>,
@@ -325,6 +340,7 @@ pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
         // One attachment at a time, in the order they came.
         attachment_turns: Arc::new(Semaphore::new(1)),
         typing_sent: std::collections::HashMap::new(),
+        stickers: Arc::default(),
     };
     tokio::spawn(connector.run(rx));
     handle
@@ -464,6 +480,7 @@ struct Connector {
     attachment_turns: Arc<Semaphore>,
     /// When typing was last told to Zalo, per thread.
     typing_sent: std::collections::HashMap<String, std::time::Instant>,
+    stickers: Arc<StickerCache>,
 }
 
 async fn next_realtime(
@@ -900,6 +917,54 @@ impl Connector {
                     let _ = reply.send(lookup_people(&client, &store, &uids).await);
                 });
             }
+            ZaloCommand::Stickers { query, reply } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let cache = self.stickers.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(cache.answer(&client, &query).await);
+                });
+            }
+            ZaloCommand::SendSticker {
+                kind,
+                remote_id,
+                sticker,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                let media_cache = self.cfg.media.clone();
+                let self_uid = self.self_uid.clone();
+                tokio::spawn(async move {
+                    let result = match client
+                        .send_sticker(recipient(kind, &remote_id), &sticker)
+                        .await
+                    {
+                        Ok(sent) => {
+                            let found = sticker_media(&sticker);
+                            if let (Some(cache), Some(found)) = (&media_cache, &found) {
+                                cache.prefetch(found.prefetch_urls());
+                            }
+                            let sent = Sent {
+                                msg_id: sent.msg_id,
+                                client_id: sent.client_id,
+                                msg_type: "chat.sticker",
+                                text: "[Nhãn dán]".into(),
+                                media: found,
+                                quote: None,
+                            };
+                            store_sent(&store, &bus, &self_uid, kind, &remote_id, sent)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = reply.send(result);
+                });
+            }
             ZaloCommand::StartLogin { reply } => {
                 if self.login_running {
                     let current = self
@@ -1201,6 +1266,12 @@ impl Connector {
             }
         }
     }
+}
+
+/// The media of a sticker message, as parsed from Zalo's own messages.
+pub fn sticker_media(sticker: &Sticker) -> Option<Media> {
+    let content = json!({ "id": sticker.id, "catId": sticker.cate_id, "type": sticker.kind });
+    media::extract("chat.sticker", Some(&content))
 }
 
 /// Ask Zalo about users and store what it says; users it does not answer for

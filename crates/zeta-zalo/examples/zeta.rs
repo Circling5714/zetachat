@@ -28,6 +28,7 @@ Cách dùng:
   zeta friends <session.json> [--names]          đếm (hoặc liệt kê) bạn bè
   zeta groups  <session.json> [--names]          đếm (hoặc liệt kê) nhóm
   zeta people  <session.json>                    hỏi tên, ảnh của thành viên nhóm không phải bạn bè (chỉ in số đếm)
+  zeta stickers <session.json> [packs | pack <id> | search <từ khóa>]   kho nhãn dán của Zalo
   zeta recent  <session.json>                    cấu trúc tin nhắn gần đây (không in nội dung)
   zeta probe   <session.json> <dịch vụ> <đường dẫn> <JSON params>  gọi GET bất kỳ, in cấu trúc phản hồi
   zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
@@ -51,6 +52,7 @@ async fn main() -> Result<()> {
         Some("friends") => friends(rest).await,
         Some("groups") => groups(rest).await,
         Some("people") => people(rest).await,
+        Some("stickers") => stickers(rest).await,
         Some("recent") => recent(rest).await,
         Some("probe") => probe(rest).await,
         Some("limits") => limits(rest).await,
@@ -160,6 +162,40 @@ async fn groups(args: &[String]) -> Result<()> {
         for g in &list {
             println!("  {} {} ({} thành viên)", g.id, g.name, g.member_count);
         }
+    }
+    Ok(())
+}
+
+/// The sticker store: packs, the stickers of a pack, a search. Prints counts
+/// and ids (stickers are public, nothing personal).
+async fn stickers(args: &[String]) -> Result<()> {
+    let client = load_client(&session_path(args)?)?;
+    match args.get(1).map(String::as_str).unwrap_or("packs") {
+        "packs" => {
+            let packs = client.sticker_packs().await?;
+            let with_icon = packs.iter().filter(|p| !p.icon.is_empty()).count();
+            println!("{} gói nhãn dán ({with_icon} có ảnh)", packs.len());
+            for p in packs.iter().take(5) {
+                println!("  {} {} ({} nhãn)", p.id, p.name, p.count);
+            }
+        }
+        "pack" => {
+            let id: u64 = args.get(2).context("thiếu id gói")?.parse()?;
+            let list = client.pack_stickers(id).await?;
+            println!("gói {id}: {} nhãn dán", list.len());
+            for s in list.iter().take(3) {
+                println!("  {s:?} {}", s.url());
+            }
+        }
+        "search" => {
+            let keyword = args.get(2..).unwrap_or_default().join(" ");
+            let list = client.search_stickers(&keyword).await?;
+            println!("\"{keyword}\": {} nhãn dán", list.len());
+            for s in list.iter().take(3) {
+                println!("  {s:?}");
+            }
+        }
+        other => bail!("không hiểu \"{other}\": packs | pack <id> | search <từ khóa>"),
     }
     Ok(())
 }

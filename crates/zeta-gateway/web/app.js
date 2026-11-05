@@ -216,7 +216,7 @@ function threadRow(t, sub) {
     el('div', 'name', threadName(t)),
     typing
       ? el('div', 'preview typing', typingText(t, typing))
-      : el('div', 'preview', sub || t.preview || (t.kind === 'group' ? membersText(t) : '')),
+      : el('div', 'preview', sub || displayText(t.preview) || (t.kind === 'group' ? membersText(t) : '')),
   );
   const meta = el('div', 'meta');
   meta.append(el('span', null, fmtListTime(t.last_message_at)));
@@ -680,6 +680,39 @@ document.addEventListener('keydown', (e) => {
 
 // ------------------------------------------------------------- conversation
 
+/** Zalo's text emoticons (the same codes as its reactions) and how they look. */
+const ZALO_EMOTICONS = {
+  '/-strong': '👍', '/-heart': '❤️', ':>': '😆', ':o': '😮', ':-((': '😭', ':-h': '😡',
+  ':-*': '😘', ":')": '😂', '/-shit': '💩', '/-rose': '🌹', '/-break': '💔', '/-weak': '👎',
+  ';xx': '😍', ';-/': '😕', ';-)': '😉', '/-fade': '🥀', '/-li': '☀️', '/-bd': '🎂',
+  '/-bome': '💣', '/-ok': '👌', '/-v': '✌️', '/-thanks': '🙏', '/-punch': '👊', '_()_': '🙏',
+  '/-no': '🙅', '/-loveu': '🤟', '--b': '😓', ':((': '😢', 'x-)': '😎', '8-)': '🤓',
+  ';-d': '😁', 'b-)': '😎', ':--|': '😐', 'p-(': '😞', ':-bye': '👋', '|-)': '😴',
+  ':wipe': '😅', '&-(': '😧', ':handclap': '👏', '>-|': '😠', ';-x': '🤐', ':-o': '😲',
+  ';-s': '😳', ';-a': '😨', ':-<': '😟', ':))': '😄', '$-)': '🤑', '/-beer': '🍺',
+};
+
+/**
+ * Text as Zalo shows it: a message that is just an emoticon code becomes its
+ * emoji, and `/-name` codes standing alone between spaces do too. Other
+ * codes (`:o`…) are left alone inside sentences, where they may be plain text.
+ */
+function displayText(text) {
+  const whole = ZALO_EMOTICONS[(text || '').trim()];
+  if (whole) return whole;
+  return (text || '').replace(/(^|\s)(\/-[a-z]+)(?=\s|$)/g, (m, pre, code) => pre + (ZALO_EMOTICONS[code] || code));
+}
+
+const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\p{Regional_Indicator}|[\u200d\ufe0f\u20e3]|\s)+$/u;
+
+/** Up to three emoji and nothing else: shown large, without a bubble. */
+function emojiOnly(text) {
+  const t = (text || '').trim();
+  if (!t || t.length > 40 || !EMOJI_ONLY.test(t)) return false;
+  if (typeof Intl.Segmenter !== 'function') return t.length <= 8;
+  return [...new Intl.Segmenter().segment(t.replace(/\s+/g, ''))].length <= 3;
+}
+
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
 
 /** Append text to `parent`, turning web addresses into links. */
@@ -716,9 +749,11 @@ function messageNode(m, prev, t) {
   const recalled = m.kind === 'chat.undo';
   const md = recalled ? null : m.media;
   const media = md && MEDIA[md.kind];
+  const text = recalled || media ? m.text : displayText(m.text);
   let cls = `msg ${m.outgoing ? 'out' : 'in'}`;
   if (media) cls += ` ${media[1]}`;
   if (recalled) cls += ' recalled';
+  else if (!media && !m.quote && emojiOnly(text)) cls += ' emoji-only';
   const bubble = el('div', cls);
   bubble.dataset.seq = String(m.seq);
   const newSender = !prev || prev.outgoing || prev.sender_id !== m.sender_id || !sameDay(prev.sent_at, m.sent_at);
@@ -741,7 +776,7 @@ function messageNode(m, prev, t) {
       bubble.appendChild(caption);
     }
   } else {
-    appendText(bubble, m.text || '');
+    appendText(bubble, text || '');
   }
   if (!recalled && m.reactions && m.reactions.length) bubble.appendChild(reactionSummary(m));
   bubble.appendChild(el('span', 'time', fmtClock(m.sent_at)));
@@ -861,6 +896,7 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (picker) closePicker();
+  else if (panelKind) closePanel();
   else if (state.replyTo && document.activeElement === input) cancelReply();
 });
 $('messages').addEventListener('scroll', closePicker, { passive: true });
@@ -984,6 +1020,7 @@ async function openThread(id, focusSeq) {
   renderUploads();
   if (state.replyTo && state.replyTo.thread_id !== id) state.replyTo = null;
   renderReply();
+  if (panelKind === 'emoji') closePanel();
   try {
     let list = await fetchMessages(id);
     let full = list.length === 50;
@@ -1112,8 +1149,18 @@ function autosize() {
   input.style.overflowY = input.scrollHeight > 160 ? 'auto' : 'hidden';
 }
 
+/** An empty box turns the send button into a quick 👍, as in Zalo. */
+function updateSendButton() {
+  const empty = !input.value.trim();
+  const send = $('send');
+  send.classList.toggle('like', empty);
+  send.textContent = empty ? '👍' : 'Gửi';
+  send.title = empty ? 'Gửi 👍' : 'Gửi';
+}
+
 input.addEventListener('input', () => {
   autosize();
+  updateSendButton();
   sendTyping();
 });
 input.addEventListener('keydown', (e) => {
@@ -1126,11 +1173,14 @@ input.addEventListener('keydown', (e) => {
 
 $('composer').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const text = input.value.trim();
+  let text = input.value.trim();
+  // The 👍 button sends a thumbs up; Enter in an empty box sends nothing.
+  if (!text && e.submitter === $('send')) text = '👍';
   const id = state.current;
   if (!text || !id) return;
   input.value = '';
   autosize();
+  updateSendButton();
   $('send').disabled = true;
   const body = { text };
   const replyTo = state.replyTo;
@@ -1140,14 +1190,309 @@ $('composer').addEventListener('submit', async (e) => {
     if (state.replyTo === replyTo) cancelReply();
     onMessage({ message, thread: null });
   } catch (err) {
-    input.value = text;
+    if (text !== '👍' || input.value) input.value = text;
     autosize();
+    updateSendButton();
     handleError(err, 'Không gửi được: ');
   } finally {
     $('send').disabled = false;
     input.focus();
   }
 });
+
+// ------------------------------------------------------- emoji and stickers
+//
+// One panel above the composer shows either emoji (put into the text) or
+// Zalo's stickers (sent at once). Recently used ones are kept on this device.
+
+const EMOJI_GROUPS = [
+  ['🕘', 'Dùng gần đây', ''],
+  ['😀', 'Mặt cười', '😀 😃 😄 😁 😆 😅 🤣 😂 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😗 😚 😋 😛 😜 🤪 😝 🤑 🤗 🤭 🤫 🤔 🤐 🤨 😐 😑 😶 😏 😒 🙄 😬 😌 😔 😪 🤤 😴 😷 🤒 🤕 🤢 🤮 🥵 🥶 🥴 😵 🤯 🤠 🥳 😎 🤓 🧐 😕 😟 🙁 😮 😯 😲 😳 🥺 😦 😧 😨 😰 😥 😢 😭 😱 😖 😣 😞 😓 😩 😫 🥱 😤 😡 😠 🤬 😈 👿 💀 💩 🤡 👻 👽 🤖 😺 😸 😹 😻 😼 😽 🙀 😿 😾'],
+  ['👋', 'Cử chỉ', '👍 👎 👌 🤌 🤏 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ ✋ 🤚 🖐️ 🖖 👋 👏 🙌 👐 🤲 🤝 🙏 ✍️ 💪 🫶 🙋 🙆 🙅 🤷 🤦 🙇 💁 🧑‍💻 👨‍👩‍👧 👶 🧒 👦 👧 🧑 👨 👩 🧓 👴 👵'],
+  ['❤️', 'Trái tim', '❤️ 🧡 💛 💚 💙 💜 🤎 🖤 🤍 💔 ❣️ 💕 💞 💓 💗 💖 💘 💝 💟 💋 💯 💢 💥 💫 💦 💨 🔥 ✨ ⭐ 🌟 💤 ❗ ❓ ✅ ❌ 🆗 🆒 🆕 🔴 🟢 🔵'],
+  ['🐶', 'Động vật và thiên nhiên', '🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🙈 🙉 🙊 🐔 🐧 🐦 🐤 🦆 🦉 🐴 🦄 🐝 🦋 🐌 🐞 🐢 🐍 🐙 🐠 🐬 🐳 🦈 🌸 🌹 🌺 🌻 🌼 🌷 🌱 🌿 🍀 🍁 🌈 ☀️ 🌙 ⛅ 🌧️ ⛄ 🌊'],
+  ['🍜', 'Đồ ăn', '🍎 🍊 🍋 🍌 🍉 🍇 🍓 🍒 🍑 🥭 🍍 🥥 🥑 🍅 🌶️ 🌽 🥕 🍞 🧀 🍳 🍗 🍖 🍔 🍟 🍕 🌭 🥪 🌮 🍜 🍲 🍛 🍣 🍱 🥟 🍤 🍙 🍚 🍰 🎂 🍩 🍪 🍫 🍬 🍭 🍦 ☕ 🍵 🧋 🥤 🍺 🍻 🥂 🍷'],
+  ['⚽', 'Hoạt động và đồ vật', '⚽ 🏀 🏐 🏓 🏸 🎾 🏆 🥇 🎮 🎲 🎯 🎤 🎧 🎸 🎹 🎉 🎊 🎈 🎁 🧧 🏮 🎄 🎆 📱 💻 📷 🎥 📞 ⏰ 💡 📚 ✏️ 📌 📎 ✂️ 🔑 🏠 🚗 🏍️ 🚲 ✈️ 🚀 💰 💵 💎 🛒 🏖️ ⛺'],
+];
+
+const RECENT_EMOJI_KEY = 'zetachat.recentEmoji';
+const RECENT_STICKERS_KEY = 'zetachat.recentStickers';
+
+function loadList(key) {
+  try {
+    const list = JSON.parse(localStorage.getItem(key) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveList(key, list) {
+  try {
+    localStorage.setItem(key, JSON.stringify(list));
+  } catch {
+    // Private windows may refuse: recent items are a convenience.
+  }
+}
+
+function rememberEmoji(emoji) {
+  const list = loadList(RECENT_EMOJI_KEY).filter((e) => e !== emoji);
+  list.unshift(emoji);
+  saveList(RECENT_EMOJI_KEY, list.slice(0, 32));
+}
+
+function rememberSticker(s) {
+  const list = loadList(RECENT_STICKERS_KEY).filter((x) => x.id !== s.id);
+  list.unshift({ id: s.id, cate_id: s.cate_id, type: s.type, url: s.url });
+  saveList(RECENT_STICKERS_KEY, list.slice(0, 24));
+}
+
+let panelKind = null; // 'emoji' | 'stickers' | null
+
+/** Change the layout under the messages, staying at the newest one if there. */
+function keepBottom(change) {
+  const box = $('messages');
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  change();
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function closePanel() {
+  panelKind = null;
+  $('panel').hidden = true;
+  $('panel').replaceChildren();
+  $('open-emoji').classList.remove('on');
+  $('open-stickers').classList.remove('on');
+}
+
+function openPanel(kind) {
+  panelKind = kind;
+  keepBottom(() => {
+    $('panel').hidden = false;
+  });
+  $('open-emoji').classList.toggle('on', kind === 'emoji');
+  $('open-stickers').classList.toggle('on', kind === 'stickers');
+  if (kind === 'emoji') renderEmoji(loadList(RECENT_EMOJI_KEY).length ? 0 : 1);
+  else renderStickerPanel();
+}
+
+function togglePanel(kind) {
+  if (panelKind === kind) closePanel();
+  else openPanel(kind);
+}
+
+/** Put text where the cursor is in the message box. */
+function insertAtCursor(text) {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  input.setRangeText(text, start, end, 'end');
+  autosize();
+  updateSendButton();
+}
+
+function renderEmoji(group) {
+  const box = $('panel');
+  box.replaceChildren();
+  const tabs = el('div', 'panel-tabs');
+  EMOJI_GROUPS.forEach(([icon, label], i) => {
+    const tab = el('button', i === group ? 'panel-tab on' : 'panel-tab', icon);
+    tab.type = 'button';
+    tab.title = label;
+    tab.setAttribute('aria-label', label);
+    tab.addEventListener('click', () => renderEmoji(i));
+    tabs.append(tab);
+  });
+  const grid = el('div', 'emoji-grid');
+  const list = group === 0 ? loadList(RECENT_EMOJI_KEY) : EMOJI_GROUPS[group][2].split(' ');
+  if (!list.length) grid.append(el('div', 'panel-empty', 'Chưa dùng biểu tượng nào'));
+  for (const emoji of list) {
+    const cell = el('button', 'emoji-cell', emoji);
+    cell.type = 'button';
+    cell.addEventListener('click', () => {
+      insertAtCursor(emoji);
+      rememberEmoji(emoji);
+    });
+    grid.append(cell);
+  }
+  box.append(tabs, grid);
+}
+
+const stickers = {
+  packs: null, // the store's packs, once loaded
+  pick: 'recent', // pack shown: 'recent' or a pack id
+  cache: new Map(), // pack id -> its stickers
+  query: '',
+  timer: 0,
+};
+
+function renderStickerPanel() {
+  const box = $('panel');
+  box.replaceChildren();
+  const search = el('input', 'field panel-search');
+  search.type = 'search';
+  search.placeholder = 'Tìm nhãn dán: haha, cảm ơn, yêu…';
+  search.value = stickers.query;
+  search.addEventListener('input', () => {
+    stickers.query = search.value;
+    clearTimeout(stickers.timer);
+    const q = search.value.trim();
+    if (!q) {
+      showPick();
+      return;
+    }
+    stickers.timer = setTimeout(() => searchStickers(q), 300);
+  });
+  const grid = el('div', 'sticker-grid');
+  grid.id = 'sticker-grid';
+  const strip = el('div', 'pack-strip');
+  strip.id = 'pack-strip';
+  box.append(search, grid, strip);
+  renderPackStrip();
+  if (stickers.query.trim()) searchStickers(stickers.query.trim());
+  else showPick();
+  if (!stickers.packs) loadPacks();
+}
+
+async function loadPacks() {
+  try {
+    stickers.packs = await api('/stickers/packs');
+  } catch (err) {
+    stickers.packs = [];
+    handleError(err, 'Không tải được kho nhãn dán: ');
+  }
+  if (panelKind === 'stickers') {
+    renderPackStrip();
+    if (stickers.pick === 'recent' && !loadList(RECENT_STICKERS_KEY).length && stickers.packs.length) {
+      stickers.pick = stickers.packs[0].id;
+      showPick();
+    }
+  }
+}
+
+function renderPackStrip() {
+  const strip = $('pack-strip');
+  if (!strip) return;
+  strip.replaceChildren();
+  const recent = el('button', 'pack-btn', '🕘');
+  recent.type = 'button';
+  recent.title = 'Dùng gần đây';
+  recent.dataset.pick = 'recent';
+  recent.addEventListener('click', () => choosePack('recent'));
+  strip.append(recent);
+  for (const p of stickers.packs || []) {
+    const button = el('button', 'pack-btn');
+    button.type = 'button';
+    button.title = p.name;
+    button.dataset.pick = String(p.id);
+    if (p.icon) {
+      const img = new Image();
+      img.alt = p.name;
+      img.loading = 'lazy';
+      img.src = mediaSrc(p.icon);
+      img.addEventListener('error', () => img.replaceWith(initials(p.name)));
+      button.append(img);
+    } else {
+      button.append(initials(p.name));
+    }
+    button.addEventListener('click', () => choosePack(p.id));
+    strip.append(button);
+  }
+  markPick();
+}
+
+function markPick() {
+  for (const b of document.querySelectorAll('#pack-strip .pack-btn')) {
+    b.classList.toggle('on', !stickers.query.trim() && b.dataset.pick === String(stickers.pick));
+  }
+}
+
+function choosePack(pick) {
+  stickers.pick = pick;
+  stickers.query = '';
+  const search = document.querySelector('#panel .panel-search');
+  if (search) search.value = '';
+  showPick();
+}
+
+async function showPick() {
+  markPick();
+  const pick = stickers.pick;
+  if (pick === 'recent') {
+    showStickers(loadList(RECENT_STICKERS_KEY), 'Chưa gửi nhãn dán nào: chọn một gói bên dưới hoặc tìm theo từ khóa.');
+    return;
+  }
+  let list = stickers.cache.get(pick);
+  if (!list) {
+    showStickers(null);
+    try {
+      list = await api(`/stickers/packs/${pick}`);
+      stickers.cache.set(pick, list);
+    } catch (err) {
+      if (stickers.pick === pick) showStickers([], 'Không tải được gói này.');
+      handleError(err, 'Không tải được nhãn dán: ');
+      return;
+    }
+  }
+  if (stickers.pick === pick && !stickers.query.trim()) showStickers(list, 'Gói này trống.');
+}
+
+async function searchStickers(q) {
+  markPick();
+  showStickers(null);
+  try {
+    const list = await api(`/stickers/search?q=${encodeURIComponent(q)}`);
+    if (stickers.query.trim() === q) showStickers(list, `Không có nhãn dán cho “${q}”.`);
+  } catch (err) {
+    if (stickers.query.trim() === q) showStickers([], 'Không tìm được nhãn dán.');
+    handleError(err, 'Không tìm được nhãn dán: ');
+  }
+}
+
+/** Fill the grid: a list of stickers, or "loading" for null. */
+function showStickers(list, emptyText) {
+  const grid = $('sticker-grid');
+  if (!grid) return;
+  grid.replaceChildren();
+  grid.scrollTop = 0;
+  if (!list) {
+    grid.append(el('div', 'panel-empty', 'Đang tải…'));
+    return;
+  }
+  if (!list.length) {
+    grid.append(el('div', 'panel-empty', emptyText));
+    return;
+  }
+  for (const s of list) {
+    const cell = el('button', 'sticker-cell');
+    cell.type = 'button';
+    cell.title = 'Gửi nhãn dán';
+    const img = new Image();
+    img.alt = 'Nhãn dán';
+    img.loading = 'lazy';
+    img.src = mediaSrc(s.url);
+    img.addEventListener('error', () => cell.remove());
+    cell.append(img);
+    cell.addEventListener('click', () => sendSticker(s));
+    grid.append(cell);
+  }
+}
+
+async function sendSticker(s) {
+  const id = state.current;
+  if (!id) return;
+  rememberSticker(s);
+  try {
+    const message = await api(`/threads/${encodeURIComponent(id)}/stickers`, {
+      json: { id: s.id, cate_id: s.cate_id, type: s.type },
+    });
+    onMessage({ message, thread: null });
+  } catch (err) {
+    handleError(err, 'Không gửi được nhãn dán: ');
+  }
+}
+
+$('open-emoji').addEventListener('click', () => togglePanel('emoji'));
+$('open-stickers').addEventListener('click', () => togglePanel('stickers'));
 
 // -------------------------------------------------------------- attachments
 //
@@ -1519,7 +1864,7 @@ function askNotificationPermission() {
 function notify(t, m) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   const title = t.kind === 'group' ? `${threadName(t)} · ${m.sender_name || 'Thành viên'}` : threadName(t);
-  const n = new Notification(title, { body: m.text, tag: m.thread_id, icon: '/icon.svg' });
+  const n = new Notification(title, { body: displayText(m.text), tag: m.thread_id, icon: '/icon.svg' });
   n.onclick = () => {
     window.focus();
     openThread(m.thread_id);

@@ -24,11 +24,13 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
+use zeta_zalo::sticker::Sticker;
 
 use crate::auth::AuthDevice;
 use crate::events::EventBus;
 use crate::media_cache::{self, FetchError, MediaCache};
 use crate::model::{now_ms, split_thread_id, Message, Person, StoredEvent, Thread};
+use crate::stickers::StickerQuery;
 use crate::store::Store;
 use crate::uploads::{CancelError, SpoolError, Upload, Uploads, MAX_PENDING};
 use crate::zalo::{
@@ -119,6 +121,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/people", get(people))
         .route("/api/v1/friends", get(friends))
         .route("/api/v1/search", get(search))
+        .route("/api/v1/stickers/packs", get(sticker_packs))
+        .route("/api/v1/stickers/packs/{id}", get(pack_stickers))
+        .route("/api/v1/stickers/search", get(search_stickers))
+        .route("/api/v1/threads/{id}/stickers", post(send_sticker))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/stream", get(stream_events))
         .route("/api/v1/media", get(media))
@@ -333,6 +339,84 @@ async fn search(
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "messages": messages })))
+}
+
+/// Ask the connector's sticker store.
+async fn ask_stickers(st: &AppState, query: StickerQuery) -> ApiResult<Value> {
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::Stickers { query, reply })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let value = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(value))
+}
+
+/// The packs of Zalo's sticker store, newest first: `[{ id, name, icon, count }]`.
+async fn sticker_packs(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Value> {
+    ask_stickers(&st, StickerQuery::Packs).await
+}
+
+/// The stickers of a pack: `[{ id, cate_id, type, url }]`.
+async fn pack_stickers(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<u64>,
+) -> ApiResult<Value> {
+    ask_stickers(&st, StickerQuery::Pack(id)).await
+}
+
+#[derive(Deserialize)]
+struct StickerSearch {
+    #[serde(default)]
+    q: String,
+}
+
+/// Stickers for a keyword ("haha", "cảm ơn"…), as Zalo suggests them.
+async fn search_stickers(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Query(q): Query<StickerSearch>,
+) -> ApiResult<Value> {
+    let keyword: String = q.q.trim().chars().take(50).collect();
+    if keyword.is_empty() {
+        return Ok(Json(json!([])));
+    }
+    ask_stickers(&st, StickerQuery::Search(keyword)).await
+}
+
+/// Send a sticker `{ "id", "cate_id", "type" }` (as listed by the sticker
+/// routes); answers with the stored message.
+async fn send_sticker(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Json(sticker): Json<Sticker>,
+) -> ApiResult<Message> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    if sticker.id == 0 {
+        return Err(ApiError::bad_request("sticker id is missing"));
+    }
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::SendSticker {
+            kind,
+            remote_id: remote_id.to_string(),
+            sticker,
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let message = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(message))
 }
 
 #[derive(Deserialize)]

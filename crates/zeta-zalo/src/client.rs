@@ -148,8 +148,60 @@ impl ZaloClient {
         Ok(crypto::url_encode(&b64))
     }
 
+    /// [`Self::encrypt_params`] of a plain string rather than JSON (the sticker
+    /// catalogue is asked for with the empty string).
+    pub(crate) fn encrypt_text(&self, text: &str) -> Result<String> {
+        let b64 = crypto::encrypt_b64(self.session_key()?, text)?;
+        Ok(crypto::url_encode(&b64))
+    }
+
     pub(crate) async fn get(&self, url: &str, key: Option<&[u8]>) -> Result<Value> {
         self.execute(self.http.get(url), url, key).await
+    }
+
+    /// GET a file rather than an API answer: its bytes, at most `max`.
+    pub(crate) async fn get_bytes(&self, url: &str, max: u64) -> Result<Vec<u8>> {
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Status {
+                status: status.as_u16(),
+                endpoint: endpoint_of(url),
+            });
+        }
+        if resp.content_length().is_some_and(|n| n > max) {
+            return Err(Error::TooLarge { limit: max });
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() as u64 > max {
+            return Err(Error::TooLarge { limit: max });
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// POST to a service, moving to the next host only when one answers 404:
+    /// nothing was done there, so trying another cannot do anything twice.
+    pub(crate) async fn post_service(
+        &self,
+        service: Service,
+        path: &str,
+        form: String,
+        key: Option<&[u8]>,
+    ) -> Result<Value> {
+        let mut last = None;
+        for host in self.domains.candidates(service) {
+            let url = format!("{host}{path}?{}", Self::common_params());
+            match self.post_form(&url, form.clone(), key).await {
+                Err(e @ Error::Status { status: 404, .. }) => {
+                    tracing::debug!(service = service.key(), %host, "404, trying next host");
+                    last = Some(e);
+                }
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            Error::Protocol(format!("no host configured for {}", service.key()))
+        }))
     }
 
     pub(crate) async fn post_form(
