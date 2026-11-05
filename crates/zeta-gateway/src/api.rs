@@ -141,6 +141,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/threads/{id}/members", get(group_members))
         .route("/api/v1/threads/{id}/presence", get(presence))
         .route("/api/v1/users/find", get(find_user))
+        .route("/api/v1/groups", post(create_group))
         .route(
             "/api/v1/friends/requests",
             get(friend_requests).post(send_friend_request),
@@ -416,6 +417,52 @@ fn valid_uid(uid: &str) -> Result<String, ApiError> {
         return Err(ApiError::bad_request("invalid user id"));
     }
     Ok(uid.to_string())
+}
+
+#[derive(Deserialize)]
+struct NewGroup {
+    #[serde(default)]
+    name: String,
+    members: Vec<String>,
+}
+
+/// Make a group with friends `{ "name", "members": [uid…] }` (two or more, as
+/// Zalo PC asks; an empty name lets Zalo name it). Answers `{ "thread",
+/// "failed": [uid…] }`, `failed` being who Zalo could not add.
+async fn create_group(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Json(body): Json<NewGroup>,
+) -> ApiResult<Value> {
+    let name: String = body.name.trim().chars().take(100).collect();
+    let mut members: Vec<String> = Vec::new();
+    for uid in &body.members {
+        let uid = valid_uid(uid)?;
+        if !members.contains(&uid) {
+            members.push(uid);
+        }
+    }
+    if members.len() < 2 {
+        return Err(ApiError::bad_request("chọn ít nhất 2 người để tạo nhóm"));
+    }
+    if members.len() > 100 {
+        return Err(ApiError::bad_request("chọn tối đa 100 người một lần"));
+    }
+    let (reply, answer) = oneshot::channel();
+    st.zalo
+        .commands
+        .send(ZaloCommand::CreateGroup {
+            name,
+            members,
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?;
+    let made = answer
+        .await
+        .map_err(|_| ApiError::unavailable("Zalo connector is not running"))?
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(made))
 }
 
 #[derive(Deserialize)]

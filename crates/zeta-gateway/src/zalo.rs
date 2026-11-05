@@ -191,6 +191,12 @@ pub enum ZaloCommand {
         owner_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Make a group with these friends; answers with `{ thread, failed }`.
+    CreateGroup {
+        name: String,
+        members: Vec<String>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// When a user was last on Zalo (asked at most once a minute per user).
     LastOnline {
         uid: String,
@@ -1049,6 +1055,20 @@ impl Connector {
                     let _ = reply.send(result);
                 });
             }
+            ZaloCommand::CreateGroup {
+                name,
+                members,
+                reply,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
+                    return;
+                };
+                let (store, bus) = (self.store.clone(), self.bus.clone());
+                tokio::spawn(async move {
+                    let _ = reply.send(create_group(&client, &store, &bus, &name, &members).await);
+                });
+            }
             ZaloCommand::LastOnline { uid, reply } => {
                 let Some(client) = self.client.clone() else {
                     let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
@@ -1613,6 +1633,52 @@ async fn friend_action(
             Ok(json!({ "ok": true }))
         }
     }
+}
+
+/// Make a group, then store it with the name and picture Zalo gave it.
+async fn create_group(
+    client: &ZaloClient,
+    store: &Store,
+    bus: &EventBus,
+    name: &str,
+    members: &[String],
+) -> Result<Value, String> {
+    let made = client
+        .create_group(name, members)
+        .await
+        .map_err(friend_error)?;
+    let mut thread = ThreadUpsert {
+        kind: ThreadKind::Group,
+        remote_id: made.group_id.clone(),
+        name: name.trim().to_string(),
+        avatar: String::new(),
+    };
+    let mut size = 1 + made.added.len() as u64;
+    // Zalo names a group left unnamed after its members.
+    match client
+        .group_info(std::slice::from_ref(&made.group_id))
+        .await
+    {
+        Ok(found) => {
+            if let Some(g) = found.into_iter().next() {
+                if !g.name.is_empty() {
+                    thread.name = g.name;
+                }
+                thread.avatar = g.avatar;
+                size = size.max(g.member_count);
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "new group details not loaded"),
+    }
+    store
+        .upsert_thread(&thread, true)
+        .and_then(|()| store.set_members(&thread.id(), size))
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = bus.publish("threads_changed", json!({})) {
+        tracing::error!(error = %e, "cannot publish threads_changed");
+    }
+    let stored = store.thread(&thread.id()).map_err(|e| e.to_string())?;
+    Ok(json!({ "thread": stored, "failed": made.failed }))
 }
 
 /// Members of a group listed at most (Zalo PC pages through larger groups).

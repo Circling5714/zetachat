@@ -444,6 +444,83 @@ async function answerRequest(uid, accept) {
   return true;
 }
 
+// ------------------------------------------------------------ new groups
+
+const newGroup = { chosen: new Set() };
+
+function openNewGroup() {
+  newGroup.chosen = new Set();
+  $('group-name').value = '';
+  $('group-search').value = '';
+  renderGroupChoices();
+  $('new-group').hidden = false;
+  $('group-name').focus();
+}
+
+function closeNewGroup() {
+  $('new-group').hidden = true;
+}
+
+function renderGroupChoices() {
+  const q = fold($('group-search').value.trim());
+  const ul = $('group-list');
+  ul.replaceChildren();
+  const list = friendList().filter((p) => !q || fold(personName(p)).includes(q));
+  if (!list.length) ul.append(el('li', 'list-empty', q ? 'Không tìm thấy bạn nào' : 'Chưa có bạn bè'));
+  for (const p of list) {
+    const chosen = newGroup.chosen.has(p.uid);
+    const li = el('li', chosen ? 'forward-item chosen' : 'forward-item');
+    const box = el('input');
+    box.type = 'checkbox';
+    box.checked = chosen;
+    box.tabIndex = -1;
+    box.setAttribute('aria-label', personName(p));
+    const body = el('div', 'body');
+    body.append(el('div', 'name', personName(p)));
+    li.append(box, avatarBox(`zalo:u:${p.uid}`, personName(p), p.avatar), body);
+    li.addEventListener('click', () => {
+      if (newGroup.chosen.has(p.uid)) newGroup.chosen.delete(p.uid);
+      else if (newGroup.chosen.size < 100) newGroup.chosen.add(p.uid);
+      renderGroupChoices();
+    });
+    ul.append(li);
+  }
+  const n = newGroup.chosen.size;
+  const create = $('group-create');
+  create.disabled = n < 2;
+  create.textContent = n ? `Tạo nhóm (${n + 1} người)` : 'Tạo nhóm';
+  create.title = n < 2 ? 'Chọn ít nhất 2 người' : '';
+}
+
+async function createGroup() {
+  const create = $('group-create');
+  create.disabled = true;
+  try {
+    const made = await api('/groups', {
+      json: { name: $('group-name').value.trim(), members: [...newGroup.chosen] },
+    });
+    closeNewGroup();
+    const t = made.thread;
+    if (t) {
+      state.threads.set(t.id, t);
+      openThread(t.id);
+    }
+    const failed = (made.failed || []).length;
+    toast(failed ? `Đã tạo nhóm; ${failed} người chưa thêm được` : 'Đã tạo nhóm');
+  } catch (err) {
+    create.disabled = false;
+    handleError(err, 'Không tạo được nhóm: ');
+  }
+}
+
+$('new-group-btn').addEventListener('click', openNewGroup);
+$('group-search').addEventListener('input', renderGroupChoices);
+$('group-cancel').addEventListener('click', closeNewGroup);
+$('group-create').addEventListener('click', createGroup);
+$('new-group').addEventListener('click', (e) => {
+  if (e.target === $('new-group')) closeNewGroup();
+});
+
 // ------------------------------------------------------------ adding friends
 
 const FRIENDSHIP_TEXT = {
@@ -1092,6 +1169,7 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!$('forward').hidden) closeForward();
+  else if (!$('new-group').hidden) closeNewGroup();
   else if (!$('add-friend').hidden) closeAddFriend();
   else if (picker) closePicker();
   else if (panelKind) closePanel();

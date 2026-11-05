@@ -926,6 +926,34 @@ pub fn spawn(store: Arc<Store>, bus: EventBus, media: Arc<MediaCache>) -> ZaloHa
                 ZaloCommand::DeleteForMe { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
+                ZaloCommand::CreateGroup {
+                    name,
+                    members,
+                    reply,
+                } => {
+                    let id = format!("{}", 2100 + rand::random::<u16>() % 800);
+                    let names: Vec<String> = store
+                        .people(&members)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| p.name)
+                        .collect();
+                    let thread = ThreadUpsert {
+                        kind: ThreadKind::Group,
+                        remote_id: id,
+                        name: if name.trim().is_empty() {
+                            format!("Demo, {}", names.join(", "))
+                        } else {
+                            name
+                        },
+                        avatar: String::new(),
+                    };
+                    let _ = store.upsert_thread(&thread, true);
+                    let _ = store.set_members(&thread.id(), 1 + members.len() as u64);
+                    let _ = bus.publish("threads_changed", json!({}));
+                    let stored = store.thread(&thread.id()).ok().flatten();
+                    let _ = reply.send(Ok(json!({ "thread": stored, "failed": [] })));
+                }
                 // Lan Anh is around, Minh Tuấn was a while ago, Hoàng Nam hides it.
                 ZaloCommand::LastOnline { uid, reply } => {
                     let minutes = match uid.as_str() {

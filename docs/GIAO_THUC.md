@@ -155,6 +155,10 @@ Gửi: tin nhóm có nhắc tên đi tới `{group}/api/group/mention` thay cho 
 
 Nhận: tin có trường `mentions: [{ uid, pos, len, type }]` (kiểu `TMessage` của zca-js). Gateway lưu chúng (schema v7) và client tô tên được nhắc. Trong các tin thật đã lưu chưa có tin nào nhắc tên.
 
+## 8l. Tạo nhóm (theo zca-js, chưa kiểm chứng)
+
+`POST {group}/api/group/create/v2`, tham số đã mã hóa nằm trên URL (`params`), thân để trống, như zca-js `createGroup`: `clientId`, `gname` (tên, hoặc thời điểm tạo khi để Zalo tự đặt), `gdesc: null`, `members`, `membersTypes` (-1 cho mỗi người), `nameChanged` (1 khi có tên), `createLink: 1`, `clientLang`, `imei`, `zsource: 601`. Kết quả gồm `groupId`, `sucessMembers` (Zalo viết sai chính tả như vậy) và `errorMembers`. Gateway hỏi lại `getmg-v2` để lấy tên và ảnh Zalo đặt. Chưa thử, vì tạo nhóm sẽ thêm người thật vào.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

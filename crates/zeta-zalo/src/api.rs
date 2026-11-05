@@ -214,6 +214,39 @@ impl Group {
     }
 }
 
+/// A group just made.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedGroup {
+    pub group_id: String,
+    /// Members Zalo added, and those it could not.
+    pub added: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+/// `create/v2` answers `{ groupId, sucessMembers, errorMembers, … }` (Zalo's
+/// spelling).
+fn created_group_of(data: &Value) -> Result<CreatedGroup> {
+    let data = unwrap_json_string(data.clone());
+    let data = inner_data(&data);
+    let group_id = first_str(data, &["groupId", "grid"]);
+    if group_id.is_empty() {
+        return Err(Error::Protocol(
+            "create group answered without a group id".into(),
+        ));
+    }
+    let ids = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| data.get(*k))
+            .map(|v| id_list(Some(v)))
+            .unwrap_or_default()
+    };
+    Ok(CreatedGroup {
+        group_id,
+        added: ids(&["sucessMembers", "successMembers"]),
+        failed: ids(&["errorMembers"]),
+    })
+}
+
 /// Group endpoints sometimes double-encode `data` as a JSON string.
 fn unwrap_json_string(v: Value) -> Value {
     match &v {
@@ -378,6 +411,34 @@ impl ZaloClient {
     pub async fn groups(&self) -> Result<Vec<Group>> {
         let ids = self.group_ids().await?;
         self.group_info(&ids).await
+    }
+
+    /// Make a group with `members` (user ids; Zalo PC asks for two or more),
+    /// as zca-js `createGroup`: `POST {group}/api/group/create/v2` with the
+    /// encrypted params in the query. An empty `name` lets Zalo name it.
+    pub async fn create_group(&self, name: &str, members: &[String]) -> Result<CreatedGroup> {
+        let key = self.session_key()?;
+        let now = now_millis();
+        let name = name.trim();
+        let params = self.encrypt_params(&json!({
+            "clientId": now,
+            "gname": if name.is_empty() { now.to_string() } else { name.to_string() },
+            "gdesc": Value::Null,
+            "members": members,
+            "membersTypes": members.iter().map(|_| -1).collect::<Vec<i32>>(),
+            "nameChanged": i32::from(!name.is_empty()),
+            "createLink": 1,
+            "clientLang": "vi",
+            "imei": self.device().imei,
+            "zsource": 601,
+        }))?;
+        let url = format!(
+            "{}/api/group/create/v2?{}&params={params}",
+            self.domains().primary(Service::Group),
+            Self::common_params()
+        );
+        let data = self.post_form(&url, String::new(), Some(key)).await?;
+        created_group_of(&data)
     }
 
     /// Details of the groups `ids` (`getmg-v2`, 50 at a time): name, avatar,
@@ -563,6 +624,24 @@ mod group_tests {
         let unknown = Group::from_info("8", &Value::Null);
         assert_eq!((unknown.id.as_str(), unknown.name.as_str()), ("8", ""));
         assert!(unknown.member_ids.is_empty());
+    }
+
+    #[test]
+    fn created_groups() {
+        let made = created_group_of(&json!({
+            "groupType": 1, "groupId": "900", "sucessMembers": ["1", "2"],
+            "errorMembers": ["3"], "error_data": {}
+        }))
+        .unwrap();
+        assert_eq!(
+            made,
+            CreatedGroup {
+                group_id: "900".into(),
+                added: vec!["1".into(), "2".into()],
+                failed: vec!["3".into()],
+            }
+        );
+        assert!(created_group_of(&json!({ "sucessMembers": [] })).is_err());
     }
 
     #[test]

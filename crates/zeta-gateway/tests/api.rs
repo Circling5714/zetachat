@@ -229,6 +229,24 @@ fn fake_connector(
                         .unwrap();
                     let _ = reply.send(Ok(message));
                 }
+                ZaloCommand::CreateGroup {
+                    name,
+                    members,
+                    reply,
+                } => {
+                    let thread = ThreadUpsert {
+                        kind: ThreadKind::Group,
+                        remote_id: "777".into(),
+                        name,
+                        avatar: String::new(),
+                    };
+                    store.upsert_thread(&thread, true).unwrap();
+                    store
+                        .set_members(&thread.id(), 1 + members.len() as u64)
+                        .unwrap();
+                    let stored = store.thread(&thread.id()).unwrap();
+                    let _ = reply.send(Ok(json!({ "thread": stored, "failed": [] })));
+                }
                 ZaloCommand::LastOnline { uid, reply } => {
                     let at = uid.parse::<i64>().unwrap_or(0);
                     let _ = reply.send(Ok(zeta_zalo::api::LastOnline { visible: true, at }));
@@ -1337,4 +1355,40 @@ async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
     )
     .await;
     assert_eq!(sent["mentions"], json!([]));
+}
+
+#[tokio::test]
+async fn groups_need_two_friends_or_more() {
+    let f = fixture();
+    let make = |members: Value| json!({ "name": " Đi phượt ", "members": members });
+    let (status, _) = call(
+        &f,
+        "POST",
+        "/api/v1/groups",
+        Some(make(json!(["1", "1"]))),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &f,
+        "POST",
+        "/api/v1/groups",
+        Some(make(json!(["1", "x"]))),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, made) = call(
+        &f,
+        "POST",
+        "/api/v1/groups",
+        Some(make(json!(["1", "2"]))),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    assert_eq!(made["thread"]["id"], "zalo:g:777");
+    assert_eq!(made["thread"]["name"], "Đi phượt");
+    assert_eq!(made["thread"]["members"], 3);
 }
