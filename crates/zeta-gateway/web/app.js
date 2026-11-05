@@ -1091,6 +1091,218 @@ function contactNode(md) {
   return card;
 }
 
+// ------------------------------------------------------------- bank accounts
+//
+// Bank cards in messages, account numbers recognised in texts, and the
+// account's saved accounts sent as cards ("gửi STK"). QR codes are VietQR,
+// drawn by the gateway.
+
+const BANKS_KEY = 'zetachat.banks';
+const bankInfo = { list: null, asking: null, read: new Set(), matchers: null };
+try {
+  const saved = JSON.parse(localStorage.getItem(BANKS_KEY) || 'null');
+  if (saved && Date.now() - saved.at < 86400000 && Array.isArray(saved.list) && saved.list.length) bankInfo.list = saved.list;
+} catch (_) { /* no storage */ }
+
+/** The banks Zalo knows: `[{ bin, name, short_name, logo, keywords }]`, asked once a day. */
+function loadBanks() {
+  if (bankInfo.list) return Promise.resolve(bankInfo.list);
+  if (!bankInfo.asking) {
+    bankInfo.asking = api('/banks')
+      .then((list) => {
+        bankInfo.list = Array.isArray(list) ? list : [];
+        bankInfo.matchers = null;
+        try { localStorage.setItem(BANKS_KEY, JSON.stringify({ at: Date.now(), list: bankInfo.list })); } catch (_) { /* full */ }
+        // Logos and recognised numbers need the list: draw the open chat again.
+        if (state.current && state.messages.length) renderMessages(false);
+        return bankInfo.list;
+      })
+      .catch(() => {
+        bankInfo.asking = null;
+        return [];
+      });
+  }
+  return bankInfo.asking;
+}
+
+function bankByBin(bin) {
+  return (bankInfo.list || []).find((b) => b.bin === bin) || null;
+}
+
+function vietqrUrl(bin, number, amount, note) {
+  const q = new URLSearchParams({ bin, number });
+  if (amount) q.set('amount', String(amount));
+  if (note) q.set('note', note);
+  return `${API}/vietqr.svg?${q}`;
+}
+
+/** `<option>`s of every bank, the one with `bin` chosen. */
+function fillBankSelect(select, bin, placeholder) {
+  const chosen = bin || select.value;
+  select.replaceChildren();
+  const none = el('option', null, placeholder);
+  none.value = '';
+  select.append(none);
+  const list = [...(bankInfo.list || [])].sort((a, b) => a.short_name.localeCompare(b.short_name, 'vi'));
+  for (const b of list) {
+    const option = el('option', null, b.name && b.name !== b.short_name ? `${b.short_name} — ${b.name}` : b.short_name);
+    option.value = b.bin;
+    select.append(option);
+  }
+  select.value = list.some((b) => b.bin === chosen) ? chosen : '';
+}
+
+/** Lower case without accents, one letter for one: positions stay those of `text`. */
+function foldSameLength(text) {
+  let out = '';
+  for (const ch of text.split('')) {
+    const f = fold(ch);
+    out += f.length === 1 ? f : ' ';
+  }
+  return out;
+}
+
+/** Words in Zalo's bank keywords that name no bank on their own. */
+const GENERIC_BANK_WORDS = new Set(['hn', 'hcm', 'tp hcm', 'ha noi', 'ho chi minh', 'viet nam', 'vietnam', 'bank', 'ngan hang', 'nh', 'tmcp', 'cn', 'chi nhanh']);
+
+/**
+ * What names a bank in a text: its short name and one-word keywords anywhere,
+ * longer keywords ("quan doi") only after "ngân hàng" or "NH".
+ */
+function bankMatchers() {
+  if (bankInfo.matchers || !bankInfo.list) return bankInfo.matchers || [];
+  const out = [];
+  for (const b of bankInfo.list) {
+    const words = new Set([fold(b.short_name).trim()]);
+    for (const k of (b.keywords || '').split('|')) words.add(fold(k).trim());
+    for (const w of words) {
+      if (w.length < 2 || GENERIC_BANK_WORDS.has(w)) continue;
+      const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+      const body = w.includes(' ') ? `(?:ngan hang|nh)\\s+${esc}` : esc;
+      out.push({ bin: b.bin, re: new RegExp(`(?:^|[^a-z0-9])${body}(?![a-z0-9])`, 'g') });
+    }
+  }
+  bankInfo.matchers = out;
+  return out;
+}
+
+const NUMBER_RUN = /(?<![\d,.])\d(?:[ .-]?\d){5,22}(?!\d)/g;
+const ACCOUNT_HINT = /(?:^|[^a-z])(?:stk|so tk|so tai khoan|tai khoan|tk|chuyen khoan|ck)(?![a-z])/g;
+const MONEY_AFTER = /^\s*(?:d|k|vnd|dong|tr|trieu|nghin|ngan|%|usd)(?![a-z])/;
+
+/**
+ * Account numbers in a text: 7 to 19 digits (spaces, dots or dashes between
+ * groups) with a bank named in the message, or "STK", "số tài khoản",
+ * "chuyển khoản"… just before. Amounts (1.500.000, 500k) and links are left
+ * alone. `[{ start, end, number, bin }]`, `bin` empty when no bank is named.
+ */
+function findAccounts(text) {
+  if (!text || !/\d{5}/.test(text.replace(/[ .-]/g, ''))) return [];
+  const folded = foldSameLength(text);
+  const banksNamed = [];
+  for (const m of bankMatchers()) {
+    for (const x of folded.matchAll(m.re)) banksNamed.push({ at: x.index, bin: m.bin });
+  }
+  const hints = [...folded.matchAll(ACCOUNT_HINT)].map((x) => x.index);
+  const links = [...text.matchAll(URL_PATTERN)].map((x) => [x.index, x.index + x[0].length]);
+  const out = [];
+  for (const x of text.matchAll(NUMBER_RUN)) {
+    const raw = x[0];
+    const start = x.index;
+    const end = start + raw.length;
+    const digits = raw.replace(/[ .-]/g, '');
+    if (digits.length < 7 || digits.length > 19) continue;
+    if (/^\d{1,3}(?:[.,]\d{3})+$/.test(raw)) continue;
+    if (MONEY_AFTER.test(folded.slice(end, end + 8))) continue;
+    if (links.some(([a, b]) => start < b && end > a)) continue;
+    let bank = null;
+    for (const m of banksNamed) {
+      const d = Math.abs(m.at - start);
+      if (!bank || d < bank.d) bank = { bin: m.bin, d };
+    }
+    const hinted = hints.some((h) => h < start && start - h < 40);
+    if (bank && bank.d > 120 && !hinted) bank = null;
+    if (!bank && !hinted) continue;
+    out.push({ start, end, number: digits, bin: bank ? bank.bin : '' });
+  }
+  return out;
+}
+
+/** Text with its account numbers as buttons that show a QR. */
+function appendWithAccounts(parent, text, accounts) {
+  let last = 0;
+  for (const a of accounts) {
+    if (a.start > last) appendText(parent, text.slice(last, a.start));
+    const chip = el('button', 'stk-chip', text.slice(a.start, a.end));
+    chip.type = 'button';
+    chip.title = 'Số tài khoản: bấm để xem mã QR chuyển khoản';
+    chip.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openStk({ bin: a.bin, number: a.number, holder: '' });
+    });
+    parent.append(chip);
+    last = a.end;
+  }
+  if (last < text.length) appendText(parent, text.slice(last));
+}
+
+/** Buttons under a card. */
+function cardActions(list) {
+  const actions = el('div', 'contact-actions');
+  for (const [label, run] of list) {
+    const b = el('button', null, label);
+    b.type = 'button';
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      run();
+    });
+    actions.append(b);
+  }
+  return actions;
+}
+
+/** A bank account card: bank, number, holder and a VietQR code. */
+function bankNode(md, m) {
+  const card = el('div', 'bank-card');
+  const b = md.bank;
+  if (!b) {
+    // What it shows is read from Zalo once, then kept by the gateway.
+    const note = el('div', 'muted small', 'Đang đọc thẻ…');
+    card.append(el('div', 'bank-name', 'Tài khoản ngân hàng'), note);
+    if (m && !bankInfo.read.has(m.seq)) {
+      bankInfo.read.add(m.seq);
+      api(`/threads/${encodeURIComponent(m.thread_id)}/messages/${m.seq}/bank`, { method: 'POST' })
+        .then((message) => onMessageUpdated({ message }))
+        .catch(() => {
+          note.textContent = 'Không đọc được thẻ này';
+        });
+    }
+    return card;
+  }
+  const known = bankByBin(b.bin);
+  const head = el('div', 'bank-head');
+  if (known && known.logo) {
+    const logo = new Image();
+    logo.className = 'bank-logo';
+    logo.alt = '';
+    logo.addEventListener('error', () => logo.remove());
+    logo.src = mediaSrc(known.logo);
+    head.append(logo);
+  }
+  head.append(el('div', 'bank-name', b.bank || (known && known.short_name) || b.bin));
+  card.append(head, el('div', 'bank-number', b.number));
+  if (b.holder) card.append(el('div', 'bank-holder', b.holder));
+  const qr = new Image();
+  qr.className = 'bank-qr';
+  qr.alt = 'Mã VietQR chuyển khoản';
+  qr.loading = 'lazy';
+  qr.src = vietqrUrl(b.bin, b.number);
+  const open = () => openStk({ bin: b.bin, number: b.number, holder: b.holder });
+  qr.addEventListener('click', open);
+  card.append(qr, cardActions([['Sao chép STK', () => copyText(b.number)], ['Chuyển khoản', open]]));
+  return card;
+}
+
 /** Renderer and bubble style per media kind. */
 const MEDIA = {
   image: [imageNode, 'media'],
@@ -1101,6 +1313,7 @@ const MEDIA = {
   file: [fileNode, 'card'],
   link: [linkNode, 'card'],
   contact: [contactNode, 'card'],
+  bank: [bankNode, 'card'],
 };
 
 // ----------------------------------------------------------- picture viewer
@@ -1326,7 +1539,7 @@ function messageNode(m, prev, t) {
   if (recalled) {
     bubble.appendChild(document.createTextNode(m.text));
   } else if (media) {
-    bubble.appendChild(media[0](md));
+    bubble.appendChild(media[0](md, m));
     if ((md.kind === 'image' || md.kind === 'video') && md.description) {
       const caption = el('div', 'caption');
       appendText(caption, md.description);
@@ -1337,7 +1550,9 @@ function messageNode(m, prev, t) {
   } else if (m.mentions && m.mentions.length) {
     appendMentioned(bubble, m.text || '', m.mentions);
   } else {
-    appendText(bubble, text || '');
+    const accounts = findAccounts(text || '');
+    if (accounts.length) appendWithAccounts(bubble, text, accounts);
+    else appendText(bubble, text || '');
   }
   if (!recalled && m.reactions && m.reactions.length) bubble.appendChild(reactionSummary(m));
   bubble.appendChild(el('span', 'time', fmtClock(m.sent_at)));
@@ -1488,6 +1703,8 @@ document.addEventListener('keydown', (e) => {
   if (!$('rename').hidden) closeRename();
   else if (!$('forward').hidden) closeForward();
   else if (!$('card-pick').hidden) closeCardPick();
+  else if (!$('stk').hidden) closeStk();
+  else if (!$('bank-modal').hidden) closeBankModal();
   else if (!$('new-group').hidden) closeNewGroup();
   else if (!$('add-friend').hidden) closeAddFriend();
   else if (picker) closePicker();
@@ -1654,6 +1871,187 @@ $('forward-cancel').addEventListener('click', closeForward);
 $('forward-send').addEventListener('click', sendForward);
 $('forward').addEventListener('click', (e) => {
   if (e.target === $('forward')) closeForward();
+});
+
+// ------------------------------------------------------- VietQR and STK sending
+
+const stk = { acc: null, timer: 0 };
+
+/** Show an account's VietQR code, with an amount and a note to add. */
+function openStk(acc) {
+  stk.acc = acc;
+  $('stk-number').textContent = acc.number;
+  $('stk-holder').textContent = acc.holder || '';
+  $('stk-amount').value = '';
+  $('stk-note').value = '';
+  fillBankSelect($('stk-bank'), acc.bin, 'Chọn ngân hàng…');
+  $('stk').hidden = false;
+  renderStkQr();
+  if (!bankInfo.list) {
+    loadBanks().then(() => {
+      if (!$('stk').hidden) {
+        fillBankSelect($('stk-bank'), stk.acc.bin, 'Chọn ngân hàng…');
+        renderStkQr();
+      }
+    });
+  }
+  $('stk-close').focus();
+}
+
+function closeStk() {
+  $('stk').hidden = true;
+}
+
+function renderStkQr() {
+  const bin = $('stk-bank').value;
+  const amount = Number(($('stk-amount').value || '').replace(/\D/g, '')) || 0;
+  const note = $('stk-note').value.trim();
+  const img = $('stk-qr');
+  img.hidden = !bin;
+  $('stk-pick').hidden = Boolean(bin);
+  $('stk-save').hidden = !bin;
+  if (!bin || !stk.acc) return;
+  const url = vietqrUrl(bin, stk.acc.number, amount, note);
+  img.src = url;
+  $('stk-save').href = url;
+}
+
+function soonStkQr() {
+  clearTimeout(stk.timer);
+  stk.timer = setTimeout(renderStkQr, 350);
+}
+
+$('stk-bank').addEventListener('change', renderStkQr);
+$('stk-amount').addEventListener('input', soonStkQr);
+$('stk-note').addEventListener('input', soonStkQr);
+$('stk-copy').addEventListener('click', () => stk.acc && copyText(stk.acc.number));
+$('stk-close').addEventListener('click', closeStk);
+$('stk').addEventListener('click', (e) => {
+  if (e.target === $('stk')) closeStk();
+});
+
+const bankModal = { accounts: null };
+
+/** The account's saved bank accounts: send one, add, delete. */
+async function openBankModal() {
+  if (!state.current) return;
+  $('bank-modal').hidden = false;
+  bankModal.accounts = null;
+  renderBankAccounts();
+  fillBankSelect($('bank-bin'), '', 'Chọn ngân hàng…');
+  loadBanks().then(() => {
+    fillBankSelect($('bank-bin'), '', 'Chọn ngân hàng…');
+    renderBankAccounts();
+  });
+  try {
+    bankModal.accounts = await api('/bank-accounts');
+  } catch (err) {
+    bankModal.accounts = [];
+    handleError(err, 'Không tải được tài khoản ngân hàng: ');
+  }
+  renderBankAccounts();
+}
+
+function closeBankModal() {
+  $('bank-modal').hidden = true;
+}
+
+function renderBankAccounts() {
+  const ul = $('bank-list');
+  ul.replaceChildren();
+  const list = bankModal.accounts;
+  if (!list) {
+    ul.append(el('li', 'list-empty', 'Đang tải…'));
+    return;
+  }
+  if (!list.length) {
+    ul.append(el('li', 'list-empty', 'Chưa lưu tài khoản nào. Thêm tài khoản ở dưới.'));
+    return;
+  }
+  for (const a of list) {
+    const known = bankByBin(a.bin);
+    const li = el('li', 'bank-item');
+    if (known && known.logo) {
+      const logo = new Image();
+      logo.className = 'bank-logo';
+      logo.alt = '';
+      logo.addEventListener('error', () => logo.remove());
+      logo.src = mediaSrc(known.logo);
+      li.append(logo);
+    }
+    const body = el('div', 'body');
+    body.append(
+      el('div', 'bank-name', (known && known.short_name) || a.bin),
+      el('div', 'bank-number', a.number),
+      el('div', 'bank-holder', a.holder || ''),
+    );
+    const send = el('button', 'btn', 'Gửi');
+    send.type = 'button';
+    send.addEventListener('click', () => sendBankCard(a, send));
+    const remove = el('button', 'btn secondary', 'Xóa');
+    remove.type = 'button';
+    remove.title = 'Xóa khỏi tài khoản Zalo (cả trên điện thoại)';
+    remove.addEventListener('click', () => removeBankAccount(a));
+    li.append(body, send, remove);
+    ul.append(li);
+  }
+}
+
+async function sendBankCard(a, button) {
+  const id = state.current;
+  if (!id) return;
+  button.disabled = true;
+  try {
+    const message = await api(`/threads/${encodeURIComponent(id)}/bank-card`, {
+      json: { bin: a.bin, number: a.number, holder: a.holder || '' },
+    });
+    closeBankModal();
+    onMessage({ message, thread: null });
+  } catch (err) {
+    button.disabled = false;
+    handleError(err, 'Không gửi được số tài khoản: ');
+  }
+}
+
+async function removeBankAccount(a) {
+  const name = (bankByBin(a.bin) || {}).short_name || a.bin;
+  if (!window.confirm(`Xóa tài khoản ${name} ${a.number} khỏi Zalo? Điện thoại cũng không còn thấy tài khoản này.`)) return;
+  try {
+    bankModal.accounts = await api(`/bank-accounts/${a.id}`, { method: 'DELETE' });
+    renderBankAccounts();
+  } catch (err) {
+    handleError(err, 'Không xóa được: ');
+  }
+}
+
+$('bank-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    bin: $('bank-bin').value,
+    number: $('bank-number').value.trim(),
+    holder: $('bank-holder').value.trim(),
+  };
+  if (!body.bin) {
+    toast('Hãy chọn ngân hàng');
+    return;
+  }
+  $('bank-save').disabled = true;
+  try {
+    bankModal.accounts = await api('/bank-accounts', { json: body });
+    $('bank-number').value = '';
+    $('bank-holder').value = '';
+    renderBankAccounts();
+    toast('Đã lưu tài khoản vào Zalo');
+  } catch (err) {
+    handleError(err, 'Không lưu được: ');
+  } finally {
+    $('bank-save').disabled = false;
+  }
+});
+$('bank-btn').addEventListener('click', openBankModal);
+$('bank-close').addEventListener('click', closeBankModal);
+$('bank-modal').addEventListener('click', (e) => {
+  if (e.target === $('bank-modal')) closeBankModal();
 });
 
 // ------------------------------------------------------------ contact cards
@@ -3729,6 +4127,7 @@ async function start() {
   state.statusLimits = st.limits || null;
   renderStatus(st.zalo);
   await loadThreads();
+  loadBanks();
   loadFriends();
   loadRequests();
   openStream();

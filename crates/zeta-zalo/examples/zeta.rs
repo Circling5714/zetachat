@@ -38,7 +38,7 @@ Cách dùng:
   zeta limits  <session.json>                    giới hạn gửi tệp do máy chủ cấp (getServerInfo)
   zeta send    <session.json> user|group <id> <nội dung> [--styles JSON] [--urgency 0|1|2]
   zeta card    <session.json> user|group <id> <uid | me> [số điện thoại]   gửi danh thiếp
-  zeta bank    <session.json> banks | accounts | send user|group <id> <bin> <số TK> <tên>
+  zeta bank    <session.json> banks | accounts | add <bin> <số TK> <tên> | remove <bin> <số TK> | send user|group <id> <bin> <số TK> <tên>
   zeta quick   <session.json> list | add <từ khóa> <nội dung> | remove <id>   tin nhắn nhanh
   zeta board   <session.json> list <group id> | reminders user|group <id> | remind user|group <id> <tiêu đề> <phút nữa> | unremind user|group <id> <reminder id> | poll <poll id>
       (id \"cloud\" với user là \"Cloud của tôi\")
@@ -583,6 +583,34 @@ async fn bank(args: &[String]) -> Result<()> {
             let accounts = client.bank_accounts().await?;
             let defaults = accounts.iter().filter(|a| a.default).count();
             println!("{} tài khoản đã lưu ({defaults} mặc định)", accounts.len());
+            for a in &accounts {
+                println!("  id {} ngân hàng {}", a.id, a.bin);
+            }
+        }
+        "add" => {
+            let (Some(bin), Some(number), Some(holder)) = (args.get(2), args.get(3), args.get(4))
+            else {
+                bail!("cần: bank <session.json> add <bin> <số TK> <tên chủ TK>");
+            };
+            match client.add_bank_account(bin, number, holder).await {
+                Ok(()) => println!("ADDED"),
+                Err(e) => println!("LỖI {e}"),
+            }
+        }
+        "remove" => {
+            // Only the account with exactly this bank and number.
+            let (Some(bin), Some(number)) = (args.get(2), args.get(3)) else {
+                bail!("cần: bank <session.json> remove <bin> <số TK>");
+            };
+            let accounts = client.bank_accounts().await?;
+            let account = accounts
+                .iter()
+                .find(|a| &a.bin == bin && &a.number == number)
+                .context("không có tài khoản nào với ngân hàng và số này")?;
+            match client.remove_bank_account(account).await {
+                Ok(()) => println!("REMOVED {bin} {number}"),
+                Err(e) => println!("LỖI {e}"),
+            }
         }
         "send" => {
             let (Some(kind), Some(id), Some(bin), Some(number)) =

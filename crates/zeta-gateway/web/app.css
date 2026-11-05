@@ -578,6 +578,40 @@ a.btn { display: inline-block; text-decoration: none; }
 .sticker-cell .sticker-moving { width: 100%; height: 100%; }
 .file-card, .link-card { color: inherit; text-decoration: none !important; white-space: normal; }
 .contact-card { width: 260px; max-width: 100%; white-space: normal; }
+.bank-card { width: 260px; max-width: 100%; white-space: normal; padding: 4px 6px 0; }
+.bank-head { display: flex; align-items: center; gap: 8px; }
+.bank-logo { width: 30px; height: 30px; flex: none; object-fit: contain; border-radius: 6px; background: #fff; }
+.bank-name { font-weight: 700; }
+.bank-number { margin-top: 6px; font-size: 18px; font-weight: 700; letter-spacing: 0.04em; font-variant-numeric: tabular-nums; }
+.bank-holder { font-size: 13px; color: var(--muted); }
+.msg.out .bank-holder { color: inherit; opacity: 0.75; }
+.bank-qr { display: block; width: 128px; height: 128px; margin: 8px auto; padding: 4px; border-radius: 8px; background: #fff; cursor: zoom-in; }
+.stk-chip {
+  border: 0;
+  padding: 0 2px;
+  border-radius: 4px;
+  background: rgb(37 99 235 / 0.12);
+  color: inherit;
+  font: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.stk-chip:hover { background: rgb(37 99 235 / 0.22); }
+.stk-card { width: min(400px, 100%); display: grid; gap: 10px; }
+.stk-card h2 { margin: 0; text-align: center; }
+.stk-card p { margin: 0; }
+.stk-number { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 20px; font-weight: 700; letter-spacing: 0.04em; overflow-wrap: anywhere; }
+.stk-extra { gap: 8px; }
+.stk-extra .field { flex: 1; min-width: 0; }
+.bank-note { margin: 0; text-align: center; }
+.bank-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; overflow-y: auto; min-height: 48px; }
+.bank-item { display: flex; align-items: center; gap: 10px; padding: 8px; border: 1px solid var(--border); border-radius: 10px; }
+.bank-item .body { flex: 1; min-width: 0; }
+.bank-item .bank-number { margin: 0; font-size: 15px; }
+.bank-item .btn { padding: 6px 10px; }
+.bank-form { display: grid; gap: 8px; border-top: 1px solid var(--border); padding-top: 10px; }
+.bank-form h3 { margin: 0; font-size: 14px; }
 .contact-head { display: flex; align-items: center; gap: 10px; padding: 6px 6px 8px; }
 .contact-head .avatar { width: 48px; height: 48px; font-size: 16px; flex: none; }
 .contact-who { min-width: 0; }

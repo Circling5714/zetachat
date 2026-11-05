@@ -44,6 +44,22 @@ pub struct Media {
     /// sender added one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uid: String,
+    /// A bank account card (`bank`), once read: `url` is then its template
+    /// on Zalo's CDN, read on demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bank: Option<BankCard>,
+}
+
+/// What a bank account card shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BankCard {
+    /// NAPAS code of the bank, for VietQR.
+    pub bin: String,
+    pub number: String,
+    /// Capitals without accents, as banks write it; may be empty.
+    pub holder: String,
+    /// The bank's short name: "Vietcombank", "MB"…
+    pub bank: String,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -284,18 +300,26 @@ pub fn summarize(msg_type: &str, content: Option<&Value>) -> String {
                 .unwrap_or_default();
             with_caption("[Liên kết]", caption)
         }
-        // Rich cards: the client shows the fallback sentence Zalo provides.
+        // Rich cards: the client shows the fallback sentence Zalo provides,
+        // in Vietnamese when it gives several (`{ en, vi }`, seen live).
         "chat.webcontent" => {
             let p = params(content);
-            let msg = p
-                .pointer("/customMsg/msg")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if msg.is_empty() {
-                "[Nội dung đặc biệt]".into()
+            let msg = match p.pointer("/customMsg/msg") {
+                Some(Value::String(s)) => s.trim().to_string(),
+                Some(Value::Object(by_lang)) => ["vi", "en"]
+                    .into_iter()
+                    .find_map(|l| by_lang.get(l).and_then(Value::as_str))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                _ => String::new(),
+            };
+            if !msg.is_empty() {
+                msg
+            } else if bank_card(content) {
+                "[Tài khoản ngân hàng]".into()
             } else {
-                msg.to_string()
+                "[Nội dung đặc biệt]".into()
             }
         }
         other => {
@@ -368,6 +392,32 @@ fn contact_media(content: Option<&Value>) -> Option<Media> {
     })
 }
 
+/// A `chat.webcontent` that is a bank account card (`zinstant.bankcard`).
+fn bank_card(content: Option<&Value>) -> bool {
+    get_str(content, "action") == "zinstant.bankcard"
+}
+
+/// A bank account card: what it shows is in its template
+/// (`params.pcItem.data_url`, seen live), read when someone looks; cards sent
+/// from here keep what they show under `content.bank`.
+fn bank_media(content: Option<&Value>) -> Option<Media> {
+    let p = params(content);
+    let template = ["/pcItem/data_url", "/item/data_url"]
+        .into_iter()
+        .find_map(|at| p.pointer(at).and_then(Value::as_str))
+        .unwrap_or("");
+    let known = content
+        .and_then(|c| c.get("bank"))
+        .and_then(|b| serde_json::from_value::<BankCard>(b.clone()).ok());
+    let media = Media {
+        kind: "bank".into(),
+        url: http_url(template),
+        bank: known,
+        ..Media::default()
+    };
+    (!media.url.is_empty() || media.bank.is_some()).then_some(media)
+}
+
 /// Media carried by a message, if any.
 pub fn extract(msg_type: &str, content: Option<&Value>) -> Option<Media> {
     if !matches!(content, Some(Value::Object(_))) {
@@ -375,6 +425,9 @@ pub fn extract(msg_type: &str, content: Option<&Value>) -> Option<Media> {
     }
     if msg_type == "chat.recommended" && contact_card(content) {
         return contact_media(content);
+    }
+    if msg_type == "chat.webcontent" && bank_card(content) {
+        return bank_media(content);
     }
     let p = params(content);
     let href = http_url(get_str(content, "href"));
@@ -672,6 +725,39 @@ mod tests {
         );
         let broken = json!({ "action": "recommened.user", "params": "abc" });
         assert!(extract("chat.recommended", Some(&broken)).is_none());
+    }
+
+    #[test]
+    fn bank_cards() {
+        // As seen live, cut down.
+        let params = json!({
+            "item": { "data_url": "https://zinst-stc.zadn.vn/m/1.bin", "data_type": 2 },
+            "pcItem": { "data_url": "https://zinst-stc.zadn.vn/p/1.html", "data_type": 4 },
+            "customMsg": { "msg": { "en": "[Bank account]", "vi": "[Tài khoản ngân hàng]" } }
+        });
+        let card =
+            json!({ "action": "zinstant.bankcard", "params": params.to_string(), "title": "" });
+        let m = extract("chat.webcontent", Some(&card)).unwrap();
+        assert_eq!(
+            (m.kind.as_str(), m.url.as_str()),
+            ("bank", "https://zinst-stc.zadn.vn/p/1.html")
+        );
+        assert!(m.bank.is_none());
+        assert_eq!(
+            summarize("chat.webcontent", Some(&card)),
+            "[Tài khoản ngân hàng]"
+        );
+        // Sent from here: what it shows is kept with it.
+        let sent = json!({ "action": "zinstant.bankcard", "bank": {
+            "bin": "970436", "number": "0123456789", "holder": "NGUYEN VAN A", "bank": "Vietcombank"
+        } });
+        let m = extract("chat.webcontent", Some(&sent)).unwrap();
+        assert_eq!(m.bank.unwrap().number, "0123456789");
+        // Other rich cards keep Zalo's sentence and carry no media.
+        let other =
+            json!({ "action": "zinstant.x", "params": "{\"customMsg\":{\"msg\":\"[Vị trí]\"}}" });
+        assert_eq!(summarize("chat.webcontent", Some(&other)), "[Vị trí]");
+        assert!(extract("chat.webcontent", Some(&other)).is_none());
     }
 
     #[test]

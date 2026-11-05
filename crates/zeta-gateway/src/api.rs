@@ -140,6 +140,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stickers/motion", get(sticker_motion))
         .route("/api/v1/threads/{id}/stickers", post(send_sticker))
         .route("/api/v1/threads/{id}/contact-card", post(send_contact_card))
+        .route("/api/v1/threads/{id}/bank-card", post(send_bank_card))
+        .route(
+            "/api/v1/threads/{id}/messages/{seq}/bank",
+            post(read_bank_card),
+        )
+        .route("/api/v1/banks", get(list_banks))
+        .route(
+            "/api/v1/bank-accounts",
+            get(bank_accounts).post(add_bank_account),
+        )
+        .route(
+            "/api/v1/bank-accounts/{account}",
+            delete(remove_bank_account),
+        )
+        .route("/api/v1/vietqr.svg", get(vietqr_svg))
         .route("/api/v1/threads/{id}/members", get(group_members))
         .route("/api/v1/threads/{id}/presence", get(presence))
         .route("/api/v1/users/find", get(find_user))
@@ -783,6 +798,126 @@ async fn send_contact_card(
         uid: uid.to_string(),
     };
     Ok(Json(ask_cards(&st, action).await?))
+}
+
+#[derive(Deserialize)]
+struct BankBody {
+    bin: String,
+    number: String,
+    #[serde(default)]
+    holder: String,
+}
+
+/// A bank code (6 digits) and an account number (6 to 19 digits, spaces,
+/// dots and dashes between groups allowed) from a client.
+fn checked_bank(body: &BankBody) -> Result<(String, String), ApiError> {
+    let bin = body.bin.trim();
+    if bin.len() != 6 || !bin.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiError::bad_request("bin is a 6-digit bank code"));
+    }
+    let number = zeta_zalo::card::account_number(body.number.trim())
+        .ok_or_else(|| ApiError::bad_request("số tài khoản phải có 6 đến 19 chữ số"))?;
+    Ok((bin.to_string(), number))
+}
+
+/// Send a bank account as a card; answers the stored message.
+async fn send_bank_card(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(id): Path<String>,
+    Json(body): Json<BankBody>,
+) -> ApiResult<Value> {
+    let (kind, remote_id) = split_thread_id(&id).ok_or_else(|| ApiError::not_found("thread"))?;
+    let (bin, number) = checked_bank(&body)?;
+    let action = CardAction::SendBank {
+        kind,
+        remote_id: remote_id.to_string(),
+        bin,
+        number,
+        holder: body.holder.trim().to_string(),
+    };
+    Ok(Json(ask_cards(&st, action).await?))
+}
+
+/// What a bank card in a thread shows (read from Zalo the first time).
+async fn read_bank_card(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path((id, seq)): Path<(String, i64)>,
+) -> ApiResult<Value> {
+    let message = message_in(&st, &id, seq)?;
+    if message.media.as_ref().map(|m| m.kind.as_str()) != Some("bank") {
+        return Err(ApiError::bad_request("not a bank card"));
+    }
+    Ok(Json(ask_cards(&st, CardAction::ReadBank { seq }).await?))
+}
+
+async fn list_banks(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Value> {
+    Ok(Json(ask_cards(&st, CardAction::Banks).await?))
+}
+
+async fn bank_accounts(State(st): State<AppState>, _: AuthDevice) -> ApiResult<Value> {
+    Ok(Json(ask_cards(&st, CardAction::Accounts).await?))
+}
+
+async fn add_bank_account(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Json(body): Json<BankBody>,
+) -> ApiResult<Value> {
+    let (bin, number) = checked_bank(&body)?;
+    if zeta_zalo::card::holder_name(&body.holder).is_none() {
+        return Err(ApiError::bad_request("tên chủ tài khoản cần ít nhất 5 chữ"));
+    }
+    let action = CardAction::AddAccount {
+        bin,
+        number,
+        holder: body.holder.trim().to_string(),
+    };
+    Ok(Json(ask_cards(&st, action).await?))
+}
+
+async fn remove_bank_account(
+    State(st): State<AppState>,
+    _: AuthDevice,
+    Path(account): Path<u64>,
+) -> ApiResult<Value> {
+    Ok(Json(
+        ask_cards(&st, CardAction::RemoveAccount { id: account }).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct VietQrQuery {
+    bin: String,
+    number: String,
+    #[serde(default)]
+    amount: u64,
+    #[serde(default)]
+    note: String,
+}
+
+/// A VietQR code that transfers to an account (SVG), for any banking app to
+/// scan; made here, nothing is asked of Zalo.
+async fn vietqr_svg(_: AuthDevice, Query(q): Query<VietQrQuery>) -> Result<Response, ApiError> {
+    let number = zeta_zalo::card::account_number(q.number.trim())
+        .ok_or_else(|| ApiError::bad_request("số tài khoản phải có 6 đến 19 chữ số"))?;
+    let payload = zeta_zalo::vietqr::payload(q.bin.trim(), &number, q.amount, &q.note)
+        .ok_or_else(|| ApiError::bad_request("mã ngân hàng không hợp lệ"))?;
+    let code = qrcode::QrCode::new(payload.as_bytes()).map_err(ApiError::internal)?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(240, 240)
+        .quiet_zone(true)
+        .build();
+    Ok((
+        [
+            (CONTENT_TYPE, "image/svg+xml"),
+            (CACHE_CONTROL, "private, max-age=86400"),
+        ],
+        svg,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]

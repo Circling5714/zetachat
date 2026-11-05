@@ -613,6 +613,29 @@ fn seed(store: &Store) {
         "Minh Tuấn",
         vec![
             say(false, "Minh Tuấn", "Em gửi anh báo cáo tháng rồi nhé", 1500),
+            say(
+                false,
+                "Minh Tuấn",
+                "Anh chuyển tiền in giúp em vào STK 1903 5678 9012 Techcombank nhé",
+                1490,
+            ),
+            share(
+                false,
+                "Minh Tuấn",
+                "chat.webcontent",
+                "[Tài khoản ngân hàng]",
+                1489,
+                Media {
+                    kind: "bank".into(),
+                    bank: Some(crate::model::BankCard {
+                        bin: "970422".into(),
+                        number: "0901234567".into(),
+                        holder: "TRAN MINH TUAN".into(),
+                        bank: "MB".into(),
+                    }),
+                    ..Media::default()
+                },
+            ),
             share(
                 false,
                 "Minh Tuấn",
@@ -746,9 +769,105 @@ fn store_and_publish(
     Some(message)
 }
 
-/// Cards in the demo: a contact's card is "sent" at once.
+/// Banks of the demo: a few real ones (public codes and names).
+fn demo_banks() -> Vec<zeta_zalo::card::Bank> {
+    [
+        ("970436", "Vietcombank", "vietcombank|ngoai thuong|vcb"),
+        ("970422", "MB", "mb|mbbank|quan doi"),
+        ("970407", "Techcombank", "techcombank|ky thuong|tcb"),
+        ("970418", "BIDV", "bidv|dau tu|phat trien"),
+        ("970415", "VietinBank", "vietinbank|cong thuong|ctg|vtb"),
+        ("970405", "Agribank", "agribank|nong nghiep"),
+        ("970416", "ACB", "acb|a chau"),
+        ("970423", "TPBank", "tpbank|tien phong|tpb"),
+    ]
+    .into_iter()
+    .map(|(bin, short, keywords)| zeta_zalo::card::Bank {
+        bin: bin.into(),
+        name: format!("Ngân hàng {short}"),
+        short_name: short.into(),
+        logo: String::new(),
+        keywords: keywords.into(),
+    })
+    .collect()
+}
+
+/// The demo's saved bank accounts, changed by adding and removing.
+static DEMO_ACCOUNTS: std::sync::Mutex<Option<Vec<zeta_zalo::card::BankAccount>>> =
+    std::sync::Mutex::new(None);
+
+fn with_accounts<T>(f: impl FnOnce(&mut Vec<zeta_zalo::card::BankAccount>) -> T) -> T {
+    let mut guard = DEMO_ACCOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let list = guard.get_or_insert_with(|| {
+        vec![zeta_zalo::card::BankAccount {
+            id: 1,
+            bin: "970436".into(),
+            number: "1023456789".into(),
+            holder: "NGUYEN VAN DEMO".into(),
+            default: true,
+        }]
+    });
+    f(list)
+}
+
+/// Cards in the demo: sent at once, accounts kept in memory.
 fn demo_cards(store: &Store, bus: &EventBus, action: CardAction) -> Result<Value, String> {
     match action {
+        CardAction::Banks => Ok(json!(demo_banks())),
+        CardAction::Accounts => Ok(with_accounts(|list| json!(list))),
+        CardAction::AddAccount {
+            bin,
+            number,
+            holder,
+        } => Ok(with_accounts(|list| {
+            let id = list.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+            list.push(zeta_zalo::card::BankAccount {
+                id,
+                bin,
+                number,
+                holder: zeta_zalo::card::holder_name(&holder).unwrap_or_default(),
+                default: list.is_empty(),
+            });
+            json!(list)
+        })),
+        CardAction::RemoveAccount { id } => Ok(with_accounts(|list| {
+            list.retain(|a| a.id != id);
+            json!(list)
+        })),
+        CardAction::SendBank {
+            kind,
+            remote_id,
+            bin,
+            number,
+            holder,
+        } => {
+            let bank = demo_banks()
+                .into_iter()
+                .find(|b| b.bin == bin)
+                .map_or_else(|| bin.clone(), |b| b.short_name);
+            let card = crate::model::BankCard {
+                bin,
+                number,
+                holder: zeta_zalo::card::holder_name(&holder).unwrap_or_default(),
+                bank,
+            };
+            let (media, raw) = crate::zalo::bank_card(card);
+            let content = Content {
+                kind: "chat.webcontent",
+                text: "[Tài khoản ngân hàng]",
+                media: Some(media),
+                quote: None,
+                raw: raw.to_string(),
+            };
+            store_and_publish(store, bus, kind, &remote_id, true, "", content)
+                .map(|m| json!(m))
+                .ok_or_else(|| "demo: không lưu được tin".to_string())
+        }
+        CardAction::ReadBank { seq } => store
+            .message(seq)
+            .map_err(|e| e.to_string())?
+            .map(|m| json!(m))
+            .ok_or_else(|| "demo: không có tin này".to_string()),
         CardAction::SendContact {
             kind,
             remote_id,

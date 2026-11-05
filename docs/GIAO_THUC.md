@@ -183,6 +183,24 @@ Gửi, như zca-js `sendCard`: hỏi `POST {friend}/api/friend/mget-qr` với `{
 
 Nhận (đã thấy thật, gửi danh thiếp của chính tài khoản vào Cloud): `msgType` `chat.recommended`. `content` là `{ action: "recommened.user" (Zalo viết sai như vậy), title: <tên>, thumb: <ảnh đại diện>, params: <uid>, href: "www.zaloapp.com", description: <chuỗi JSON { qrCodeUrl, gUid, phone? }> }`. Liên kết chia sẻ cũng là `chat.recommended`, nhưng `action` khác. Bản cũ hiện danh thiếp thành "[Liên kết]"; schema v10 đọc lại chúng.
 
+## 8p. Tài khoản ngân hàng (đã kiểm chứng)
+
+Dịch vụ `zimsg` (`zimsg.chat.zalo.me`), như zca-js:
+
+- Danh sách ngân hàng: `GET /api/transfer/conf` với `{}` trả về `{ banks: [{ bin, logo, name, name_eng, short_name, search_key_word }] }`. Thử thật: 66 ngân hàng, đều có logo; `search_key_word` là các tên gọi khác, nối bằng `|` (ví dụ `abbank|an binh`).
+- Tài khoản đã lưu: `GET /api/transfer/list` với `{ page, limit }` trả về `{ hasMore, total, myBanks: [{ id, account_id, bin, bank_number, holder_name, is_default, … }] }`. Lưu: `POST /api/transfer/create` với `{ bin, bank_number, holder_name, language }`. Xóa: `POST /api/transfer/delete` với `{ account_id, is_default, language }`. Đã thử thật với một số giả (mười số 0): lưu được, danh sách hiện nó là mặc định, xóa xong danh sách trống lại. Tên chủ tài khoản phải viết hoa không dấu, ít nhất 5 chữ (như `normalizeHolderName` của zca-js). Mỗi lần thêm hay xóa, Zalo đẩy một khung điều khiển 601 mang tài khoản đó.
+- Gửi thẻ: `POST /api/transfer/card` với `{ binBank, numAccBank, nameAccBank, cliMsgId, tsMsg, destUid, destType }` (`destType` 1 cho nhóm). Zalo trả lời rỗng và tự tạo tin, với `cliMsgId` riêng của nó (thấy thật: lệch 18 ms so với mã zeta gửi). Vì vậy gateway khớp tin vọng về theo thời gian, không theo mã.
+
+Nhận (đã thấy thật): `msgType` `chat.webcontent`, `content.action` `zinstant.bankcard`. `params` chứa `customMsg.msg` là `{ en: "[Bank account]", vi: "[Tài khoản ngân hàng]" }`, cùng hai mẫu hiển thị trên `zinst-stc.zadn.vn`: `item` (nhị phân, cho điện thoại) và `pcItem` (HTML, cho Zalo PC). Mẫu HTML có:
+
+- `<p id="bank_bin">970436</p>`;
+- tên ngân hàng, số tài khoản (`number_text`), chủ tài khoản (`pc_element`);
+- các liên kết `https://bankcard-action.zalo.me?action=transfer|save&content=<chuỗi VietQR>`.
+
+Gateway đọc mẫu này khi có client xem thẻ lần đầu. Mã ngân hàng và số tài khoản lấy từ chuỗi VietQR (có kiểm tra CRC), còn chủ tài khoản lấy từ đoạn văn bản.
+
+VietQR là chuẩn EMVCo: `00 02 01`, `01 02 11|12`, `38` (`00` `A000000727`, `01` (`00` BIN, `01` số tài khoản), `02` `QRIBFTTA`), `53 03 704`, `54` số tiền, `58 02 VN`, `62` (`08` nội dung), `63 04` CRC-16/CCITT-FALSE. Thẻ của Zalo thêm trường `80` (`com.vng.zalo`, `ZABANKCARD`). Gateway tự tạo mã QR (`/vietqr.svg`) cho thẻ và cho số tài khoản nhận ra trong tin nhắn.
+
 ## 9. Báo đã xem (theo zca-js, chưa kiểm chứng)
 
 `POST {chat}/api/message/seenv2?…&nretry=0` (nhóm: `{group}/api/group/seenv2`) với `params` mã hóa: `msgInfos` là chuỗi JSON `{ "data": [ … ], "grid": <id nhóm, chỉ với nhóm> }`, kèm `senderId` (người gửi, với hội thoại 1-1) hoặc `imei` (với nhóm). Mỗi phần tử của `data` lấy từ tin nhắn gốc: `cmi` (`cliMsgId`), `gmi` (`msgId`), `si` (`uidFrom`), `di` (`idTo`, hoặc `"0"` khi là chính mình), `mt` (`msgType`), `st`, `at`, `cmd`, `ts`. Tối đa 50 tin mỗi lần.

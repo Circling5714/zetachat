@@ -20,7 +20,12 @@
 //!   `{ account_id, is_default, language }`.
 //! - Sending an account: `POST {zimsg}/api/transfer/card` with `{ binBank,
 //!   numAccBank, nameAccBank, cliMsgId, tsMsg, destUid, destType }` (`destType`
-//!   0 for a person, 1 for a group).
+//!   0 for a person, 1 for a group). Seen live: the card arrives as a
+//!   `chat.webcontent` message whose `content.action` is `zinstant.bankcard`;
+//!   what it shows is in a template on Zalo's CDN (`params.pcItem.data_url`,
+//!   HTML for the PC client), read by [`template_card`].
+
+use std::io::Read;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -134,6 +139,96 @@ fn number_or(v: &Value, keys: &[&str]) -> u64 {
         .map(|k| number(v, k))
         .find(|n| *n != 0)
         .unwrap_or(0)
+}
+
+/// What a bank card's template shows (`pcItem`, HTML).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateCard {
+    pub bin: String,
+    pub number: String,
+    pub holder: String,
+    /// As the card writes it: "Ngân hàng Vietcombank".
+    pub bank_name: String,
+}
+
+/// `&amp;` and friends, the few a template uses.
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// `<p …>text</p>` elements of an HTML text: (attributes, text).
+fn paragraphs(html: &str) -> Vec<(&str, String)> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(at) = rest.find("<p") {
+        rest = &rest[at + 2..];
+        if !rest.starts_with([' ', '>']) {
+            continue;
+        }
+        let Some(close) = rest.find('>') else { break };
+        let attrs = &rest[..close];
+        rest = &rest[close + 1..];
+        let Some(end) = rest.find("</p>") else { break };
+        let text = &rest[..end];
+        if !text.contains('<') {
+            out.push((attrs, unescape(text.trim())));
+        }
+        rest = &rest[end + 4..];
+    }
+    out
+}
+
+/// What a received bank card shows, from its template (seen live, November
+/// 2026): the VietQR payload in its `bankcard-action.zalo.me?…&content=`
+/// links gives the bank and the account; paragraphs give the holder
+/// (`pc_element`), the bank's name and, failing the payload, the BIN
+/// (`id="bank_bin"`) and the number (`number_text`).
+pub fn template_card(html: &str) -> Option<TemplateCard> {
+    let mut card = TemplateCard::default();
+    if let Some(at) = html.find("bankcard-action.zalo.me") {
+        let tail = &html[at..];
+        if let Some(c) = tail.find("content=") {
+            let payload: String = tail[c + 8..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '.')
+                .collect();
+            if let Some((bin, number)) = crate::vietqr::parse(&payload) {
+                card.bin = bin;
+                card.number = number;
+            }
+        }
+    }
+    for (attrs, text) in paragraphs(html) {
+        let class = attrs
+            .split("class=\"")
+            .nth(1)
+            .and_then(|c| c.split('"').next())
+            .unwrap_or("");
+        if attrs.contains("id=\"bank_bin\"") {
+            if card.bin.is_empty() {
+                card.bin = text;
+            }
+        } else if class.contains("number_text") {
+            if card.number.is_empty() {
+                card.number = text.chars().filter(|c| !c.is_whitespace()).collect();
+            }
+        } else if class.contains("pc_element") {
+            if card.holder.is_empty() {
+                card.holder = text;
+            }
+        } else if class.contains("normal_text")
+            && !class.contains("mobile_element")
+            && card.bank_name.is_empty()
+        {
+            card.bank_name = text;
+        }
+    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(&card.bin) && digits(&card.number)).then_some(card)
 }
 
 /// A holder's name the way banks (and Zalo, as zca-js
@@ -301,6 +396,23 @@ impl ZaloClient {
         }
     }
 
+    /// What a received bank card shows: its template (`url`, on Zalo's CDN)
+    /// read with [`template_card`].
+    pub async fn read_bank_card(&self, url: &str) -> Result<TemplateCard> {
+        let bytes = self.get_bytes(url, 2 * 1024 * 1024).await?;
+        let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+            let mut plain = Vec::new();
+            flate2::read::GzDecoder::new(&bytes[..])
+                .take(4 * 1024 * 1024)
+                .read_to_end(&mut plain)?;
+            plain
+        } else {
+            bytes
+        };
+        template_card(&String::from_utf8_lossy(&bytes))
+            .ok_or_else(|| Error::Protocol("không đọc được thẻ tài khoản ngân hàng".into()))
+    }
+
     /// Send a bank account as a card ("gửi số tài khoản"); Zalo draws the bank,
     /// the number, the holder and a VietQR code. Answers the client id it was
     /// sent with (Zalo answers nothing else).
@@ -409,6 +521,42 @@ mod tests {
                 default: true,
             }]
         );
+    }
+
+    #[test]
+    fn bank_card_templates() {
+        // Cut down from the template of a card sent while testing (a fake
+        // Vietcombank account of ten zeros).
+        let html = concat!(
+            r#"<style>._x_30 { color: #fff; }</style><div id="vw_card">
+            <img class="bank_logo">
+            <p class="normal_text _x_29">Ngân hàng Vietcombank</p>
+            <p class="number_text _x_30">0000000000</p>
+            <p class="normal_text pc_element _x_31"> NGUYEN VAN THU </p>
+            <p class="normal_text mobile_element _x_32"> NGUYEN VAN THU </p>
+            <div class="bank_bin_element"><p id="bank_bin">970436</p></div>
+            <zinstant-attr-theme>[{"_x_15":{"data-click-data":"https://bankcard-action.zalo.me?action=save&amp;content="#,
+            "00020101021138540010A000000727",
+            "01240006970436011000000000000208QRIBFTTA",
+            "53037045802VN80300012com.vng.zalo0110ZABANKCARD6304CA3D",
+            r#"&amp;sid=X"}}]</zinstant-attr-theme>"#
+        );
+        assert_eq!(
+            template_card(html),
+            Some(TemplateCard {
+                bin: "970436".into(),
+                number: "0000000000".into(),
+                holder: "NGUYEN VAN THU".into(),
+                bank_name: "Ngân hàng Vietcombank".into(),
+            })
+        );
+        // Without the payload the paragraphs still tell.
+        let plain = html.replace("bankcard-action", "elsewhere");
+        assert_eq!(
+            template_card(&plain).map(|c| c.number),
+            Some("0000000000".into())
+        );
+        assert_eq!(template_card("<p>nothing</p>"), None);
     }
 
     #[test]

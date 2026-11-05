@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use zeta_zalo::api::{LastOnline, Recipient, SessionHealth, TextExtras};
+use zeta_zalo::card::{account_number, holder_name, Bank};
 use zeta_zalo::message::QuotedMessage;
 use zeta_zalo::socket::{self, RealtimeEvent};
 use zeta_zalo::sticker::Sticker;
@@ -25,8 +26,8 @@ use crate::events::EventBus;
 use crate::media;
 use crate::media_cache::{MediaCache, MAX_FILE_BYTES};
 use crate::model::{
-    now_ms, thread_id, GroupMembers, Media, Member, Mention, Message, NewMessage, NewReaction,
-    Person, Quote, TextStyle, Thread, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
+    now_ms, thread_id, BankCard, GroupMembers, Media, Member, Mention, Message, NewMessage,
+    NewReaction, Person, Quote, TextStyle, Thread, ThreadKind, ThreadUpsert, PEOPLE_FRESH_MS,
 };
 use crate::stickers::{StickerCache, StickerQuery};
 use crate::store::Store;
@@ -244,6 +245,32 @@ pub enum CardAction {
         remote_id: String,
         uid: String,
     },
+    /// Banks Zalo can send accounts of: `[{ bin, name, short_name, logo,
+    /// keywords }]`.
+    Banks,
+    /// Bank accounts the account saved in Zalo: `[{ id, bin, number, holder,
+    /// default }]`.
+    Accounts,
+    /// Save a bank account in Zalo; answers the accounts.
+    AddAccount {
+        bin: String,
+        number: String,
+        holder: String,
+    },
+    /// Delete a saved bank account; answers the accounts.
+    RemoveAccount { id: u64 },
+    /// Send a bank account as a card ("số tài khoản"): answers the stored
+    /// message.
+    SendBank {
+        kind: ThreadKind,
+        remote_id: String,
+        bin: String,
+        number: String,
+        holder: String,
+    },
+    /// What a stored bank card shows, read from its template once and kept:
+    /// answers the message.
+    ReadBank { seq: i64 },
 }
 
 /// What to do on the friends side.
@@ -459,6 +486,7 @@ pub fn spawn(cfg: ZaloConfig, store: Arc<Store>, bus: EventBus) -> ZaloHandle {
         typing_sent: std::collections::HashMap::new(),
         stickers: Arc::default(),
         presence: Arc::default(),
+        banks: Arc::default(),
     };
     tokio::spawn(connector.run(rx));
     handle
@@ -600,6 +628,33 @@ struct Connector {
     typing_sent: std::collections::HashMap<String, std::time::Instant>,
     stickers: Arc<StickerCache>,
     presence: PresenceCache,
+    banks: BankList,
+}
+
+/// The banks Zalo can send accounts of, kept a day: `(when asked, banks)`.
+type BankList = Arc<std::sync::Mutex<Option<(i64, Vec<Bank>)>>>;
+
+/// How long the bank list is kept (ms).
+const BANKS_FRESH_MS: i64 = 24 * 3600 * 1000;
+
+/// The bank list, from Zalo once a day.
+async fn banks(client: &ZaloClient, cache: &BankList) -> Result<Vec<Bank>, String> {
+    let now = now_ms();
+    if let Some((at, list)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if now - at < BANKS_FRESH_MS && !list.is_empty() {
+            return Ok(list.clone());
+        }
+    }
+    let list = client.banks().await.map_err(|e| e.to_string())?;
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, list.clone()));
+    Ok(list)
+}
+
+/// A bank's short name by its code; the code itself when unknown.
+fn bank_name(list: &[Bank], bin: &str) -> String {
+    list.iter()
+        .find(|b| b.bin == bin)
+        .map_or_else(|| bin.to_string(), |b| b.short_name.clone())
 }
 
 async fn next_realtime(
@@ -1308,10 +1363,14 @@ impl Connector {
                     let _ = reply.send(Err("Zalo chưa đăng nhập".into()));
                     return;
                 };
-                let (store, bus) = (self.store.clone(), self.bus.clone());
-                let self_uid = self.self_uid.clone();
+                let ctx = CardContext {
+                    store: self.store.clone(),
+                    bus: self.bus.clone(),
+                    self_uid: self.self_uid.clone(),
+                    banks: self.banks.clone(),
+                };
                 tokio::spawn(async move {
-                    let _ = reply.send(card_action(&client, &store, &bus, &self_uid, action).await);
+                    let _ = reply.send(card_action(&client, &ctx, action).await);
                 });
             }
             ZaloCommand::StartLogin { reply } => {
@@ -2032,14 +2091,172 @@ fn person_name(p: &Person) -> String {
         .to_string()
 }
 
+/// What a card action needs besides the client.
+struct CardContext {
+    store: Arc<Store>,
+    bus: EventBus,
+    self_uid: String,
+    banks: BankList,
+}
+
+/// The media of a bank card sent from here, and the Zalo JSON it is kept with
+/// (what it shows under `content.bank`).
+pub fn bank_card(card: BankCard) -> (Media, Value) {
+    let raw = json!({
+        "msgType": "chat.webcontent",
+        "content": {
+            "action": "zinstant.bankcard",
+            "params": json!({ "customMsg": { "msg": { "vi": "[Tài khoản ngân hàng]" } } }).to_string(),
+            "bank": card,
+        },
+    });
+    let media = Media {
+        kind: "bank".into(),
+        bank: Some(card),
+        ..Media::default()
+    };
+    (media, raw)
+}
+
+async fn accounts_json(client: &ZaloClient) -> Result<Value, String> {
+    let list = client.bank_accounts().await.map_err(|e| e.to_string())?;
+    Ok(json!(list))
+}
+
 async fn card_action(
     client: &ZaloClient,
-    store: &Store,
-    bus: &EventBus,
-    self_uid: &str,
+    ctx: &CardContext,
     action: CardAction,
 ) -> Result<Value, String> {
+    let (store, bus, self_uid) = (&ctx.store, &ctx.bus, ctx.self_uid.as_str());
     match action {
+        CardAction::Banks => Ok(json!(banks(client, &ctx.banks).await?)),
+        CardAction::Accounts => accounts_json(client).await,
+        CardAction::AddAccount {
+            bin,
+            number,
+            holder,
+        } => {
+            client
+                .add_bank_account(&bin, &number, &holder)
+                .await
+                .map_err(|e| e.to_string())?;
+            accounts_json(client).await
+        }
+        CardAction::RemoveAccount { id } => {
+            let list = client.bank_accounts().await.map_err(|e| e.to_string())?;
+            let account = list
+                .iter()
+                .find(|a| a.id == id)
+                .ok_or_else(|| "không có tài khoản này".to_string())?;
+            client
+                .remove_bank_account(account)
+                .await
+                .map_err(|e| e.to_string())?;
+            accounts_json(client).await
+        }
+        CardAction::SendBank {
+            kind,
+            remote_id,
+            bin,
+            number,
+            holder,
+        } => {
+            let number = account_number(&number)
+                .ok_or_else(|| "số tài khoản phải có 6 đến 19 chữ số".to_string())?;
+            // The bank's name is only for showing; a failed list does not stop the send.
+            let list = banks(client, &ctx.banks).await.unwrap_or_default();
+            let card = BankCard {
+                bank: bank_name(&list, &bin),
+                holder: holder_name(&holder).unwrap_or_default(),
+                bin,
+                number,
+            };
+            let sent = client
+                .send_bank_card(
+                    recipient(kind, &remote_id),
+                    &card.bin,
+                    &card.number,
+                    &card.holder,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let (media, raw) = bank_card(card);
+            // Zalo composes the card itself and echoes it with a client id of
+            // its own: wait for that message and give it what it shows. If it
+            // is late, a local copy is stored and takes its ids when it comes.
+            let thread = thread_id(kind, &remote_id);
+            let at = i64::try_from(sent.client_id).unwrap_or(0);
+            for _ in 0..25 {
+                if let Some(seq) = store.card_echo(&thread, at).map_err(|e| e.to_string())? {
+                    let message = store
+                        .set_media(seq, &media)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "tin vừa gửi không còn trong kho".to_string())?;
+                    let snapshot = store.thread(&thread).ok().flatten();
+                    let payload = json!({ "message": message, "thread": snapshot });
+                    if let Err(e) = bus.publish("message_updated", payload) {
+                        tracing::error!(error = %e, "cannot publish a bank card");
+                    }
+                    return Ok(json!(message));
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let sent = Sent {
+                msg_id: sent.msg_id,
+                client_id: sent.client_id,
+                msg_type: "chat.webcontent",
+                text: "[Tài khoản ngân hàng]".into(),
+                media: Some(media),
+                quote: None,
+                raw: Some(raw),
+            };
+            let message = store_sent(store, bus, self_uid, kind, &remote_id, sent)?;
+            Ok(json!(message))
+        }
+        CardAction::ReadBank { seq } => {
+            let message = store
+                .message(seq)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "không có tin này".to_string())?;
+            let Some(media) = message.media.clone().filter(|m| m.kind == "bank") else {
+                return Err("tin này không phải thẻ tài khoản ngân hàng".into());
+            };
+            if media.bank.is_some() || media.url.is_empty() {
+                return Ok(json!(message));
+            }
+            let read = client
+                .read_bank_card(&media.url)
+                .await
+                .map_err(|e| e.to_string())?;
+            let list = banks(client, &ctx.banks).await.unwrap_or_default();
+            let name = bank_name(&list, &read.bin);
+            let card = BankCard {
+                // The card's own words when Zalo's list does not know the bank.
+                bank: if name == read.bin && !read.bank_name.is_empty() {
+                    read.bank_name.trim_start_matches("Ngân hàng ").to_string()
+                } else {
+                    name
+                },
+                bin: read.bin,
+                number: read.number,
+                holder: read.holder,
+            };
+            let updated = Media {
+                bank: Some(card),
+                ..media
+            };
+            let message = store
+                .set_media(seq, &updated)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "không có tin này".to_string())?;
+            let thread = store.thread(&message.thread_id).ok().flatten();
+            let payload = json!({ "message": message, "thread": thread });
+            if let Err(e) = bus.publish("message_updated", payload) {
+                tracing::error!(error = %e, "cannot publish a bank card");
+            }
+            Ok(json!(message))
+        }
         CardAction::SendContact {
             kind,
             remote_id,

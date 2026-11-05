@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::media::{Media, Quote};
+pub use crate::media::{BankCard, Media, Quote};
 pub use zeta_zalo::api::{Mention, TextStyle};
 
 /// One conversation: a 1-1 chat or a group.

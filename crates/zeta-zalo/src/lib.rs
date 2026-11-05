@@ -30,6 +30,7 @@ pub mod socket;
 pub mod sticker;
 pub mod typing;
 pub mod upload;
+pub mod vietqr;
 
 pub use client::ZaloClient;
 pub use domains::{Domains, Service};

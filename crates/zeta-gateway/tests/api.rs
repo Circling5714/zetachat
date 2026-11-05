@@ -338,6 +338,53 @@ fn fake_connector(
                     let _ = reply.send(Ok(message));
                 }
                 ZaloCommand::Cards { action, reply } => match action {
+                    zeta_gateway::zalo::CardAction::SendBank {
+                        kind,
+                        remote_id,
+                        bin,
+                        number,
+                        holder,
+                    } => {
+                        let (media, raw) =
+                            zeta_gateway::zalo::bank_card(zeta_gateway::model::BankCard {
+                                bin,
+                                number,
+                                holder,
+                                bank: "Vietcombank".into(),
+                            });
+                        let thread = ThreadUpsert {
+                            kind,
+                            remote_id,
+                            name: String::new(),
+                            avatar: String::new(),
+                        };
+                        store.upsert_thread(&thread, false).unwrap();
+                        let message = store
+                            .insert_message(&NewMessage {
+                                thread_id: thread.id(),
+                                remote_id: format!("srv-{sent}"),
+                                client_id: format!("{sent}"),
+                                sender_id: "me".into(),
+                                sender_name: String::new(),
+                                outgoing: true,
+                                kind: "chat.webcontent".into(),
+                                text: "[Tài khoản ngân hàng]".into(),
+                                media: Some(media),
+                                quote: None,
+                                sent_at: 10,
+                                raw: raw.to_string(),
+                            })
+                            .unwrap()
+                            .unwrap();
+                        let _ = reply.send(Ok(json!(message)));
+                    }
+                    zeta_gateway::zalo::CardAction::Banks
+                    | zeta_gateway::zalo::CardAction::Accounts
+                    | zeta_gateway::zalo::CardAction::AddAccount { .. }
+                    | zeta_gateway::zalo::CardAction::RemoveAccount { .. }
+                    | zeta_gateway::zalo::CardAction::ReadBank { .. } => {
+                        let _ = reply.send(Ok(json!([])));
+                    }
                     zeta_gateway::zalo::CardAction::SendContact {
                         kind,
                         remote_id,
@@ -1432,6 +1479,70 @@ async fn mentions_fit_the_trimmed_text_and_stay_in_groups() {
     )
     .await;
     assert_eq!(sent["mentions"], json!([]));
+}
+
+#[tokio::test]
+async fn bank_cards_and_vietqr_codes() {
+    let f = fixture();
+    let user = thread_id(ThreadKind::User, "70");
+    let uri = format!("/api/v1/threads/{user}/bank-card");
+    let body = json!({ "bin": "970436", "number": "0123 456 789", "holder": "Nguyễn Văn A" });
+    let (status, sent) = call(&f, "POST", &uri, Some(body), true).await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["media"]["kind"], "bank");
+    assert_eq!(sent["media"]["bank"]["number"], "0123456789");
+    for bad in [
+        json!({ "bin": "97043", "number": "0123456789" }),
+        json!({ "bin": "970436", "number": "12a45678" }),
+        json!({ "bin": "970436", "number": "123" }),
+    ] {
+        let (status, _) = call(&f, "POST", &uri, Some(bad), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    // Only bank cards can be read as such.
+    let seq = sent["seq"].as_i64().unwrap();
+    let (status, _) = call(
+        &f,
+        "POST",
+        &format!("/api/v1/threads/{user}/messages/{seq}/bank"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/vietqr.svg?bin=970436&number=0123456789&amount=50000")
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/svg+xml");
+    let (status, _) = call(
+        &f,
+        "GET",
+        "/api/v1/vietqr.svg?bin=1&number=0123456789",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &f,
+        "GET",
+        "/api/v1/vietqr.svg?bin=970436&number=0123456789",
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

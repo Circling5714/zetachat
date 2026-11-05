@@ -17,8 +17,8 @@ use crate::media;
 #[cfg(test)]
 use crate::model::Mention;
 use crate::model::{
-    now_ms, Device, Message, NewMessage, NewReaction, Person, ReactionCount, StoredEvent, Thread,
-    ThreadKind, ThreadUpsert,
+    now_ms, Device, Media, Message, NewMessage, NewReaction, Person, ReactionCount, StoredEvent,
+    Thread, ThreadKind, ThreadUpsert,
 };
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -142,8 +142,15 @@ ALTER TABLE messages ADD COLUMN styles TEXT NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN urgency INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// How far apart (ms) the client ids of a card sent from here and of the
+/// message Zalo composes for it can be (seen live: 18 ms).
+const CARD_ECHO_MS: i64 = 15_000;
+
 /// The version `init` brings every database to.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
+
+/// Version 11: bank account cards, shown as "[Nội dung đặc biệt]" before.
+const REPARSED_IN_V11: [&str; 1] = ["chat.webcontent"];
 
 /// Version 10: contact cards, stored as links before, are parsed again.
 const REPARSED_IN_V10: [&str; 1] = ["chat.recommended"];
@@ -640,6 +647,15 @@ impl Store {
                 tracing::info!(count = reparsed, "contact cards parsed again");
             }
         }
+        if version < 11 {
+            let tx = conn.transaction()?;
+            let reparsed = reparse_kinds(&tx, &REPARSED_IN_V11)?;
+            tx.pragma_update(None, "user_version", 11)?;
+            tx.commit()?;
+            if reparsed > 0 {
+                tracing::info!(count = reparsed, "rich cards parsed again");
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -908,6 +924,25 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
+            // A card Zalo composed for a send from here, after the local copy
+            // was stored: the copy takes its ids (and keeps what it shows).
+            if m.outgoing && m.kind == "chat.webcontent" && !m.remote_id.starts_with("local:") {
+                if let Ok(at) = m.client_id.parse::<i64>() {
+                    let adopted = tx.execute(
+                        "UPDATE messages SET remote_id = ?2, client_id = ?3
+                         WHERE seq = (SELECT seq FROM messages
+                                      WHERE thread_id = ?1 AND kind = 'chat.webcontent'
+                                        AND outgoing = 1 AND remote_id LIKE 'local:%'
+                                        AND ABS(CAST(client_id AS INTEGER) - ?4) < ?5
+                                      ORDER BY seq DESC LIMIT 1)",
+                        params![m.thread_id, m.remote_id, m.client_id, at, CARD_ECHO_MS],
+                    )?;
+                    if adopted > 0 {
+                        tx.commit()?;
+                        return Ok(None);
+                    }
+                }
+            }
         }
         let mentions = mentions_of_raw(&m.raw);
         let (styles, urgency) = extras_of_raw(&m.raw);
@@ -1152,6 +1187,32 @@ impl Store {
             Some(seq) => self.delete_message(seq),
             None => Ok(None),
         }
+    }
+
+    /// The echo of a card sent from here at `client_id` (ms): an outgoing
+    /// `chat.webcontent` Zalo stored with a client id of its own, close to ours.
+    pub fn card_echo(&self, thread_id: &str, client_id: i64) -> Result<Option<i64>> {
+        self.conn()
+            .query_row(
+                "SELECT seq FROM messages
+                 WHERE thread_id = ?1 AND kind = 'chat.webcontent' AND outgoing = 1
+                   AND remote_id NOT LIKE 'local:%'
+                   AND ABS(CAST(client_id AS INTEGER) - ?2) < ?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![thread_id, client_id, CARD_ECHO_MS],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Replace what a message carries (a bank card once read); returns the
+    /// message as it is now.
+    pub fn set_media(&self, seq: i64, media: &Media) -> Result<Option<Message>> {
+        self.conn().execute(
+            "UPDATE messages SET media = ?2 WHERE seq = ?1",
+            params![seq, to_json(Some(media))],
+        )?;
+        self.message(seq)
     }
 
     /// Remove a message (and its reactions) for good; returns what it was.
@@ -1428,6 +1489,48 @@ mod tests {
             sent_at: at,
             raw: "{}".into(),
         }
+    }
+
+    #[test]
+    fn cards_zalo_composes_meet_their_local_copy() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_thread(&user("1", "A"), true).unwrap();
+        let t = thread_id(ThreadKind::User, "1");
+        let card = |remote: &str, client: &str| NewMessage {
+            kind: "chat.webcontent".into(),
+            ..msg(&t, remote, client, true, 5)
+        };
+        // Echo first: found by time, near the client id the send used.
+        let echo = s.insert_message(&card("900", "2018")).unwrap().unwrap();
+        assert_eq!(s.card_echo(&t, 2000).unwrap(), Some(echo.seq));
+        assert_eq!(s.card_echo(&t, 90_000).unwrap(), None);
+        // Local copy first: the echo takes its place instead of being added.
+        let local = s
+            .insert_message(&card("local:5000", "5000"))
+            .unwrap()
+            .unwrap();
+        assert!(s.insert_message(&card("901", "5018")).unwrap().is_none());
+        let kept = s.message(local.seq).unwrap().unwrap();
+        assert_eq!(
+            (kept.remote_id.as_str(), kept.client_id.as_str()),
+            ("901", "5018")
+        );
+        assert_eq!(s.messages(&t, None, 10).unwrap().len(), 2);
+        // Texts never match by time.
+        let text = s
+            .insert_message(&msg(&t, "local:7000", "7000", true, 6))
+            .unwrap()
+            .unwrap();
+        assert!(s
+            .insert_message(&msg(&t, "902", "7010", true, 6))
+            .unwrap()
+            .is_some());
+        assert!(s
+            .message(text.seq)
+            .unwrap()
+            .unwrap()
+            .remote_id
+            .starts_with("local:"));
     }
 
     #[test]

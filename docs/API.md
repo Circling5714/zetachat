@@ -30,6 +30,12 @@ Lỗi trả về JSON `{ "error": "…" }`: `401` thiếu hoặc sai token, `404
 | GET | `/stickers/search?q=` | Nhãn dán theo từ khóa ("haha", "cảm ơn", "yêu"…), như Zalo gợi ý; cùng dạng như trên |
 | GET | `/stickers/motion?ids=` | Nhãn dán động ra sao, tối đa 50 id: `{ "<id>": { "sprite", "frames", "duration_ms", "ext" } }`. `sprite` thường là dải `frames` khung xếp ngang trên CDN của Zalo, mỗi khung hiện `duration_ms`. `frames` bằng 0 nghĩa là Zalo để sprite tự nói: một hình 130×130 (nhãn tĩnh) hoặc, với `ext` 2, một ảnh WebP động. `null` khi nhãn không có sprite. Id mà Zalo không trả lời được thì vắng mặt, để client hỏi lại. Gateway giữ kết quả, vì nhãn dán không đổi |
 | POST | `/threads/{id}/stickers` | Gửi nhãn dán `{ "id", "cate_id", "type" }` lấy từ các đường dẫn trên; trả về tin đã lưu (`kind` là `chat.sticker`) |
+| POST | `/threads/{id}/bank-card` | Gửi số tài khoản ngân hàng thành thẻ `{ "bin", "number", "holder" }` (`bin` là mã NAPAS 6 chữ số của ngân hàng); người nhận thấy ngân hàng, số, chủ tài khoản và mã QR. Trả về tin đã lưu (`media.kind` là `bank`) |
+| POST | `/threads/{id}/messages/{seq}/bank` | Đọc một thẻ tài khoản nhận được: lần đầu gateway hỏi Zalo rồi giữ lại, sau đó trả ngay. Trả về tin, với `media.bank` đã có |
+| GET | `/banks` | Các ngân hàng Zalo hỗ trợ: `[{ "bin", "name", "short_name", "logo", "keywords" }]` (gateway giữ một ngày) |
+| GET, POST | `/bank-accounts` | Tài khoản ngân hàng đã lưu trong Zalo (điện thoại cũng thấy): `[{ "id", "bin", "number", "holder", "default" }]`. POST `{ "bin", "number", "holder" }` lưu thêm một tài khoản và trả về danh sách mới |
+| DELETE | `/bank-accounts/{id}` | Xóa một tài khoản đã lưu; trả về danh sách mới |
+| GET | `/vietqr.svg?bin=&number=&amount=&note=` | Mã VietQR (SVG) để app ngân hàng quét và chuyển tiền tới tài khoản; `amount` (đồng) và `note` không bắt buộc. Gateway tự tạo, không hỏi Zalo |
 | POST | `/threads/{id}/contact-card` | Gửi danh thiếp `{ "uid" }` (của bạn bè, hay của chính tài khoản); trả về tin đã lưu (`kind` là `chat.recommended`, `media.kind` là `contact`). Chuyển tiếp một danh thiếp cũng gửi lại danh thiếp đó |
 | GET | `/search?q=&limit=` | Tìm trong nội dung tin nhắn đã lưu, không phân biệt hoa thường và dấu tiếng Việt (`pho` tìm được "Phở"), mới nhất trước: `{ "messages": [...] }`. Tên tệp và chú thích ảnh cũng được tìm, nhãn `[Hình ảnh]`… thì không |
 | GET | `/threads/{id}/messages?before=&limit=` | Tin nhắn cũ hơn `seq = before`, cũ nhất trước |
@@ -62,13 +68,14 @@ Một tin nhắn có `seq`, `thread_id`, `remote_id`, `client_id`, `sender_id`, 
 
 | Trường | Ý nghĩa |
 |---|---|
-| `kind` | `image`, `gif`, `video`, `sticker`, `audio` (tin nhắn thoại), `file`, `link` hoặc `contact` (danh thiếp) |
+| `kind` | `image`, `gif`, `video`, `sticker`, `audio` (tin nhắn thoại), `file`, `link`, `contact` (danh thiếp) hoặc `bank` (thẻ tài khoản ngân hàng) |
 | `url` | Tệp gốc trên CDN của Zalo; với `link` là trang được chia sẻ |
 | `thumb` | Ảnh xem trước: ảnh thu nhỏ, ảnh bìa video, ảnh của thẻ liên kết |
 | `width`, `height` | Kích thước ảnh hoặc video (0 khi không rõ), để giữ chỗ trước khi tải |
 | `name`, `description` | Tên tệp hoặc tiêu đề liên kết; chú thích ảnh hoặc mô tả liên kết |
 | `size`, `duration_ms` | Dung lượng (byte) và độ dài video hay tin nhắn thoại, 0 khi không rõ |
 | `sticker_id` | Id của nhãn dán (chỉ với `sticker`), để hỏi `/stickers/motion` |
+| `bank` | Với `bank`: `{ "bin", "number", "holder", "bank" }` (mã ngân hàng, số tài khoản, chủ tài khoản viết hoa không dấu, tên ngắn của ngân hàng). Thẻ nhận được chưa đọc thì chưa có trường này: hỏi `POST /threads/{id}/messages/{seq}/bank` |
 | `uid` | Người trên danh thiếp (chỉ với `contact`); khi đó `name` là tên họ, `thumb` là ảnh đại diện, `url` là ảnh mã QR của họ, `description` là số điện thoại nếu người gửi kèm theo |
 
 Client tải `url` và `thumb` qua `/media?u=…`, không gọi thẳng CDN của Zalo: thiết bị không cần ra Internet, và gateway giữ một bản trên đĩa. Gateway tự tải trước ảnh, sticker, tin nhắn thoại và video (đến 100 MB) của tin mới ngay khi tin đến, nên mở ra là có ngay và vẫn còn khi link của Zalo hết hạn. Tệp đính kèm chỉ được tải khi có người mở. Tệp lớn hơn 256 MB không đi qua gateway (`413`).
